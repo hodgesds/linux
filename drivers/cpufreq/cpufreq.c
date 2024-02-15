@@ -268,6 +268,7 @@ void cpufreq_cpu_release(struct cpufreq_policy *policy)
 
 	cpufreq_cpu_put(policy);
 }
+EXPORT_SYMBOL_GPL(cpufreq_cpu_release);
 
 /**
  * cpufreq_cpu_acquire - Find policy for a CPU, mark it as busy and lock it.
@@ -297,6 +298,7 @@ struct cpufreq_policy *cpufreq_cpu_acquire(unsigned int cpu)
 
 	return policy;
 }
+EXPORT_SYMBOL_GPL(cpufreq_cpu_acquire);
 
 /*********************************************************************
  *            EXTERNALLY AFFECTING FREQUENCY CHANGES                 *
