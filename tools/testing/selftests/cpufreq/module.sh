@@ -111,6 +111,8 @@ find_gov_name()
 {
 	if [ $1 = "cpufreq_ondemand.ko" ]; then
 		printf "ondemand"
+	elif [ $1 = "cpufreq_bpf.ko" ]; then
+		printf "bpf"
 	elif [ $1 = "cpufreq_conservative.ko" ]; then
 		printf "conservative"
 	elif [ $1 = "cpufreq_userspace.ko" ]; then
