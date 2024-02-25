@@ -121,6 +121,8 @@ find_gov_name()
 		printf "powersave"
 	elif [ $1 = "cpufreq_schedutil.ko" ]; then
 		printf "schedutil"
+	elif [ $1 = "cpufreq_bpf.ko" ]; then
+		printf "bpf"
 	fi
 }
 

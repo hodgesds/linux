@@ -101,7 +101,7 @@ switch_governor()
 switch_show_governor()
 {
 	cur_gov=find_current_governor
-	if [ $cur_gov == "userspace" ]; then
+	if [[ $cur_gov == "userspace" || $cur_gov == "bpf" ]]; then
 		cur_freq=find_current_freq
 	fi
 
