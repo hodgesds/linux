@@ -24,6 +24,7 @@
 #include <linux/bpf_lsm.h>
 #include <linux/btf_ids.h>
 #include <linux/poison.h>
+#include <linux/printk.h>
 #include <linux/module.h>
 #include <linux/cpumask.h>
 #include <linux/bpf_mem_alloc.h>
@@ -6484,6 +6485,9 @@ BTF_TYPE_SAFE_RCU_OR_NULL(struct request_sock) {
 	struct sock *sk;
 };
 
+BTF_TYPE_SAFE_RCU_OR_NULL(struct cpufreq_policy) {
+};
+
 /* full trusted: these fields are trusted even outside of RCU CS and never NULL */
 BTF_TYPE_SAFE_TRUSTED(struct bpf_iter_meta) {
 	struct seq_file *seq;
@@ -6519,6 +6523,7 @@ static bool type_is_rcu(struct bpf_verifier_env *env,
 	BTF_TYPE_EMIT(BTF_TYPE_SAFE_RCU(struct cgroup));
 	BTF_TYPE_EMIT(BTF_TYPE_SAFE_RCU(struct css_set));
 
+
 	return btf_nested_type_is_trusted(&env->log, reg, field_name, btf_id, "__safe_rcu");
 }
 
@@ -6529,6 +6534,7 @@ static bool type_is_rcu_or_null(struct bpf_verifier_env *env,
 	BTF_TYPE_EMIT(BTF_TYPE_SAFE_RCU_OR_NULL(struct mm_struct));
 	BTF_TYPE_EMIT(BTF_TYPE_SAFE_RCU_OR_NULL(struct sk_buff));
 	BTF_TYPE_EMIT(BTF_TYPE_SAFE_RCU_OR_NULL(struct request_sock));
+	BTF_TYPE_EMIT(BTF_TYPE_SAFE_RCU_OR_NULL(struct cpufreq_policy));
 
 	return btf_nested_type_is_trusted(&env->log, reg, field_name, btf_id, "__safe_rcu_or_null");
 }
@@ -8519,6 +8525,7 @@ int check_func_arg_reg_off(struct bpf_verifier_env *env,
 		if (reg->off) {
 			verbose(env, "R%d must have zero offset when passed to release func or trusted arg to kfunc\n",
 				regno);
+			printk("bpf: verifier: %s: reg->off set", __func__);
 			return -EINVAL;
 		}
 		return __check_ptr_off_reg(env, reg, regno, false);

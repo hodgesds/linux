@@ -5,6 +5,7 @@
 #include <linux/btf.h>
 #include <linux/bpf-cgroup.h>
 #include <linux/cgroup.h>
+#include <linux/cpufreq.h>
 #include <linux/rcupdate.h>
 #include <linux/random.h>
 #include <linux/smp.h>
@@ -2150,6 +2151,19 @@ __bpf_kfunc void bpf_task_release(struct task_struct *p)
 	put_task_struct_rcu_user(p);
 }
 
+#ifdef CONFIG_CPU_FREQ_BPF
+__bpf_kfunc struct cpufreq_policy *bpf_cpufreq_policy_acquire(struct cpufreq_policy *p)
+{
+	down_write(&p->rwsem);
+	return p;
+}
+
+__bpf_kfunc void bpf_cpufreq_policy_release(struct cpufreq_policy *p)
+{
+	up_write(&p->rwsem);
+}
+#endif
+
 #ifdef CONFIG_CGROUPS
 /**
  * bpf_cgroup_acquire - Acquire a reference to a cgroup. A cgroup acquired by
@@ -2538,6 +2552,10 @@ BTF_ID_FLAGS(func, bpf_cgroup_ancestor, KF_ACQUIRE | KF_RCU | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_cgroup_from_id, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_task_under_cgroup, KF_RCU)
 #endif
+#ifdef CONFIG_CPU_FREQ_BPF
+BTF_ID_FLAGS(func, bpf_cpufreq_policy_acquire, KF_ACQUIRE | KF_RCU | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_cpufreq_policy_release, KF_RELEASE)
+#endif
 BTF_ID_FLAGS(func, bpf_task_from_pid, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_throw)
 BTF_SET8_END(generic_btf_ids)
@@ -2554,6 +2572,10 @@ BTF_ID(func, bpf_task_release)
 #ifdef CONFIG_CGROUPS
 BTF_ID(struct, cgroup)
 BTF_ID(func, bpf_cgroup_release)
+#endif
+#ifdef CONFIG_CPU_FREQ_BPF
+BTF_ID(struct, cpufreq_policy)
+BTF_ID(func, bpf_cpufreq_policy_release)
 #endif
 
 BTF_SET8_START(common_btf_ids)
@@ -2604,6 +2626,12 @@ static int __init kfunc_init(void)
 		{
 			.btf_id       = generic_dtor_ids[2],
 			.kfunc_btf_id = generic_dtor_ids[3]
+		},
+#endif
+#ifdef CONFIG_CPU_FREQ_BPF
+		{
+			.btf_id       = generic_dtor_ids[4],
+			.kfunc_btf_id = generic_dtor_ids[5]
 		},
 #endif
 	};

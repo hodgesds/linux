@@ -9,4 +9,9 @@ BPF_STRUCT_OPS_TYPE(bpf_dummy_ops)
 #include <net/tcp.h>
 BPF_STRUCT_OPS_TYPE(tcp_congestion_ops)
 #endif
+#ifdef CONFIG_CPU_FREQ_BPF
+#include <linux/cpufreq.h>
+#include <linux/cpufreq_bpf.h>
+BPF_STRUCT_OPS_TYPE(cpufreq_bpf_ops)
+#endif
 #endif
