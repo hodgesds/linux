@@ -34,6 +34,14 @@ config CPU_FREQ_STAT
 
 	  If in doubt, say N.
 
+config CPU_FREQ_BPF
+	tristate "CPU frequency bpf support"
+	help
+	  BPF integration with CPU frequency subsystem. Allows for interacting
+	  with CPU governors and drivers from BPF programs.
+
+	  If in doubt, say N.
+
 choice
 	prompt "Default CPUFreq governor"
 	default CPU_FREQ_DEFAULT_GOV_USERSPACE if ARM_SA1110_CPUFREQ
