@@ -110,7 +110,7 @@ switch_show_governor()
 
 	printf "\nSwitched governor for $1 to $2\n\n"
 
-	if [ $2 == "userspace" -o $2 == "powersave" -o $2 == "performance" ]; then
+	if [ $2 == "userspace" -o $2 == "powersave" -o $2 == "performance" -o $w == "bpf" ]; then
 		printf "No files to read for $2 governor\n\n"
 		return
 	fi
