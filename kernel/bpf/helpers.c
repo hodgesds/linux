@@ -2375,13 +2375,17 @@ CFI_NOSEAL(bpf_task_release_dtor);
 #ifdef CONFIG_CPU_FREQ_BPF
 __bpf_kfunc struct cpufreq_policy *bpf_cpufreq_policy_acquire(struct cpufreq_policy *p)
 {
+	if (!p)
+		return NULL;
+
 	down_write(&p->rwsem);
 	return p;
 }
 
 __bpf_kfunc void bpf_cpufreq_policy_release(struct cpufreq_policy *p)
 {
-	up_write(&p->rwsem);
+	if (p)
+		up_write(&p->rwsem);
 }
 #endif
 
@@ -3048,7 +3052,7 @@ BTF_ID_FLAGS(func, bpf_task_under_cgroup, KF_RCU)
 BTF_ID_FLAGS(func, bpf_task_get_cgroup1, KF_ACQUIRE | KF_RCU | KF_RET_NULL)
 #endif
 #ifdef CONFIG_CPU_FREQ_BPF
-BTF_ID_FLAGS(func, bpf_cpufreq_policy_acquire, KF_ACQUIRE | KF_RCU | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_cpufreq_policy_acquire, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_cpufreq_policy_release, KF_RELEASE)
 #endif
 BTF_ID_FLAGS(func, bpf_task_from_pid, KF_ACQUIRE | KF_RET_NULL)

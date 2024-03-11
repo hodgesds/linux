@@ -6505,9 +6505,6 @@ BTF_TYPE_SAFE_RCU_OR_NULL(struct request_sock) {
 	struct sock *sk;
 };
 
-BTF_TYPE_SAFE_RCU_OR_NULL(struct cpufreq_policy) {
-};
-
 /* full trusted: these fields are trusted even outside of RCU CS and never NULL */
 BTF_TYPE_SAFE_TRUSTED(struct bpf_iter_meta) {
 	struct seq_file *seq;
@@ -6535,6 +6532,14 @@ BTF_TYPE_SAFE_TRUSTED_OR_NULL(struct socket) {
 	struct sock *sk;
 };
 
+BTF_TYPE_SAFE_TRUSTED(struct cpufreq_policy) {
+	struct clk *clk;
+	struct cpufreq_frequency_table *freq_table;
+	struct cpufreq_stats *stats;
+	struct thermal_cooling_device *cdev;
+	struct task_struct *transition_task;
+};
+
 static bool type_is_rcu(struct bpf_verifier_env *env,
 			struct bpf_reg_state *reg,
 			const char *field_name, u32 btf_id)
@@ -6553,7 +6558,6 @@ static bool type_is_rcu_or_null(struct bpf_verifier_env *env,
 	BTF_TYPE_EMIT(BTF_TYPE_SAFE_RCU_OR_NULL(struct mm_struct));
 	BTF_TYPE_EMIT(BTF_TYPE_SAFE_RCU_OR_NULL(struct sk_buff));
 	BTF_TYPE_EMIT(BTF_TYPE_SAFE_RCU_OR_NULL(struct request_sock));
-	BTF_TYPE_EMIT(BTF_TYPE_SAFE_RCU_OR_NULL(struct cpufreq_policy));
 
 	return btf_nested_type_is_trusted(&env->log, reg, field_name, btf_id, "__safe_rcu_or_null");
 }
@@ -6567,6 +6571,8 @@ static bool type_is_trusted(struct bpf_verifier_env *env,
 	BTF_TYPE_EMIT(BTF_TYPE_SAFE_TRUSTED(struct linux_binprm));
 	BTF_TYPE_EMIT(BTF_TYPE_SAFE_TRUSTED(struct file));
 	BTF_TYPE_EMIT(BTF_TYPE_SAFE_TRUSTED(struct dentry));
+	BTF_TYPE_EMIT(BTF_TYPE_SAFE_TRUSTED(struct socket));
+	BTF_TYPE_EMIT(BTF_TYPE_SAFE_TRUSTED(struct cpufreq_policy));
 
 	return btf_nested_type_is_trusted(&env->log, reg, field_name, btf_id, "__safe_trusted");
 }
