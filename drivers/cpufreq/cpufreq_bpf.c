@@ -50,26 +50,36 @@ static inline struct cpufreq_policy *get_cpu_policy(unsigned int cpu)
 }
 
 
-__bpf_hook_start()
+__bpf_hook_start();
+
+
+// acquire
+// KF_ACQUIRE | KF_TRUSTED_ARGS
 
 // cpufreq_bpf_ops defaults
-static int __bpf_cpufreq_policy_start(struct cpufreq_policy *policy)
+__bpf_kfunc static int __bpf_cpufreq_policy_start(struct cpufreq_policy *policy)
 {
-	BUG_ON(!policy->cur);
-
 	return 0;
 }
 
-static void __bpf_cpufreq_policy_stop(struct cpufreq_policy *policy) {}
+__bpf_kfunc static void __bpf_cpufreq_policy_stop(struct cpufreq_policy *policy) {}
 
-static void __bpf_cpufreq_policy_limits(struct cpufreq_policy *policy)
+__bpf_kfunc static void __bpf_cpufreq_policy_limits(struct cpufreq_policy *policy)
 {
+	if (!policy) {
+		return;
+	}
+
 	// By default set the frequency as close to the policy.
 	__cpufreq_driver_target(policy, policy->cur, CPUFREQ_RELATION_C);
 }
 
-static int __bpf_cpufreq_policy_store_setspeed(struct cpufreq_policy *policy, unsigned int freq)
+__bpf_kfunc static int __bpf_cpufreq_policy_store_setspeed(struct cpufreq_policy *policy, unsigned int freq)
 {
+	if (!policy) {
+		return 0;
+	}
+
 	int ret;
 
 	policy->cur = freq;
@@ -79,7 +89,6 @@ static int __bpf_cpufreq_policy_store_setspeed(struct cpufreq_policy *policy, un
 	return ret;
 }
 
-
 // kfunc helpers
 __bpf_kfunc int bpf_cpufreq_gov_set_cpu(unsigned int freq, unsigned int cpu)
 {
@@ -87,6 +96,8 @@ __bpf_kfunc int bpf_cpufreq_gov_set_cpu(unsigned int freq, unsigned int cpu)
 
 	if (!policy)
 		return -EINVAL;
+
+	policy->cur = freq;
 
 	int ret = cpufreq_driver_fast_switch(policy, freq);
 
@@ -164,6 +175,7 @@ static const struct bpf_func_proto * bpf_cpufreq_get_func_proto(
 	enum bpf_func_id func_id, const struct bpf_prog *prog
 ) {
 
+	// printk("cpufreq: bpf: %s: base_func_proto default for func_id %d", __func__, func_id);
 	switch (func_id) {
 	case BPF_FUNC_task_storage_get:
 		return &bpf_task_storage_get_proto;
@@ -173,13 +185,26 @@ static const struct bpf_func_proto * bpf_cpufreq_get_func_proto(
 		return bpf_get_trace_vprintk_proto();
 	case BPF_FUNC_trace_printk:
 		return bpf_get_trace_printk_proto();
+	// case BPF_FUNC___bpf_cpufreq_policy_start:
+	// 	return &bpf_btf_cpufreq_policy_start_proto ;
+	// case BPF_FUNC___bpf_cpufreq_policy_stop:
+	// 	return &bpf_btf_cpufreq_policy_stop_proto ;
+	// case BPF_FUNC___bpf_cpufreq_policy_limits:
+	// 	return &bpf_btf_cpufreq_policy_limits_proto ;
+	// case BPF_FUNC___bpf_cpufreq_policy_store_setspeed:
+	// 	return &bpf_btf_cpufreq_policy_store_setspeed_proto ;
 	default:
+		// printk("cpufreq: bpf: %s: base_func_proto default for func_id %d", __func__, func_id);
 		struct bpf_func_proto * proto;
 		proto = bpf_base_func_proto(func_id);
 		if (proto) {
+			printk("cpufreq: bpf: %s: base_func_proto", __func__);
 			return proto;
 		}
 		proto = tracing_prog_func_proto(func_id, prog);
+		if (proto) {
+			printk("cpufreq: bpf: %s: tracing_prog_func_proto", __func__);
+		}
 		return proto;
 	}
 }
@@ -188,9 +213,10 @@ static bool bpf_cpufreq_is_valid_access(
 	int off, int size, enum bpf_access_type type, const struct bpf_prog *prog,
 	struct bpf_insn_access_aux *info
 ) {
-	bool ret = bpf_tracing_btf_ctx_access(off, size, type, prog, info);
+	return 0;
+	// bool ret = bpf_tracing_btf_ctx_access(off, size, type, prog, info);
 
-	return ret;
+	// return ret;
 }
 
 static int bpf_cpufreq_btf_struct_access(
@@ -203,18 +229,37 @@ static int bpf_cpufreq_btf_struct_access(
 
 	type_id = btf_find_by_name_kind(reg->btf, "cpufreq_policy", BTF_KIND_STRUCT);
 
-	if (type_id < 0)
+	if (type_id < 0) {
+		printk("cpufreq: bpf: %s: type_id < 0", __func__);
+		// bpf_log(log, "[cpufreq] %s: type_id = %p", __func__, type_id);
 		return -EINVAL;
+	}
 
 	t = btf_type_by_id(reg->btf, reg->btf_id);
 	state = btf_type_by_id(reg->btf, type_id);
-	if (t != state)
-		return -EACCES;
 
-	if (off + size > sizeof(struct cpufreq_policy))
+	if (t != state) {
+		printk("cpufreq: bpf: %s: t != state", __func__);
+		// bpf_log(log, "[cpufreq] %s: type = %p state= %p", __func__, t,
+		// 		state);
 		return -EACCES;
+	}
 
-	return NOT_INIT;
+	// [100275] STRUCT 'cpufreq_bpf_ops' size=32 vlen=4
+        // 'start' type_id=3348 bits_offset=0
+        // 'stop' type_id=3352 bits_offset=64
+        // 'limits' type_id=3352 bits_offset=128
+        // 'store_setspeed' type_id=3350 bits_offset=192
+
+	if (off + size > sizeof(struct cpufreq_policy)) {
+		printk("cpufreq: bpf: %s: off+size > sizeof cpufreq_policy", __func__);
+		// bpf_log(log, "[cpufreq] %s: offset= %d size= %d sizeof(cpufreq_policy) %d", __func__, off,
+		// 		size, sizeof(struct cpufreq_policy));
+		return -EACCES;
+	}
+
+	// return RET_PTR_TO_MEM_OR_BTF_ID;
+	return RET_PTR_TO_BTF_ID_TRUSTED;
 }
 
 static int bpf_cpufreq_init_member(const struct btf_type *t, const struct
@@ -236,16 +281,21 @@ static int bpf_cpufreq_init_member(const struct btf_type *t, const struct
 		} else {
 			printk("cpufreq: bpf: %s: start invalid", __func__);
 		}
-		break;
+		return 1;
 	case offsetof(struct cpufreq_bpf_ops, stop):
 		printk("cpufreq: bpf: init stop");
-		break;
+		return 1;
 	case offsetof(struct cpufreq_bpf_ops, limits):
 		printk("cpufreq: bpf: init limits");
-		break;
+		return 1;
 	case offsetof(struct cpufreq_bpf_ops, store_setspeed):
 		printk("cpufreq: bpf: init store_setspeed");
-		break;
+		if (*(u64 *)(udata+moff)) {
+			printk("cpufreq: bpf: %s: store_setspeed valid", __func__);
+		} else {
+			printk("cpufreq: bpf: %s: store_setspeed invalid", __func__);
+		}
+		return 1;
 	}
 
 	return ret;
@@ -327,15 +377,15 @@ static void bpf_cpufreq_unreg(void *kdata)
 
 
 BTF_SET8_START(cpufreq_bpf_ops_kfuncs)
-BTF_ID_FLAGS(func, __bpf_cpufreq_policy_start, KF_ACQUIRE)
-BTF_ID_FLAGS(func, __bpf_cpufreq_policy_stop, KF_ACQUIRE)
-BTF_ID_FLAGS(func, __bpf_cpufreq_policy_limits, KF_ACQUIRE)
-BTF_ID_FLAGS(func, __bpf_cpufreq_policy_store_setspeed, KF_ACQUIRE)
+BTF_ID_FLAGS(func, __bpf_cpufreq_policy_start, KF_TRUSTED_ARGS)
+BTF_ID_FLAGS(func, __bpf_cpufreq_policy_stop, KF_TRUSTED_ARGS)
+BTF_ID_FLAGS(func, __bpf_cpufreq_policy_limits, KF_TRUSTED_ARGS)
+BTF_ID_FLAGS(func, __bpf_cpufreq_policy_store_setspeed, KF_TRUSTED_ARGS)
 BTF_SET8_END(cpufreq_bpf_ops_kfuncs)
 
 BTF_SET8_START(cpufreq_bpf_drv_kfuncs)
 BTF_ID_FLAGS(func, bpf_cpufreq_gov_set_cpu)
-BTF_ID_FLAGS(func, bpf_cpufreq_gov_set, KF_RCU)
+BTF_ID_FLAGS(func, bpf_cpufreq_gov_set)
 BTF_ID_FLAGS(func, bpf_cpufreq_drv_get_hw_max_freq)
 BTF_ID_FLAGS(func, bpf_cpufreq_drv_quick_get)
 BTF_ID_FLAGS(func, bpf_cpufreq_drv_quick_get_max)
@@ -361,7 +411,6 @@ static struct cpufreq_bpf_ops default_cpufreq_ops = {
 };
 
 
-
 struct bpf_struct_ops bpf_cpufreq_bpf_ops = {
 	.verifier_ops = &bpf_cpufreq_verifier_ops,
 	.reg = bpf_cpufreq_reg,
@@ -380,13 +429,14 @@ static const struct btf_kfunc_id_set cpufreq_bpf_ops_kfunc_set = {
 	.set   = &cpufreq_bpf_ops_kfuncs,
 };
 
+
 static const struct btf_kfunc_id_set cpufreq_bpf_drv_kfunc_set = {
 	.owner = THIS_MODULE,
 	.set   = &cpufreq_bpf_drv_kfuncs,
 };
 
 
-// Governor
+// Governor implementation
 
 static int cpufreq_bpf_policy_init(struct cpufreq_policy *policy)
 {
