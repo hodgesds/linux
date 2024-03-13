@@ -53,9 +53,6 @@ static inline struct cpufreq_policy *get_cpu_policy(unsigned int cpu)
 __bpf_hook_start();
 
 
-// acquire
-// KF_ACQUIRE | KF_TRUSTED_ARGS
-
 // cpufreq_bpf_ops defaults
 __bpf_kfunc static int __bpf_cpufreq_policy_start(struct cpufreq_policy *policy)
 {
@@ -86,7 +83,7 @@ __bpf_kfunc static int __bpf_cpufreq_policy_store_setspeed(struct cpufreq_policy
 
 	ret = __cpufreq_driver_target(policy, policy->cur, CPUFREQ_RELATION_C);
 
-	return ret;
+	return 0;
 }
 
 // kfunc helpers
@@ -213,8 +210,14 @@ static bool bpf_cpufreq_is_valid_access(
 	int off, int size, enum bpf_access_type type, const struct bpf_prog *prog,
 	struct bpf_insn_access_aux *info
 ) {
-	return 0;
+	printk("cpufreq: bpf: %s: off: %d size: %d type: %d", __func__, off, size, type);
+	return true;
 	// bool ret = bpf_tracing_btf_ctx_access(off, size, type, prog, info);
+	// if (base_type(info->reg_type) == PTR_TO_BTF_ID &&
+	//     !bpf_type_has_unsafe_modifiers(info->reg_type) &&
+	//     info->btf_id == sock_id)
+	// 	/* promote it to tcp_sock */
+	// 	info->btf_id = tcp_sock_id;
 
 	// return ret;
 }
@@ -258,8 +261,9 @@ static int bpf_cpufreq_btf_struct_access(
 		return -EACCES;
 	}
 
+	return 0;
 	// return RET_PTR_TO_MEM_OR_BTF_ID;
-	return RET_PTR_TO_BTF_ID_TRUSTED;
+	// return RET_PTR_TO_BTF_ID_TRUSTED;
 }
 
 static int bpf_cpufreq_init_member(const struct btf_type *t, const struct
@@ -268,6 +272,7 @@ static int bpf_cpufreq_init_member(const struct btf_type *t, const struct
 	const struct cpufreq_bpf_ops *uops = udata;
 
 	struct cpufreq_bpf_ops *ops = kdata;
+	printk("cpufreq: %s: uops: %p ops: %p", __func__, uops, ops);
 
 	u32 moff = __btf_member_bit_offset(t, member) / 8;
 
@@ -333,6 +338,7 @@ static int bpf_cpufreq_update(void *kdata, void *old_kdata)
 	const struct cpufreq_bpf_ops *old_ops = old_kdata;
 	struct cpufreq_bpf_ops *ops = kdata;
 
+	printk("cpufreq: bpf: %s: odl_ops: %p new_ops: %p");
 	mutex_lock(&cpufreq_ops_enable_mutex);
 	cpufreq_ops = ops;
 	mutex_unlock(&cpufreq_ops_enable_mutex);
@@ -346,6 +352,16 @@ static int bpf_cpufreq_validate(void *kdata)
 	if (!ops)
 		return -EINVAL;
 
+	// Check if an existing struct_ops implementation is active.
+	bool is_active = false;
+
+	mutex_lock(&cpufreq_ops_enable_mutex);
+	if (cpufreq_ops != &default_cpufreq_ops)
+		is_active = true;
+	mutex_unlock(&cpufreq_ops_enable_mutex);
+
+	if (is_active)
+		return -EINVAL;
 	printk("cpufreq: bpf: %s kops %p", __func__, ops);
 	return 0;
 }
@@ -358,6 +374,7 @@ static int bpf_cpufreq_init(struct btf *btf)
 static int bpf_cpufreq_reg(void *kdata)
 {
 	struct cpufreq_bpf_ops *ops = kdata;
+	printk("cpufreq: bpf: %s: registering %p for %p", ops, cpufreq_ops);
 
 	mutex_lock(&cpufreq_ops_enable_mutex);
 	cpufreq_ops = ops;
@@ -370,8 +387,9 @@ static void bpf_cpufreq_unreg(void *kdata)
 {
 	struct cpufreq_bpf_ops *ops = kdata;
 
+	printk("cpufreq: bpf: %s: unregistering %p for %p with default %p", ops, cpufreq_ops, &default_cpufreq_ops);
 	mutex_lock(&cpufreq_ops_enable_mutex);
-	cpufreq_ops = ops;
+	cpufreq_ops = &default_cpufreq_ops;
 	mutex_unlock(&cpufreq_ops_enable_mutex);
 }
 
@@ -499,7 +517,7 @@ static int cpufreq_bpf_store_setspeed(struct cpufreq_policy *policy, unsigned in
 
 	ret = cpufreq_ops->store_setspeed(policy, freq);
 
-	return ret;
+	return 0;
 }
 
 
