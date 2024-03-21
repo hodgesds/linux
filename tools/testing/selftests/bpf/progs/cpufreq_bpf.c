@@ -24,6 +24,7 @@ void limits_gov(struct cpufreq_policy *policy)
 SEC("struct_ops/store_setspeed")
 int setspeed_gov(struct cpufreq_policy *policy, unsigned int freq)
 {
+	policy->cur = freq;
 	return 0;
 }
 
