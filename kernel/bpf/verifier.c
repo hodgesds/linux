@@ -19,6 +19,7 @@
 #include <linux/bsearch.h>
 #include <linux/sort.h>
 #include <linux/perf_event.h>
+#include <linux/printk.h>
 #include <linux/ctype.h>
 #include <linux/error-injection.h>
 #include <linux/bpf_lsm.h>
@@ -21775,6 +21776,8 @@ static int check_struct_ops_btf_id(struct bpf_verifier_env *env)
 	if (member_idx >= btf_type_vlen(t)) {
 		verbose(env, "attach to invalid member idx %u of struct %s\n",
 			member_idx, st_ops->name);
+		printk("bpf: %s: attach to invalid member idx %u of struct %s",
+				__func__, member_idx, st_ops->name);
 		return -EINVAL;
 	}
 
@@ -21785,6 +21788,8 @@ static int check_struct_ops_btf_id(struct bpf_verifier_env *env)
 	if (!func_proto) {
 		verbose(env, "attach to invalid member %s(@idx %u) of struct %s\n",
 			mname, member_idx, st_ops->name);
+		printk("bpf: %s: attach to invalid member %s(@idx %u) of struct %s",
+			__func__, mname, member_idx, st_ops->name);
 		return -EINVAL;
 	}
 
@@ -21801,6 +21806,8 @@ static int check_struct_ops_btf_id(struct bpf_verifier_env *env)
 		if (err) {
 			verbose(env, "attach to unsupported member %s of struct %s\n",
 				mname, st_ops->name);
+			printk("bpf: %s: attach to unsupported member of %s of struct %s",
+				__func__, mname, st_ops->name);
 			return err;
 		}
 	}
