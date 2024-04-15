@@ -20,6 +20,8 @@
 #include <linux/mutex.h>
 #include <linux/printk.h>
 
+#include <acpi/cppc_acpi.h>
+
 
 /* "extern" is to avoid sparse warning.  It is only used in bpf_struct_ops.c. */
 extern struct bpf_struct_ops bpf_cpufreq_bpf_ops;
@@ -59,28 +61,30 @@ __bpf_kfunc static int __bpf_cpufreq_policy_start(struct cpufreq_policy *policy)
 	return 0;
 }
 
-__bpf_kfunc static void __bpf_cpufreq_policy_stop(struct cpufreq_policy *policy) {}
+__bpf_kfunc static void __bpf_cpufreq_policy_stop(struct cpufreq_policy
+		*policy) {}
 
-__bpf_kfunc static void __bpf_cpufreq_policy_limits(struct cpufreq_policy *policy)
+__bpf_kfunc static void __bpf_cpufreq_policy_limits(struct cpufreq_policy
+		*policy)
 {
 	// By default set the frequency as close to the policy.
 	__cpufreq_driver_target(policy, policy->cur, CPUFREQ_RELATION_C);
 }
 
-__bpf_kfunc static int __bpf_cpufreq_policy_store_setspeed(struct cpufreq_policy *policy, unsigned int freq)
+__bpf_kfunc static int __bpf_cpufreq_policy_store_setspeed(struct
+		cpufreq_policy *policy, unsigned int freq)
 {
-	printk("cpufreq: bpf: %s: freq: %d", __func__, freq);
-	if (!policy) {
+	if (!policy)
 		return 0;
-	}
 
 	int ret;
 
 	policy->cur = freq;
+	if (cpufreq_this_cpu_can_update(policy))
+		ret = __cpufreq_driver_target(policy, policy->cur,
+				CPUFREQ_RELATION_C);
 
-	ret = __cpufreq_driver_target(policy, policy->cur, CPUFREQ_RELATION_C);
-
-	return 0;
+	return ret;
 }
 
 // kfunc helpers
@@ -88,12 +92,16 @@ __bpf_kfunc int bpf_cpufreq_gov_set_cpu(unsigned int freq, unsigned int cpu)
 {
 	struct cpufreq_policy *policy = cpufreq_cpu_acquire(cpu);
 
+	int ret = 0;
+
 	if (!policy)
 		return -EINVAL;
 
 	policy->cur = freq;
 
-	int ret = cpufreq_driver_fast_switch(policy, freq);
+	if (policy->fast_switch_enabled && policy->fast_switch_possible &&
+			cpufreq_this_cpu_can_update(policy))
+		ret = cpufreq_driver_fast_switch(policy, freq);
 
 	cpufreq_cpu_release(policy);
 
@@ -134,14 +142,16 @@ __bpf_kfunc void bpf_cpufreq_drv_enable_fast_switch(unsigned int cpu)
 {
 	struct cpufreq_policy *policy = get_cpu_policy(cpu);
 
-	cpufreq_enable_fast_switch(policy);
+	if (!policy)
+		cpufreq_enable_fast_switch(policy);
 }
 
 __bpf_kfunc void bpf_cpufreq_drv_disable_fast_switch(unsigned int cpu)
 {
 	struct cpufreq_policy *policy = get_cpu_policy(cpu);
 
-	cpufreq_disable_fast_switch(policy);
+	if (!policy)
+		cpufreq_disable_fast_switch(policy);
 }
 
 __bpf_kfunc int bpf_cpufreq_drv_boost_enabled(void)
@@ -159,6 +169,94 @@ __bpf_kfunc int bpf_cpufreq_drv_boost_trigger_state(int state)
 	return cpufreq_boost_trigger_state(state);
 }
 
+// ACPI CPPC kfuncs
+int bpf_cppc_get_desired_perf(int cpunum, u64 *desired_perf) {
+	return cppc_get_desired_perf(cpunum, desired_perf);
+}
+
+int bpf_cppc_get_nominal_perf(int cpunum, u64 *nominal_perf) {
+	return cppc_get_nominal_perf(cpunum, nominal_perf);
+}
+
+int bpf_cppc_get_perf_ctrs(int cpu, struct cppc_perf_fb_ctrs *perf_fb_ctrs) {
+	return cppc_get_perf_ctrs(cpu, perf_fb_ctrs);
+
+}
+int bpf_cppc_set_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls) {
+	return cppc_set_perf(cpu, perf_ctrls);
+
+}
+int bpf_cppc_set_enable(int cpu, bool enable) {
+	return cppc_set_enable(cpu, enable);
+
+}
+int bpf_cppc_get_perf_caps(int cpu, struct cppc_perf_caps *caps) {
+	return cppc_get_perf_caps(cpu, caps);
+}
+
+bool bpf_cppc_perf_ctrs_in_pcc(void) {
+	return cppc_perf_ctrs_in_pcc();
+}
+
+// unsigned int bpf_cppc_perf_to_khz(struct cppc_perf_caps *caps, unsigned int
+// 		perf) {
+// 	return cppc_perf_to_khz(caps, perf);
+// }
+// 
+// unsigned int bpf_cppc_khz_to_perf(struct cppc_perf_caps *caps, unsigned int
+// 		freq) {
+// 	return cppc_khz_to_perf(caps, freq);
+// }
+
+bool bpf_acpi_cpc_valid(void) {
+	return acpi_cpc_valid();
+}
+
+bool bpf_cppc_allow_fast_switch(void) {
+	return cppc_allow_fast_switch();
+}
+
+// int bpf_acpi_get_psd_map(unsigned int cpu, struct cppc_cpudata *cpu_data) {
+// 	return acpi_get_psd_map(cpu, cpu_data);
+// }
+
+unsigned int bpf_cppc_get_transition_latency(int cpu) {
+	return cppc_get_transition_latency(cpu);
+}
+
+bool bpf_cpc_ffh_supported(void) {
+	return cpc_ffh_supported();
+}
+
+// bool bpf_cpc_supported_by_cpu(void) {
+// 	return cpc_supported_by_cpu();
+// }
+
+int bpf_cpc_read_ffh(int cpunum, struct cpc_reg *reg, u64 *val) {
+	return cpc_read_ffh(cpunum, reg, val);
+}
+
+int bpf_cpc_write_ffh(int cpunum, struct cpc_reg *reg, u64 val) {
+	return cpc_write_ffh(cpunum, reg, val);
+}
+
+int bpf_cppc_get_epp_perf(int cpunum, u64 *epp_perf) {
+	return cppc_get_epp_perf(cpunum, epp_perf);
+}
+
+int bpf_cppc_set_epp_perf(int cpu, struct cppc_perf_ctrls *perf_ctrls, bool
+		enable) {
+	return cppc_set_epp_perf(cpu, perf_ctrls, enable);
+}
+
+int bpf_cppc_get_auto_sel_caps(int cpunum, struct cppc_perf_caps *perf_caps) {
+	return cppc_get_auto_sel_caps(cpunum, perf_caps);
+}
+
+int bpf_cppc_set_auto_sel(int cpu, bool enable) {
+	return cppc_set_auto_sel(cpu, enable);
+}
+
 __bpf_hook_end();
 
 
@@ -169,7 +267,6 @@ static const struct bpf_func_proto * bpf_cpufreq_get_func_proto(
 	enum bpf_func_id func_id, const struct bpf_prog *prog
 ) {
 
-	printk("cpufreq: bpf: %s: base_func_proto default for func_id %d for prog %s", __func__, func_id, prog->aux->attach_func_name);
 	switch (func_id) {
 	case BPF_FUNC_task_storage_get:
 		return &bpf_task_storage_get_proto;
@@ -182,17 +279,10 @@ static const struct bpf_func_proto * bpf_cpufreq_get_func_proto(
 	default:
 		struct bpf_func_proto * proto;
 		proto = bpf_base_func_proto(func_id);
-		if (proto) {
-			printk("cpufreq: bpf: %s: base_func_proto func_id", __func__);
+		if (proto)
 			return proto;
-		}
-		proto = tracing_prog_func_proto(func_id, prog);
-		if (proto) {
-			printk("cpufreq: bpf: %s: tracing_prog_func_proto", __func__);
-		} else {
-			printk("cpufreq: bpf: %s: tracing_prog_func_proto no proto", __func__);
-		}
-		return proto;
+
+		return tracing_prog_func_proto(func_id, prog);
 	}
 }
 
@@ -350,7 +440,7 @@ static int bpf_cpufreq_update(void *kdata, void *old_kdata)
 	const struct cpufreq_bpf_ops *old_ops = old_kdata;
 	struct cpufreq_bpf_ops *ops = kdata;
 
-	printk("cpufreq: bpf: %s: old_ops: %p new_ops: %p", __func__, old_kdata, kdata);
+	printk("cpufreq: bpf: %s: old_ops: %p new_ops: %p", __func__, old_ops, kdata);
 	mutex_lock(&cpufreq_ops_enable_mutex);
 	cpufreq_ops = ops;
 	mutex_unlock(&cpufreq_ops_enable_mutex);
@@ -424,7 +514,32 @@ BTF_ID_FLAGS(func, bpf_cpufreq_drv_enable_fast_switch)
 BTF_ID_FLAGS(func, bpf_cpufreq_drv_disable_fast_switch)
 BTF_ID_FLAGS(func, bpf_cpufreq_drv_boost_enabled)
 BTF_ID_FLAGS(func, bpf_cpufreq_drv_enable_boost_support)
+BTF_ID_FLAGS(func, bpf_cpufreq_drv_boost_trigger_state)
 BTF_SET8_END(cpufreq_bpf_drv_kfuncs)
+
+BTF_SET8_START(cpufreq_bpf_cppc_kfuncs)
+BTF_ID_FLAGS(func, bpf_cppc_get_desired_perf)
+BTF_ID_FLAGS(func, bpf_cppc_get_nominal_perf)
+BTF_ID_FLAGS(func, bpf_cppc_get_perf_ctrs)
+BTF_ID_FLAGS(func, bpf_cppc_set_perf)
+BTF_ID_FLAGS(func, bpf_cppc_set_enable)
+BTF_ID_FLAGS(func, bpf_cppc_get_perf_caps)
+BTF_ID_FLAGS(func, bpf_cppc_perf_ctrs_in_pcc)
+// BTF_ID_FLAGS(func, bpf_cppc_perf_to_khz)
+// BTF_ID_FLAGS(func, bpf_cppc_khz_to_perf)
+BTF_ID_FLAGS(func, bpf_acpi_cpc_valid)
+BTF_ID_FLAGS(func, bpf_cppc_allow_fast_switch)
+// BTF_ID_FLAGS(func, bpf_acpi_get_psd_map)
+BTF_ID_FLAGS(func, bpf_cppc_get_transition_latency)
+BTF_ID_FLAGS(func, bpf_cpc_ffh_supported)
+// BTF_ID_FLAGS(func, bpf_cpc_supported_by_cpu)
+BTF_ID_FLAGS(func, bpf_cpc_read_ffh)
+BTF_ID_FLAGS(func, bpf_cpc_write_ffh)
+BTF_ID_FLAGS(func, bpf_cppc_get_epp_perf)
+BTF_ID_FLAGS(func, bpf_cppc_set_epp_perf)
+BTF_ID_FLAGS(func, bpf_cppc_get_auto_sel_caps)
+BTF_ID_FLAGS(func, bpf_cppc_set_auto_sel)
+BTF_SET8_END(cpufreq_bpf_cppc_kfuncs)
 
 
 static const struct bpf_verifier_ops bpf_cpufreq_verifier_ops = {
@@ -467,6 +582,11 @@ static const struct btf_kfunc_id_set cpufreq_bpf_ops_kfunc_set = {
 static const struct btf_kfunc_id_set cpufreq_bpf_drv_kfunc_set = {
 	.owner = THIS_MODULE,
 	.set   = &cpufreq_bpf_drv_kfuncs,
+};
+
+static const struct btf_kfunc_id_set cpufreq_bpf_cppc_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set   = &cpufreq_bpf_cppc_kfuncs,
 };
 
 
@@ -520,12 +640,14 @@ static void cpufreq_bpf_policy_limits(struct cpufreq_policy *policy)
 
 }
 
-static ssize_t cpufreq_bpf_show_setspeed(struct cpufreq_policy *policy, char *buf)
+static ssize_t cpufreq_bpf_show_setspeed(struct cpufreq_policy *policy, char
+		*buf)
 {
 	return sprintf(buf, "%u\n", policy->cur);
 }
 
-static int cpufreq_bpf_store_setspeed(struct cpufreq_policy *policy, unsigned int freq)
+static int cpufreq_bpf_store_setspeed(struct cpufreq_policy *policy, unsigned
+		int freq)
 {
 	int ret = 0;
 
@@ -561,16 +683,21 @@ static int init_bpf(void)
 			&cpufreq_bpf_ops_kfunc_set);
 
 	// kfuncs
-	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_CLS,
-			&cpufreq_bpf_drv_kfunc_set);
-	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_ACT,
-			&cpufreq_bpf_drv_kfunc_set);
-	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_TRACING,
-			&cpufreq_bpf_drv_kfunc_set);
+	// ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_CLS,
+	// 		&cpufreq_bpf_drv_kfunc_set);
+	// ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_ACT,
+	// 		&cpufreq_bpf_drv_kfunc_set);
+	// ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_TRACING,
+	// 		&cpufreq_bpf_drv_kfunc_set);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_UNSPEC,
 			&cpufreq_bpf_drv_kfunc_set);
-	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL,
-			&cpufreq_bpf_drv_kfunc_set);
+
+	// ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL,
+	// 		&cpufreq_bpf_drv_kfunc_set);
+
+	// cppc kfuncs
+	// ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_UNSPEC,
+	// 		&cpufreq_bpf_cppc_kfunc_set);
 	if (ret)
 		return -EINVAL;
 
@@ -583,8 +710,10 @@ static int __init cpufreq_bpf_module_init(void)
 
 	ret = cpufreq_register_governor(&cpufreq_gov_bpf);
 	printk("cpufreq: bpf: %s: ret %d", __func__, ret);
+	if (ret)
+		return -EINVAL;
 
-	return ret;
+	return init_bpf();
 }
 
 static void __exit cpufreq_bpf_module_exit(void)
@@ -592,7 +721,6 @@ static void __exit cpufreq_bpf_module_exit(void)
 	cpufreq_unregister_governor(&cpufreq_gov_bpf);
 }
 
-late_initcall(init_bpf);
 module_init(cpufreq_bpf_module_init);
 module_exit(cpufreq_bpf_module_exit);
 
