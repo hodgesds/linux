@@ -87,6 +87,16 @@ config BPF_UNPRIV_DEFAULT_OFF
 
 	  If you are unsure how to answer this question, answer Y.
 
+config BPF_NOTIFIER
+	bool "Enable BPF notifier"
+	depends on BPF_EVENTS
+	depends on BPF_SYSCALL
+	help
+	  Enables implementation of the kernel notifier hooks with BPF programs
+	  for implementing BPF related notifications.
+
+	  If you are unsure how to answer this question, answer N.
+
 source "kernel/bpf/preload/Kconfig"
 
 config BPF_LSM
