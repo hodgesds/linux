@@ -27,7 +27,7 @@
 extern struct bpf_struct_ops bpf_cpufreq_bpf_ops;
 
 static DEFINE_MUTEX(cpufreq_ops_enable_mutex);
-static struct cpufreq_bpf_ops *cpufreq_ops;
+static struct cpufreq_bpf_ops *bpf_cpufreq_ops;
 static struct cpufreq_bpf_ops default_cpufreq_ops;
 
 
@@ -277,33 +277,35 @@ static const struct bpf_func_proto * bpf_cpufreq_get_func_proto(
 	case BPF_FUNC_trace_printk:
 		return bpf_get_trace_printk_proto();
 	default:
-		struct bpf_func_proto * proto;
-		proto = bpf_base_func_proto(func_id);
-		if (proto)
-			return proto;
-
-		return tracing_prog_func_proto(func_id, prog);
+		return bpf_base_func_proto(func_id, prog);
 	}
 }
 
 static bool bpf_cpufreq_is_valid_access(
-	int off, int size, enum bpf_access_type type, const struct bpf_prog *prog,
+	int off, int size,
+	enum bpf_access_type type,
+	const struct bpf_prog *prog,
 	struct bpf_insn_access_aux *info
 ) {
-
-	//if (off < 0 || off >= sizeof(struct cpufreq_bpf_ops))
-	//	return false
-
+	if (type != BPF_READ)
+		return false;
 
 	bpf_log(info->log, "[cpufreq] %s: offset: %d size: %d type: %d prog: %s", __func__, off, size, type, prog->aux->attach_func_name);
 	printk("cpufreq: bpf: %s: off: %d size: %d type: %d prog: %s", __func__, off, size, type, prog->aux->attach_func_name);
-	bool valid = btf_ctx_access(off, size, type, prog, info);
-	printk("cpufreq: bpf: %s: valid: %d", __func__, valid);
-	valid = bpf_tracing_btf_ctx_access(off, size, type, prog, info);
-	printk("cpufreq: bpf: %s: tracing valid ctx access: %d", __func__, valid);
+	if (off < 0 || off >= sizeof(__u64) * MAX_BPF_FUNC_ARGS)
+		return false;
 
-	return true;
+	if (off % size != 0)
+		return false;
 
+	return btf_ctx_access(off, size, type, prog, info);
+
+//	printk("cpufreq: bpf: %s: valid: %d", __func__, valid);
+//	valid = bpf_tracing_btf_ctx_access(off, size, type, prog, info);
+//	printk("cpufreq: bpf: %s: tracing valid ctx access: %d", __func__, valid);
+//
+//	return true;
+//
 	// return ret;
 }
 
@@ -426,23 +428,24 @@ static int bpf_cpufreq_check_member(const struct btf_type *t, const struct
 
 		break;
 	default:
-		if (prog->aux->sleepable) {
-			printk("cpufreq: bpf: %s: sleepable not allowed", __func__);
-			return -EINVAL;
-		}
+		// if (prog->aux->sleepable) {
+		// 	printk("cpufreq: bpf: %s: sleepable not allowed", __func__);
+		// 	return -EINVAL;
+		// }
 	}
 
 	return 0;
 }
 
-static int bpf_cpufreq_update(void *kdata, void *old_kdata)
+static int bpf_cpufreq_update(void *kdata, void *old_kdata,
+			      struct bpf_link * link)
 {
 	const struct cpufreq_bpf_ops *old_ops = old_kdata;
 	struct cpufreq_bpf_ops *ops = kdata;
 
 	printk("cpufreq: bpf: %s: old_ops: %p new_ops: %p", __func__, old_ops, kdata);
 	mutex_lock(&cpufreq_ops_enable_mutex);
-	cpufreq_ops = ops;
+	bpf_cpufreq_ops = ops;
 	mutex_unlock(&cpufreq_ops_enable_mutex);
 
 	return 0;
@@ -460,7 +463,7 @@ static int bpf_cpufreq_validate(void *kdata)
 	bool is_active = false;
 
 	mutex_lock(&cpufreq_ops_enable_mutex);
-	if (cpufreq_ops != &default_cpufreq_ops)
+	if (bpf_cpufreq_ops != &default_cpufreq_ops)
 		is_active = true;
 	mutex_unlock(&cpufreq_ops_enable_mutex);
 
@@ -474,25 +477,25 @@ static int bpf_cpufreq_init(struct btf *btf)
 	return 0;
 }
 
-static int bpf_cpufreq_reg(void *kdata)
+static int bpf_cpufreq_reg(void *kdata, struct bpf_link *link)
 {
 	struct cpufreq_bpf_ops *ops = kdata;
-	printk("cpufreq: bpf: %s: registering %p for %p", __func__, ops, (void *)cpufreq_ops);
+	printk("cpufreq: bpf: %s: registering %p for %p", __func__, ops, (void *)bpf_cpufreq_ops);
 
 	mutex_lock(&cpufreq_ops_enable_mutex);
-	cpufreq_ops = ops;
+	bpf_cpufreq_ops = ops;
 	mutex_unlock(&cpufreq_ops_enable_mutex);
 
 	return 0;
 }
 
-static void bpf_cpufreq_unreg(void *kdata)
+static void bpf_cpufreq_unreg(void *kdata, struct bpf_link *link)
 {
 	struct cpufreq_bpf_ops *ops = kdata;
 
-	printk("cpufreq: bpf: %s: unregistering %p for %p with default %p", __func__, ops, cpufreq_ops, (void *)&default_cpufreq_ops);
+	printk("cpufreq: bpf: %s: unregistering %p for %p with default %p", __func__, ops, bpf_cpufreq_ops, (void *)&default_cpufreq_ops);
 	mutex_lock(&cpufreq_ops_enable_mutex);
-	cpufreq_ops = &default_cpufreq_ops;
+	bpf_cpufreq_ops = &default_cpufreq_ops;
 	mutex_unlock(&cpufreq_ops_enable_mutex);
 }
 
@@ -545,9 +548,6 @@ BTF_SET8_END(cpufreq_bpf_cppc_kfuncs)
 static const struct bpf_verifier_ops bpf_cpufreq_verifier_ops = {
 	.get_func_proto		= bpf_cpufreq_get_func_proto,
 	.is_valid_access	= bpf_cpufreq_is_valid_access,
-	// .gen_prolouge           = bpf_cpufreq_gen_prologue,
-	// .gen_ld_abs             = bpf_cpufreq_gen_ld_abs,
-	// .convert_ctx_access     = bpf_cpufreq_convert_ctx_access,
 	.btf_struct_access	= bpf_cpufreq_btf_struct_access,
 };
 
@@ -570,6 +570,8 @@ struct bpf_struct_ops bpf_cpufreq_bpf_ops = {
 	.init = bpf_cpufreq_init,
 	.validate = bpf_cpufreq_validate,
 	.name = "cpufreq_bpf_ops",
+	.owner = THIS_MODULE,
+	.cfi_stubs = &default_cpufreq_ops,
 };
 
 
@@ -597,7 +599,7 @@ static int cpufreq_bpf_policy_init(struct cpufreq_policy *policy)
 	cpufreq_enable_fast_switch(policy);
 
 	mutex_lock(&cpufreq_ops_enable_mutex);
-	cpufreq_ops = &default_cpufreq_ops;
+	bpf_cpufreq_ops = &default_cpufreq_ops;
 	mutex_unlock(&cpufreq_ops_enable_mutex);
 
 	return 0;
@@ -609,7 +611,7 @@ static void cpufreq_bpf_policy_exit(struct cpufreq_policy *policy)
 	policy->governor_data = NULL;
 
 	mutex_lock(&cpufreq_ops_enable_mutex);
-	cpufreq_ops = &default_cpufreq_ops;
+	bpf_cpufreq_ops = &default_cpufreq_ops;
 	mutex_unlock(&cpufreq_ops_enable_mutex);
 }
 
@@ -619,24 +621,24 @@ static int cpufreq_bpf_policy_start(struct cpufreq_policy *policy)
 
 	BUG_ON(!policy->cur);
 
-	ret = cpufreq_ops->start(policy);
+	ret = bpf_cpufreq_ops->start(policy);
 
 	return ret;
 }
 
 static void cpufreq_bpf_policy_stop(struct cpufreq_policy *policy)
 {
-	cpufreq_ops->stop(policy);
+	bpf_cpufreq_ops->stop(policy);
 
 	// Restore default ops
 	mutex_lock(&cpufreq_ops_enable_mutex);
-	cpufreq_ops = &default_cpufreq_ops;
+	bpf_cpufreq_ops = &default_cpufreq_ops;
 	mutex_unlock(&cpufreq_ops_enable_mutex);
 }
 
 static void cpufreq_bpf_policy_limits(struct cpufreq_policy *policy)
 {
-	cpufreq_ops->limits(policy);
+	bpf_cpufreq_ops->limits(policy);
 
 }
 
@@ -653,9 +655,9 @@ static int cpufreq_bpf_store_setspeed(struct cpufreq_policy *policy, unsigned
 
 	policy->cur = freq;
 
-	ret = cpufreq_ops->store_setspeed(policy, freq);
+	ret = bpf_cpufreq_ops->store_setspeed(policy, freq);
 
-	return 0;
+	return ret;
 }
 
 
@@ -681,6 +683,9 @@ static int init_bpf(void)
 	// struct_ops
 	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_STRUCT_OPS,
 			&cpufreq_bpf_ops_kfunc_set);
+
+	ret = ret ?: register_bpf_struct_ops(&bpf_cpufreq_bpf_ops,
+					     cpufreq_bpf_ops);
 
 	// kfuncs
 	// ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_CLS,
