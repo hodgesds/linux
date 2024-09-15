@@ -3,6 +3,9 @@
 
 #include <linux/cpufreq.h>
 
+enum cpufreq_bpf_consts {
+	CPU_FREQ_BPF_NAME_LEN		= 128,
+};
 
 struct cpufreq_bpf_ops {
 	int	(*start)(struct cpufreq_policy *policy);
@@ -10,6 +13,7 @@ struct cpufreq_bpf_ops {
 	void	(*limits)(struct cpufreq_policy *policy);
 	int	(*store_setspeed)(struct cpufreq_policy *policy,
 				  unsigned int freq);
+	char name[CPU_FREQ_BPF_NAME_LEN];
 };
 
 #endif
