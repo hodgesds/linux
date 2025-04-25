@@ -2736,14 +2736,6 @@ static void scx_breather(struct rq *rq)
 static bool consume_dispatch_q(struct rq *rq, struct scx_dispatch_q *dsq)
 {
 	struct task_struct *p;
-retry:
-	/*
-	 * This retry loop can repeatedly race against scx_bypass() dequeueing
-	 * tasks from @dsq trying to put the system into the bypass mode. On
-	 * some multi-socket machines (e.g. 2x Intel 8480c), this can live-lock
-	 * the machine into soft lockups. Give a breather.
-	 */
-	scx_breather(rq);
 
 	/*
 	 * The caller can't expect to successfully consume a task if the task's
@@ -2752,6 +2744,15 @@ retry:
 	 */
 	if (list_empty(&dsq->list))
 		return false;
+
+retry:
+	/*
+	 * This retry loop can repeatedly race against scx_bypass() dequeueing
+	 * tasks from @dsq trying to put the system into the bypass mode. On
+	 * some multi-socket machines (e.g. 2x Intel 8480c), this can live-lock
+	 * the machine into soft lockups. Give a breather.
+	 */
+	scx_breather(rq);
 
 	raw_spin_lock(&dsq->lock);
 
