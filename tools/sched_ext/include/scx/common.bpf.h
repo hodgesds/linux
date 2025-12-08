@@ -102,6 +102,25 @@ struct task_struct *scx_bpf_cpu_curr(s32 cpu) __ksym __weak;
 u64 scx_bpf_now(void) __ksym __weak;
 void scx_bpf_events(struct scx_event_stats *events, size_t events__sz) __ksym __weak;
 
+/**
+ * scx_bpf_migrate_task_pages - Hint async page migration for task
+ * @p: target task
+ * @target_nid: target NUMA node ID
+ * @flags: reserved for future use (must be 0)
+ *
+ * Hints that @p's working set pages should be migrated to @target_nid.
+ * Migration happens asynchronously via NUMA balancing. This function
+ * returns immediately without blocking.
+ *
+ * This is typically called in select_cpu() when a task crosses NUMA
+ * boundaries, allowing the scheduler to proactively migrate pages.
+ *
+ * No error is returned. Migration is best-effort and may fail or be
+ * delayed due to memory pressure, mempolicy constraints, or system load.
+ */
+void scx_bpf_migrate_task_pages(struct task_struct *p, int target_nid,
+				 u64 flags) __ksym __weak;
+
 /*
  * Use the following as @it__iter when calling scx_bpf_dsq_move[_vtime]() from
  * within bpf_for_each() loops.

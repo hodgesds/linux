@@ -243,6 +243,153 @@ static struct scx_dispatch_q *find_global_dsq(struct scx_sched *sch,
 	return sch->global_dsqs[cpu_to_node(task_cpu(p))];
 }
 
+#ifdef CONFIG_NUMA_BALANCING
+/*
+ * Work item for async page migration hints from BPF scheduler.
+ * Queued when scx_bpf_migrate_task_pages() is called.
+ */
+struct scx_migrate_hint_work {
+	struct work_struct work;
+	struct mm_struct *mm;      /* Target mm, refcounted */
+	int target_nid;             /* Target NUMA node */
+	pid_t pid;                  /* For debugging/stats */
+};
+
+/* Workqueue for processing migration hints */
+static struct workqueue_struct *scx_migrate_wq __read_mostly;
+
+/* Pre-allocated work pool (lockless allocation for scheduler context) */
+static DEFINE_PER_CPU(struct scx_migrate_hint_work *, scx_migrate_work_cache);
+
+/* Migration hint statistics */
+struct scx_migrate_stats {
+	atomic64_t hints_total;      /* Total hints issued */
+	atomic64_t hints_dropped;    /* Hints dropped (alloc failure) */
+	atomic64_t pages_marked;     /* Pages marked protnone */
+};
+
+static struct scx_migrate_stats scx_migrate_stats;
+
+static struct scx_migrate_hint_work *alloc_migrate_hint_work(void)
+{
+	struct scx_migrate_hint_work *work;
+
+	/* Try per-CPU cache first (fast path, no allocation) */
+	work = this_cpu_read(scx_migrate_work_cache);
+	if (work) {
+		this_cpu_write(scx_migrate_work_cache, NULL);
+		return work;
+	}
+
+	/* Slow path: allocate with GFP_ATOMIC (scheduler context) */
+	work = kmalloc(sizeof(*work), GFP_ATOMIC | __GFP_NOWARN);
+	return work;
+}
+
+static void free_migrate_hint_work(struct scx_migrate_hint_work *work)
+{
+	/* Try to cache for reuse */
+	if (!this_cpu_read(scx_migrate_work_cache)) {
+		this_cpu_write(scx_migrate_work_cache, work);
+		return;
+	}
+
+	/* Cache full, free it */
+	kfree(work);
+}
+
+/*
+ * Worker function that marks task pages as protnone to trigger
+ * migration on next access via NUMA balancing.
+ *
+ * Runs in workqueue context (can sleep and take locks).
+ */
+static void scx_migrate_hint_worker(struct work_struct *work)
+{
+	struct scx_migrate_hint_work *mw;
+	struct mm_struct *mm;
+	struct vm_area_struct *vma;
+	unsigned long start, end, pages_marked = 0;
+	int target_nid;
+	VMA_ITERATOR(vmi, mm, 0);
+
+	mw = container_of(work, struct scx_migrate_hint_work, work);
+	mm = mw->mm;
+	target_nid = mw->target_nid;
+
+	if (!mmap_read_trylock(mm)) {
+		/* Contended, skip to avoid blocking */
+		goto out_mmput;
+	}
+
+	/*
+	 * Mark anonymous VMAs as protnone to trigger NUMA faults.
+	 * We focus on anonymous memory (task working set), not file-backed.
+	 */
+	for_each_vma(vmi, vma) {
+		/* Skip non-anonymous, special, or huge page VMAs */
+		if (!vma_is_accessible(vma) || vma_is_temporary_stack(vma) ||
+		    (vma->vm_flags & (VM_IO | VM_PFNMAP | VM_HUGETLB)))
+			continue;
+
+		if (!vma_is_anonymous(vma))
+			continue;
+
+		start = vma->vm_start;
+		end = vma->vm_end;
+
+		/*
+		 * Use change_protection() with MM_CP_PROT_NUMA to mark
+		 * pages as protnone. This is the same mechanism used by
+		 * NUMA balancing.
+		 */
+		change_protection(vma, start, end, PAGE_NONE, MM_CP_PROT_NUMA);
+
+		/* Track pages marked */
+		pages_marked += (end - start) >> PAGE_SHIFT;
+	}
+
+	/* Update stats */
+	if (pages_marked)
+		atomic64_add(pages_marked, &scx_migrate_stats.pages_marked);
+
+	mmap_read_unlock(mm);
+
+out_mmput:
+	mmput(mm); /* Release mm reference */
+	free_migrate_hint_work(mw);
+}
+
+static void queue_numa_migrate_work(struct task_struct *p,
+				     struct mm_struct *mm, int target_nid)
+{
+	struct scx_migrate_hint_work *work;
+
+	/* Allocate work item (may fail in atomic context) */
+	work = alloc_migrate_hint_work();
+	if (!work) {
+		atomic64_inc(&scx_migrate_stats.hints_dropped);
+		return; /* Silently drop hint if allocation fails */
+	}
+
+	/* Setup work */
+	work->mm = mm;
+	work->target_nid = target_nid;
+	work->pid = p->pid;
+
+	/* Take mm reference (released by worker) */
+	if (!mmget_not_zero(mm)) {
+		free_migrate_hint_work(work);
+		atomic64_inc(&scx_migrate_stats.hints_dropped);
+		return;
+	}
+
+	/* Initialize and queue work */
+	INIT_WORK(&work->work, scx_migrate_hint_worker);
+	queue_work(scx_migrate_wq, &work->work);
+}
+#endif
+
 static struct scx_dispatch_q *find_user_dsq(struct scx_sched *sch, u64 dsq_id)
 {
 	return rhashtable_lookup(&sch->dsq_hash, &dsq_id, dsq_hash_params);
@@ -3552,12 +3699,46 @@ static ssize_t scx_attr_enable_seq_show(struct kobject *kobj,
 }
 SCX_ATTR(enable_seq);
 
+#ifdef CONFIG_NUMA_BALANCING
+static ssize_t scx_attr_migrate_hints_total_show(struct kobject *kobj,
+						  struct kobj_attribute *ka,
+						  char *buf)
+{
+	return sysfs_emit(buf, "%lld\n",
+			  atomic64_read(&scx_migrate_stats.hints_total));
+}
+SCX_ATTR(migrate_hints_total);
+
+static ssize_t scx_attr_migrate_hints_dropped_show(struct kobject *kobj,
+						    struct kobj_attribute *ka,
+						    char *buf)
+{
+	return sysfs_emit(buf, "%lld\n",
+			  atomic64_read(&scx_migrate_stats.hints_dropped));
+}
+SCX_ATTR(migrate_hints_dropped);
+
+static ssize_t scx_attr_migrate_pages_marked_show(struct kobject *kobj,
+						   struct kobj_attribute *ka,
+						   char *buf)
+{
+	return sysfs_emit(buf, "%lld\n",
+			  atomic64_read(&scx_migrate_stats.pages_marked));
+}
+SCX_ATTR(migrate_pages_marked);
+#endif /* CONFIG_NUMA_BALANCING */
+
 static struct attribute *scx_global_attrs[] = {
 	&scx_attr_state.attr,
 	&scx_attr_switch_all.attr,
 	&scx_attr_nr_rejected.attr,
 	&scx_attr_hotplug_seq.attr,
 	&scx_attr_enable_seq.attr,
+#ifdef CONFIG_NUMA_BALANCING
+	&scx_attr_migrate_hints_total.attr,
+	&scx_attr_migrate_hints_dropped.attr,
+	&scx_attr_migrate_pages_marked.attr,
+#endif
 	NULL,
 };
 
@@ -7194,6 +7375,49 @@ __bpf_kfunc void scx_bpf_events(struct scx_event_stats *events,
 	memcpy(events, &e_sys, events__sz);
 }
 
+/**
+ * scx_bpf_migrate_task_pages() - Hint async page migration to target node
+ * @p: target task (must be valid, RCU-protected)
+ * @target_nid: target NUMA node ID (0 to nr_node_ids-1)
+ * @flags: reserved flags (must be 0)
+ *
+ * Hints that @p's working set pages should be migrated to @target_nid
+ * asynchronously. Migration happens via NUMA balancing infrastructure.
+ * This function returns immediately without blocking the scheduler.
+ *
+ * The hint is best-effort - migration may fail or be delayed due to:
+ * - Memory pressure
+ * - Memory policy constraints (mbind/set_mempolicy)
+ * - Task has no mm (kernel thread)
+ * - Target node offline or invalid
+ *
+ * No error is returned. Callers should not depend on migration completing.
+ */
+__bpf_kfunc void scx_bpf_migrate_task_pages(struct task_struct *p,
+					     int target_nid, u64 flags)
+{
+	struct mm_struct *mm;
+
+	/* Validation */
+	if (!p || target_nid < 0 || target_nid >= nr_node_ids || flags != 0)
+		return;
+
+	mm = p->mm;
+	if (!mm)
+		return; /* Kernel thread, no pages to migrate */
+
+#ifdef CONFIG_NUMA_BALANCING
+	/* Track total hints issued */
+	atomic64_inc(&scx_migrate_stats.hints_total);
+
+	/* Set preferred node hint for NUMA balancing */
+	WRITE_ONCE(p->numa_preferred_nid, target_nid);
+
+	/* Queue async work to mark pages protnone */
+	queue_numa_migrate_work(p, mm, target_nid);
+#endif
+}
+
 __bpf_kfunc_end_defs();
 
 BTF_KFUNCS_START(scx_kfunc_ids_any)
@@ -7228,6 +7452,7 @@ BTF_ID_FLAGS(func, scx_bpf_task_cgroup, KF_RCU | KF_ACQUIRE)
 #endif
 BTF_ID_FLAGS(func, scx_bpf_now)
 BTF_ID_FLAGS(func, scx_bpf_events, KF_TRUSTED_ARGS)
+BTF_ID_FLAGS(func, scx_bpf_migrate_task_pages, KF_RCU | KF_TRUSTED_ARGS)
 BTF_KFUNCS_END(scx_kfunc_ids_any)
 
 static const struct btf_kfunc_id_set scx_kfunc_set_any = {
@@ -7305,6 +7530,15 @@ static int __init scx_init(void)
 		pr_err("sched_ext: Failed to allocate cpumasks\n");
 		return -ENOMEM;
 	}
+
+#ifdef CONFIG_NUMA_BALANCING
+	/* Create workqueue for async page migration hints */
+	scx_migrate_wq = alloc_workqueue("scx_migrate", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+	if (!scx_migrate_wq) {
+		pr_err("sched_ext: Failed to create migration workqueue\n");
+		return -ENOMEM;
+	}
+#endif
 
 	return 0;
 }
