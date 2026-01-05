@@ -33,6 +33,7 @@
 #include "memmap.h"
 #include "zcrx.h"
 #include "query.h"
+#include "ipc.h"
 
 #define IORING_MAX_RESTRICTIONS	(IORING_RESTRICTION_LAST + \
 				 IORING_REGISTER_LAST + IORING_OP_LAST)
@@ -817,6 +818,27 @@ static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
 		break;
 	case IORING_REGISTER_ZCRX_CTRL:
 		ret = io_zcrx_ctrl(ctx, arg, nr_args);
+		break;
+	case IORING_REGISTER_IPC_CHANNEL_CREATE:
+		ret = -EINVAL;
+		if (!arg || nr_args != 1)
+			break;
+		ret = io_ipc_channel_create(ctx, arg);
+		break;
+	case IORING_REGISTER_IPC_CHANNEL_ATTACH:
+		ret = -EINVAL;
+		if (!arg || nr_args != 1)
+			break;
+		ret = io_ipc_channel_attach(ctx, arg);
+		break;
+	case IORING_REGISTER_IPC_CHANNEL_DETACH:
+		ret = -EINVAL;
+		if (!arg || nr_args != 1)
+			break;
+		ret = io_ipc_channel_detach(ctx, *(u32 __user *)arg);
+		break;
+	case IORING_REGISTER_IPC_BUFFERS:
+		ret = -EOPNOTSUPP; /* TODO: implement */
 		break;
 	default:
 		ret = -EINVAL;

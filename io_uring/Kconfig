@@ -9,3 +9,17 @@ config IO_URING_ZCRX
 	depends on PAGE_POOL
 	depends on INET
 	depends on NET_RX_BUSY_POLL
+
+config IO_URING_IPC
+	bool "io_uring IPC support"
+	depends on IO_URING
+	default y
+	help
+	  Enable io_uring-based inter-process communication.
+
+	  This provides high-performance IPC channels that leverage
+	  io_uring's shared memory infrastructure and async notification
+	  model. Supports broadcast and multicast patterns with
+	  zero-copy capabilities.
+
+	  If unsure, say Y.

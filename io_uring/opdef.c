@@ -38,6 +38,7 @@
 #include "futex.h"
 #include "truncate.h"
 #include "zcrx.h"
+#include "ipc.h"
 
 static int io_no_issue(struct io_kiocb *req, unsigned int issue_flags)
 {
@@ -593,6 +594,22 @@ const struct io_issue_def io_issue_defs[] = {
 		.prep			= io_uring_cmd_prep,
 		.issue			= io_uring_cmd,
 	},
+	[IORING_OP_IPC_SEND] = {
+		.audit_skip		= 1,
+		.async_size		= sizeof(struct io_ipc_send),
+		.prep			= io_ipc_send_prep,
+		.issue			= io_ipc_send,
+	},
+	[IORING_OP_IPC_RECV] = {
+		.audit_skip		= 1,
+		.async_size		= sizeof(struct io_ipc_recv),
+		.prep			= io_ipc_recv_prep,
+		.issue			= io_ipc_recv,
+	},
+	[IORING_OP_IPC_SENDRECV] = {
+		.audit_skip		= 1,
+		.prep			= io_eopnotsupp_prep,
+	},
 };
 
 const struct io_cold_def io_cold_defs[] = {
@@ -850,6 +867,17 @@ const struct io_cold_def io_cold_defs[] = {
 		.name			= "URING_CMD128",
 		.sqe_copy		= io_uring_cmd_sqe_copy,
 		.cleanup		= io_uring_cmd_cleanup,
+	},
+	[IORING_OP_IPC_SEND] = {
+		.name			= "IPC_SEND",
+		.cleanup		= io_ipc_send_cleanup,
+	},
+	[IORING_OP_IPC_RECV] = {
+		.name			= "IPC_RECV",
+		.cleanup		= io_ipc_recv_cleanup,
+	},
+	[IORING_OP_IPC_SENDRECV] = {
+		.name			= "IPC_SENDRECV",
 	},
 };
 
