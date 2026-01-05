@@ -34,6 +34,7 @@
 #include "zcrx.h"
 #include "query.h"
 #include "bpf_filter.h"
+#include "ipc.h"
 
 #define IORING_MAX_RESTRICTIONS	(IORING_RESTRICTION_LAST + \
 				 IORING_REGISTER_LAST + IORING_OP_LAST)
@@ -918,6 +919,32 @@ static int __io_uring_register(struct io_ring_ctx *ctx, unsigned opcode,
 		if (!ret)
 			WRITE_ONCE(ctx->bpf_filters,
 				   ctx->restrictions.bpf_filters->filters);
+		break;
+	case IORING_REGISTER_IPC_CHANNEL_CREATE:
+		ret = -EINVAL;
+		if (!arg || nr_args != 1)
+			break;
+		ret = io_ipc_channel_create(ctx, arg);
+		break;
+	case IORING_REGISTER_IPC_CHANNEL_ATTACH:
+		ret = -EINVAL;
+		if (!arg || nr_args != 1)
+			break;
+		ret = io_ipc_channel_attach(ctx, arg);
+		break;
+	case IORING_REGISTER_IPC_CHANNEL_DETACH: {
+		u32 channel_id;
+
+		ret = -EINVAL;
+		if (!arg || nr_args != 1)
+			break;
+		ret = get_user(channel_id, (u32 __user *)arg);
+		if (!ret)
+			ret = io_ipc_channel_detach(ctx, channel_id);
+		break;
+	}
+	case IORING_REGISTER_IPC_BUFFERS:
+		ret = -EOPNOTSUPP; /* TODO: implement */
 		break;
 	default:
 		ret = -EINVAL;
