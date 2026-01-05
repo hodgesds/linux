@@ -163,6 +163,7 @@ static int ipc_region_alloc(struct io_ipc_channel *channel, u32 ring_entries,
 	/* Set up ring and data region pointers */
 	channel->region = region;
 	channel->ring = (struct io_ipc_ring *)ptr;
+	channel->desc_array = (struct io_ipc_msg_desc *)((u8 *)ptr + sizeof(struct io_ipc_ring));
 	channel->data_region = ptr + ring_size;
 	channel->data_region_size = data_size;
 
@@ -544,9 +545,6 @@ int io_ipc_channel_detach(struct io_ring_ctx *ctx, u32 subscriber_id)
 	return -ENOENT;
 }
 
-/*
- * Wake up receivers waiting for messages
- */
 static void ipc_wake_receivers(struct io_ipc_channel *channel)
 {
 	struct io_ipc_subscriber *sub;
@@ -555,8 +553,9 @@ static void ipc_wake_receivers(struct io_ipc_channel *channel)
 	rcu_read_lock();
 	xa_for_each(&channel->subscribers, index, sub) {
 		if (sub->flags & IOIPC_SUB_RECV) {
-			/* Wake up the subscriber's io_uring context */
 			io_cqring_wake(sub->ctx);
+			if (!(channel->flags & IOIPC_F_BROADCAST))
+				break;
 		}
 	}
 	rcu_read_unlock();
@@ -598,11 +597,10 @@ int io_ipc_send(struct io_kiocb *req, unsigned int issue_flags)
 	void *dest;
 	u32 head, tail, next_tail, idx;
 	u32 sub_flags;
-	u64 offset;
 	int ret;
 	u32 fd = ipc->channel_id;
+	bool need_put = false;
 
-	/* First try to find subscriber in context's list (sqe->fd = subscriber_id) */
 	rcu_read_lock();
 	list_for_each_entry_rcu(sub, &req->ctx->ipc_subscriber_list, list) {
 		if (sub->subscriber_id == fd) {
@@ -610,76 +608,74 @@ int io_ipc_send(struct io_kiocb *req, unsigned int issue_flags)
 			refcount_inc(&channel->ref_count);
 			sub_flags = sub->flags;
 			rcu_read_unlock();
+			need_put = true;
 
-			/* Check send permission */
 			if (!(sub_flags & IOIPC_SUB_SEND)) {
-				ret = -EACCES;
-				goto out_put;
+				io_ipc_channel_put(channel);
+				return -EACCES;
 			}
 			goto found;
 		}
 	}
 	rcu_read_unlock();
 
-	/* Not a subscriber_id, try as channel_id (for non-attached senders) */
 	channel = io_ipc_channel_get(fd);
 	if (!channel)
 		return -ENOENT;
 
-	/* Check send permission for non-subscriber */
+	need_put = true;
+
 	ret = ipc_check_permission(channel, IOIPC_SUB_SEND);
-	if (ret)
-		goto out_put;
+	if (ret) {
+		io_ipc_channel_put(channel);
+		return ret;
+	}
 
 found:
-	ipc->channel = channel;
 	ring = channel->ring;
 
-	/* Check message size */
-	if (ipc->len > channel->msg_max_size) {
-		ret = -EMSGSIZE;
-		goto out_put;
+	if (unlikely(ipc->len > channel->msg_max_size)) {
+		if (need_put)
+			io_ipc_channel_put(channel);
+		return -EMSGSIZE;
 	}
 
 	mutex_lock(&channel->producer_lock);
 
-	/* Get current producer tail */
 	tail = READ_ONCE(ring->producer.tail);
 	next_tail = tail + 1;
-
-	/* Check if ring is full */
 	head = READ_ONCE(ring->consumer.head);
-	if (next_tail - head > ring->ring_entries) {
-		WRITE_ONCE(ring->producer.dropped,
-			   READ_ONCE(ring->producer.dropped) + 1);
+
+	if (unlikely(next_tail - head > ring->ring_entries)) {
 		mutex_unlock(&channel->producer_lock);
-		ret = -ENOBUFS;
-		goto out_put;
+		if (need_put)
+			io_ipc_channel_put(channel);
+		return -ENOBUFS;
 	}
 
-	/* Calculate ring index and data offset */
 	idx = tail & ring->ring_mask;
-	offset = (u64)(idx * channel->msg_max_size);
-	dest = channel->data_region + offset;
+	dest = channel->data_region + (idx * channel->msg_max_size);
+	desc = &channel->desc_array[idx];
 
-	/* OPTIMIZATION: Copy directly from userspace to ring buffer */
+	prefetchw(desc);
+
 	user_buf = u64_to_user_ptr(ipc->addr);
-	if (copy_from_user(dest, user_buf, ipc->len)) {
-		mutex_unlock(&channel->producer_lock);
-		ret = -EFAULT;
-		goto out_put;
+	if (unlikely(__copy_from_user_inatomic(dest, user_buf, ipc->len))) {
+		if (unlikely(copy_from_user(dest, user_buf, ipc->len))) {
+			mutex_unlock(&channel->producer_lock);
+			if (need_put)
+				io_ipc_channel_put(channel);
+			return -EFAULT;
+		}
 	}
 
-	/* Fill in message descriptor */
-	desc = (struct io_ipc_msg_desc *)((u8 *)ring +
-		sizeof(struct io_ipc_ring) + idx * sizeof(*desc));
-	desc->offset = offset;
+	desc->offset = idx * channel->msg_max_size;
 	desc->len = ipc->len;
 	desc->msg_id = atomic_inc_return(&channel->next_msg_id);
 	desc->sender_data = req->cqe.user_data;
 	desc->flags = 0;
 	desc->sender_id = 0;
-	desc->timestamp = 0; /* Optimization: avoid expensive ktime_get_ns() */
+	desc->timestamp = 0;
 
 	/* Memory barrier to ensure descriptor is written before tail update */
 	smp_wmb();
@@ -688,29 +684,17 @@ found:
 	WRITE_ONCE(ring->producer.tail, next_tail);
 	mutex_unlock(&channel->producer_lock);
 
-	/* Update statistics (relaxed, not performance-critical) */
-	atomic64_inc(&channel->msgs_sent);
-	atomic64_add(ipc->len, &channel->bytes_transferred);
-
-	ret = ipc->len; /* Return bytes sent */
-
 	/* Wake up receivers */
 	ipc_wake_receivers(channel);
 
-out_put:
-	io_ipc_channel_put(channel);
-	ipc->channel = NULL;
-	return ret;
+	if (need_put)
+		io_ipc_channel_put(channel);
+
+	return ipc->len;
 }
 
 void io_ipc_send_cleanup(struct io_kiocb *req)
 {
-	struct io_ipc_send *ipc = io_kiocb_to_cmd(req, struct io_ipc_send);
-
-	if (ipc->channel) {
-		io_ipc_channel_put(ipc->channel);
-		ipc->channel = NULL;
-	}
 }
 
 /*
@@ -771,11 +755,8 @@ int io_ipc_recv(struct io_kiocb *req, unsigned int issue_flags)
 	return -ENOENT;
 
 found:
-	ipc->channel = channel;
-	ipc->subscriber = sub;
 	ring = channel->ring;
 
-	/* Check receive permission */
 	if (!(sub_flags & IOIPC_SUB_RECV)) {
 		ret = -EACCES;
 		goto out_put;
@@ -783,29 +764,27 @@ found:
 
 	/* Check if there are messages available */
 	tail = READ_ONCE(ring->producer.tail);
-	smp_rmb(); /* Ensure tail is read before checking */
-	if (head == tail) {
-		ret = -EAGAIN; /* No messages available */
+	if (unlikely(head == tail)) {
+		ret = -EAGAIN;
 		goto out_put;
 	}
 
-	/* Memory barrier to ensure we read fresh descriptor data */
 	smp_rmb();
 
-	/* Calculate ring index */
 	idx = head & ring->ring_mask;
+	desc = &channel->desc_array[idx];
 
-	/* Get message descriptor */
-	desc = (struct io_ipc_msg_desc *)((u8 *)ring +
-		sizeof(struct io_ipc_ring) + idx * sizeof(*desc));
-
-	/* OPTIMIZATION: Copy directly from ring buffer to userspace */
 	src = channel->data_region + desc->offset;
+	prefetch(src);
+
 	copy_len = min_t(u32, desc->len, ipc->len);
 	user_buf = u64_to_user_ptr(ipc->addr);
-	if (copy_to_user(user_buf, src, copy_len)) {
-		ret = -EFAULT;
-		goto out_put;
+
+	if (unlikely(__copy_to_user_inatomic(user_buf, src, copy_len))) {
+		if (unlikely(copy_to_user(user_buf, src, copy_len))) {
+			ret = -EFAULT;
+			goto out_put;
+		}
 	}
 
 	/*
@@ -852,25 +831,14 @@ update_head:
 	}
 	rcu_read_unlock();
 
-	/* Update statistics */
-	atomic64_inc(&channel->msgs_received);
-
-	ret = copy_len; /* Return bytes received */
-
+	ret = copy_len;
 out_put:
 	io_ipc_channel_put(channel);
-	ipc->channel = NULL;
 	return ret;
 }
 
 void io_ipc_recv_cleanup(struct io_kiocb *req)
 {
-	struct io_ipc_recv *ipc = io_kiocb_to_cmd(req, struct io_ipc_recv);
-
-	if (ipc->channel) {
-		io_ipc_channel_put(ipc->channel);
-		ipc->channel = NULL;
-	}
 }
 
 /*

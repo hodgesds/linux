@@ -70,6 +70,7 @@ struct io_ipc_channel {
 	struct io_mapped_region	*region;	/* Shared memory region */
 	struct io_ipc_ring	*ring;		/* Shared ring structure in mmap'd region */
 	void			*data_region;	/* Data storage area for messages */
+	struct io_ipc_msg_desc	*desc_array;	/* Cached descriptor array base */
 	struct file		*file;		/* Anonymous file for mmap support */
 
 	/* Subscribers to this channel */
