@@ -1146,7 +1146,7 @@ int wilc_add_ptk(struct wilc_vif *vif, const u8 *ptk, u8 ptk_key_len,
 		wid_list[1].val = (u8 *)key_buf;
 		result = wilc_send_config_pkt(vif, WILC_SET_CFG, wid_list,
 					      ARRAY_SIZE(wid_list));
-		kfree(key_buf);
+		kfree_sensitive(key_buf);
 	} else if (mode == WILC_STATION_MODE) {
 		struct wid wid;
 		struct wilc_sta_wpa_ptk *key_buf;
@@ -1172,7 +1172,7 @@ int wilc_add_ptk(struct wilc_vif *vif, const u8 *ptk, u8 ptk_key_len,
 		wid.size = sizeof(*key_buf) + t_key_len;
 		wid.val = (s8 *)key_buf;
 		result = wilc_send_config_pkt(vif, WILC_SET_CFG, &wid, 1);
-		kfree(key_buf);
+		kfree_sensitive(key_buf);
 	}
 
 	return result;
@@ -1203,7 +1203,7 @@ int wilc_add_igtk(struct wilc_vif *vif, const u8 *igtk, u8 igtk_key_len,
 	wid.size = sizeof(*key_buf) + t_key_len;
 	wid.val = (s8 *)key_buf;
 	result = wilc_send_config_pkt(vif, WILC_SET_CFG, &wid, 1);
-	kfree(key_buf);
+	kfree_sensitive(key_buf);
 
 	return result;
 }
