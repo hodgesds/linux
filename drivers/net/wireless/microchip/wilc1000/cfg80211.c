@@ -653,7 +653,7 @@ static int del_key(struct wiphy *wiphy, struct net_device *netdev, int link_id,
 	if (!pairwise && (key_index == 4 || key_index == 5)) {
 		key_index -= 4;
 		if (priv->wilc_igtk[key_index]) {
-			kfree(priv->wilc_igtk[key_index]->key);
+			kfree_sensitive(priv->wilc_igtk[key_index]->key);
 			priv->wilc_igtk[key_index]->key = NULL;
 			kfree(priv->wilc_igtk[key_index]->seq);
 			priv->wilc_igtk[key_index]->seq = NULL;
@@ -662,7 +662,7 @@ static int del_key(struct wiphy *wiphy, struct net_device *netdev, int link_id,
 		}
 	} else {
 		if (priv->wilc_gtk[key_index]) {
-			kfree(priv->wilc_gtk[key_index]->key);
+			kfree_sensitive(priv->wilc_gtk[key_index]->key);
 			priv->wilc_gtk[key_index]->key = NULL;
 			kfree(priv->wilc_gtk[key_index]->seq);
 			priv->wilc_gtk[key_index]->seq = NULL;
@@ -671,7 +671,7 @@ static int del_key(struct wiphy *wiphy, struct net_device *netdev, int link_id,
 			priv->wilc_gtk[key_index] = NULL;
 		}
 		if (priv->wilc_ptk[key_index]) {
-			kfree(priv->wilc_ptk[key_index]->key);
+			kfree_sensitive(priv->wilc_ptk[key_index]->key);
 			priv->wilc_ptk[key_index]->key = NULL;
 			kfree(priv->wilc_ptk[key_index]->seq);
 			priv->wilc_ptk[key_index]->seq = NULL;
