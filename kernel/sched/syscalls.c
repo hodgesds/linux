@@ -1306,6 +1306,15 @@ static void do_sched_yield(void)
 	schedstat_inc(rq->yld_count);
 	rq->donor->sched_class->yield_task(rq);
 
+	/*
+	 * If we're the only runnable task and there are no pending wakeups,
+	 * there's nothing to yield to. Skip the schedule() overhead.
+	 */
+	if (rq->nr_running == 1 && !READ_ONCE(rq->ttwu_pending)) {
+		rq_unlock_irq(rq, &rf);
+		return;
+	}
+
 	preempt_disable();
 	rq_unlock_irq(rq, &rf);
 	sched_preempt_enable_no_resched();
