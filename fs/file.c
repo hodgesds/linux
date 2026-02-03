@@ -1041,12 +1041,18 @@ static inline struct file *__fget_files_rcu(struct files_struct *files,
 		 * We need to confirm it by incrementing the refcount
 		 * and then check the lookup again.
 		 *
-		 * file_ref_get() gives us a full memory barrier. We
-		 * only really need an 'acquire' one to protect the
-		 * loads below, but we don't have that.
+		 * We only need acquire ordering to protect the loads
+		 * below (f_mode check, fdentry recheck). On ARM64,
+		 * file_ref_get_acquire() provides this with a cheaper
+		 * barrier than file_ref_get()'s full barrier.
 		 */
+#ifdef CONFIG_ARM64
+		if (unlikely(!file_ref_get_acquire(&file->f_ref)))
+			continue;
+#else
 		if (unlikely(!file_ref_get(&file->f_ref)))
 			continue;
+#endif
 
 		/*
 		 * Such a race can take two forms:

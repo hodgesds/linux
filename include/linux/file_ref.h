@@ -108,6 +108,33 @@ static __always_inline __must_check bool file_ref_get(file_ref_t *ref)
 	return !atomic_long_add_negative(1, &ref->refcnt);
 }
 
+#ifdef CONFIG_ARM64
+/**
+ * file_ref_get_acquire - Acquire one reference on a file with acquire semantics
+ * @ref: Pointer to the reference count
+ *
+ * Similar to file_ref_get() but uses acquire ordering instead of full memory
+ * barriers. This is sufficient when only loads after the get need to be
+ * ordered with respect to the reference count increment.
+ *
+ * On weakly-ordered architectures (ARM64), this avoids an expensive full
+ * barrier. On strongly-ordered architectures (x86), there is no difference.
+ *
+ * Return: False if the attempt to acquire a reference failed. This happens
+ *         when the last reference has been put already. True if a reference
+ *         was successfully acquired
+ */
+static __always_inline __must_check bool file_ref_get_acquire(file_ref_t *ref)
+{
+	/*
+	 * Use acquire ordering - sufficient for the fd lookup path where
+	 * we only need to ensure subsequent loads (f_mode check, etc.)
+	 * happen after the refcount increment is visible.
+	 */
+	return atomic_long_add_return_acquire(1, &ref->refcnt) >= 0;
+}
+#endif
+
 /**
  * file_ref_inc - Acquire one reference on a file
  * @ref: Pointer to the reference count
