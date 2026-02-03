@@ -23,6 +23,7 @@
 #include <linux/rw_hint.h>
 #include <linux/seq_file.h>
 #include <linux/debugfs.h>
+#include <linux/zfcache.h>
 #include <trace/events/writeback.h>
 #define CREATE_TRACE_POINTS
 #include <trace/events/timestamp.h>
@@ -817,6 +818,13 @@ static void evict(struct inode *inode)
 
 	BUG_ON(!(inode_state_read_once(inode) & I_FREEING));
 	BUG_ON(!list_empty(&inode->i_lru));
+
+	/*
+	 * Invalidate any compressed pages in zfcache for this inode.
+	 * This must be done before truncating inode pages to avoid
+	 * stale compressed data remaining after inode eviction.
+	 */
+	zfcache_invalidate_inode(inode);
 
 	inode_io_list_del(inode);
 	inode_sb_list_del(inode);

@@ -122,6 +122,77 @@ config ZSWAP_COMPRESSOR_DEFAULT
        default "zstd" if ZSWAP_COMPRESSOR_DEFAULT_ZSTD
        default ""
 
+config ZFCACHE
+	bool "Compressed cache for file pages (EXPERIMENTAL)"
+	depends on MMU
+	select CRYPTO
+	select ZSMALLOC
+	help
+	  A lightweight compressed cache for file-backed pages. It takes
+	  clean file pages that are being evicted from the page cache and
+	  attempts to compress them into a dynamically allocated RAM-based
+	  memory pool. This can result in significant I/O reduction when
+	  pages are re-accessed, as they can be decompressed from RAM
+	  instead of being read from disk.
+
+	  This is similar to zswap but for file-backed pages instead of
+	  swap pages. It intercepts clean file pages during eviction and
+	  stores them compressed, restoring them on page fault.
+
+	  If unsure, say N.
+
+config ZFCACHE_DEFAULT_ON
+	bool "Enable the compressed cache for file pages by default"
+	depends on ZFCACHE
+	default n
+	help
+	  If selected, the compressed cache for file pages will be enabled
+	  at boot, otherwise it will be disabled.
+
+	  The selection made here can be overridden by using the kernel
+	  command line 'zfcache.enabled=' option.
+
+choice
+	prompt "Default compressor for zfcache"
+	depends on ZFCACHE
+	default ZFCACHE_COMPRESSOR_DEFAULT_LZ4
+	help
+	  Selects the default compression algorithm for the compressed cache
+	  for file pages.
+
+	  LZ4 is recommended for its good balance of compression ratio and
+	  speed.
+
+	  The selection made here can be overridden by using the kernel
+	  command line 'zfcache.compressor=' option.
+
+config ZFCACHE_COMPRESSOR_DEFAULT_LZO
+	bool "LZO"
+	select CRYPTO_LZO
+	help
+	  Use the LZO algorithm as the default compression algorithm.
+
+config ZFCACHE_COMPRESSOR_DEFAULT_LZ4
+	bool "LZ4"
+	select CRYPTO_LZ4
+	help
+	  Use the LZ4 algorithm as the default compression algorithm.
+
+config ZFCACHE_COMPRESSOR_DEFAULT_ZSTD
+	bool "zstd"
+	select CRYPTO_ZSTD
+	help
+	  Use the zstd algorithm as the default compression algorithm.
+endchoice
+
+config ZFCACHE_COMPRESSOR_DEFAULT
+	string
+	depends on ZFCACHE
+	default "lzo" if ZFCACHE_COMPRESSOR_DEFAULT_LZO
+	default "lz4" if ZFCACHE_COMPRESSOR_DEFAULT_LZ4
+	default "zstd" if ZFCACHE_COMPRESSOR_DEFAULT_ZSTD
+	default "lz4"
+
 config ZSMALLOC
 	tristate
 

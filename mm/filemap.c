@@ -49,6 +49,7 @@
 #include <linux/sched/mm.h>
 #include <linux/sysctl.h>
 #include <linux/pgalloc.h>
+#include <linux/zfcache.h>
 
 #include <asm/tlbflush.h>
 #include "internal.h"
@@ -977,8 +978,16 @@ int filemap_add_folio(struct address_space *mapping, struct folio *folio,
 		 * get overwritten with something else, is a waste of memory.
 		 */
 		WARN_ON_ONCE(folio_test_active(folio));
-		if (!(gfp & __GFP_WRITE) && shadow)
+		if (!(gfp & __GFP_WRITE) && shadow) {
+			/*
+			 * Try to restore the folio from compressed cache.
+			 * If successful, the folio is marked uptodate and
+			 * we avoid the I/O to read from disk.
+			 */
+			if (zfcache_load(folio, mapping, index))
+				folio_mark_uptodate(folio);
 			workingset_refault(folio, shadow);
+		}
 		folio_add_lru(folio);
 		if (kernel_file)
 			mod_node_page_state(folio_pgdat(folio),

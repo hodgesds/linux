@@ -65,6 +65,7 @@
 #include <linux/swapops.h>
 #include <linux/balloon_compaction.h>
 #include <linux/sched/sysctl.h>
+#include <linux/zfcache.h>
 
 #include "internal.h"
 #include "swap.h"
@@ -783,8 +784,15 @@ static int __remove_mapping(struct address_space *mapping, struct folio *folio,
 		 * same address_space.
 		 */
 		if (reclaimed && folio_is_file_lru(folio) &&
-		    !mapping_exiting(mapping) && !dax_mapping(mapping))
+		    !mapping_exiting(mapping) && !dax_mapping(mapping)) {
+			/*
+			 * Try to compress the folio before eviction.
+			 * zfcache_store() will compress and store the folio
+			 * content, so we can restore it on refault without I/O.
+			 */
+			zfcache_store(folio, mapping);
 			shadow = workingset_eviction(folio, target_memcg);
+		}
 		__filemap_remove_folio(folio, shadow);
 		xa_unlock_irq(&mapping->i_pages);
 		if (mapping_shrinkable(mapping))

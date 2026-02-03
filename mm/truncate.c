@@ -21,6 +21,7 @@
 #include <linux/task_io_accounting_ops.h>
 #include <linux/shmem_fs.h>
 #include <linux/rmap.h>
+#include <linux/zfcache.h>
 #include "internal.h"
 
 static void clear_shadow_entries(struct address_space *mapping,
@@ -394,6 +395,13 @@ void truncate_inode_pages_range(struct address_space *mapping,
 		end = -1;
 	else
 		end = (lend + 1) >> PAGE_SHIFT;
+
+	/*
+	 * Invalidate any compressed pages in zfcache for this range.
+	 * This must be done before we start truncating pages from the
+	 * page cache to avoid stale compressed data.
+	 */
+	zfcache_invalidate(mapping, start, end == (pgoff_t)-1 ? ULONG_MAX : end);
 
 	folio_batch_init(&fbatch);
 	index = start;
