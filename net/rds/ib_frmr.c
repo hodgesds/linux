@@ -45,6 +45,7 @@ rds_transition_frwr_state(struct rds_ib_mr *ibmr,
 		 */
 		smp_mb__before_atomic();
 		atomic_dec(&ibmr->ic->i_fastreg_inuse_count);
+		smp_mb__after_atomic();
 		if (waitqueue_active(&rds_ib_ring_empty_wait))
 			wake_up(&rds_ib_ring_empty_wait);
 	}
