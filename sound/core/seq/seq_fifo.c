@@ -60,11 +60,10 @@ void snd_seq_fifo_delete(struct snd_seq_fifo **fifo)
 	if (f->pool)
 		snd_seq_pool_mark_closing(f->pool);
 
-	snd_seq_fifo_clear(f);
+	/* wake up clients before waiting for use_lock to prevent deadlock */
+	wake_up(&f->input_sleep);
 
-	/* wake up clients if any */
-	if (waitqueue_active(&f->input_sleep))
-		wake_up(&f->input_sleep);
+	snd_seq_fifo_clear(f);
 
 	/* release resources...*/
 	/*....................*/
@@ -177,6 +176,10 @@ int snd_seq_fifo_cell_out(struct snd_seq_fifo *f,
 			/* non-blocking - return immediately */
 			spin_unlock_irqrestore(&f->lock, flags);
 			return -EAGAIN;
+		}
+		if (f->pool->closing) {
+			spin_unlock_irqrestore(&f->lock, flags);
+			return -ENOMEM;
 		}
 		set_current_state(TASK_INTERRUPTIBLE);
 		add_wait_queue(&f->input_sleep, &wait);
