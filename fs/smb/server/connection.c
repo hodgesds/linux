@@ -131,6 +131,7 @@ void ksmbd_conn_try_dequeue_request(struct ksmbd_work *work)
 	struct ksmbd_conn *conn = work->conn;
 
 	atomic_dec(&conn->req_running);
+	smp_mb__after_atomic();
 	if (waitqueue_active(&conn->req_running_q))
 		wake_up(&conn->req_running_q);
 
