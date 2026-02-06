@@ -74,9 +74,12 @@ static inline u8 tcf_vlan_push_prio(const struct tc_action *a)
 static inline void tcf_vlan_push_eth(unsigned char *src, unsigned char *dest,
 				     const struct tc_action *a)
 {
+	struct tcf_vlan_params *p;
+
 	rcu_read_lock();
-	memcpy(dest, rcu_dereference(to_vlan(a)->vlan_p)->tcfv_push_dst, ETH_ALEN);
-	memcpy(src, rcu_dereference(to_vlan(a)->vlan_p)->tcfv_push_src, ETH_ALEN);
+	p = rcu_dereference(to_vlan(a)->vlan_p);
+	memcpy(dest, p->tcfv_push_dst, ETH_ALEN);
+	memcpy(src, p->tcfv_push_src, ETH_ALEN);
 	rcu_read_unlock();
 }
 
