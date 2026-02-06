@@ -630,12 +630,12 @@ static int perform_sglist(
 			retval = -ETIMEDOUT;
 		else
 			retval = req->status;
-		timer_destroy_on_stack(&timeout.timer);
 
 		/* FIXME check resulting data pattern */
 
 		/* FIXME if endpoint halted, clear halt (and log) */
 	}
+	timer_destroy_on_stack(&timeout.timer);
 
 	/* FIXME for unlink or fault handling tests, don't report
 	 * failure if retval is as we expected ...
