@@ -1012,6 +1012,7 @@ static void tifm_sd_remove(struct tifm_dev *sock)
 		tasklet_schedule(&host->finish_tasklet);
 	}
 	spin_unlock_irqrestore(&sock->lock, flags);
+	tasklet_kill(&host->finish_tasklet);
 	mmc_remove_host(mmc);
 	dev_dbg(&sock->dev, "after remove\n");
 
