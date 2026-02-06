@@ -980,7 +980,7 @@ void cw1200_event_handler(struct work_struct *work)
 			break;
 		case WSM_EVENT_BSS_LOST:
 			pr_debug("[CQM] BSS lost.\n");
-			cancel_work_sync(&priv->unjoin_work);
+			cancel_work(&priv->unjoin_work);
 			if (!down_trylock(&priv->scan.lock)) {
 				cw1200_cqm_bssloss_sm(priv, 1, 0, 0);
 				up(&priv->scan.lock);
@@ -997,7 +997,7 @@ void cw1200_event_handler(struct work_struct *work)
 		case WSM_EVENT_BSS_REGAINED:
 			pr_debug("[CQM] BSS regained.\n");
 			cw1200_cqm_bssloss_sm(priv, 0, 0, 0);
-			cancel_work_sync(&priv->unjoin_work);
+			cancel_work(&priv->unjoin_work);
 			break;
 		case WSM_EVENT_RADAR_DETECTED:
 			wiphy_info(priv->hw->wiphy, "radar pulse detected\n");
