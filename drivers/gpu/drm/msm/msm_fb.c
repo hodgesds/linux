@@ -95,10 +95,19 @@ int msm_framebuffer_prepare(struct drm_framebuffer *fb, bool needs_dirtyfb)
 		drm_dbg_state(fb->dev, "FB[%u]: iova[%d]: %08llx (%d)\n",
 			      fb->base.id, i, msm_fb->iova[i], ret);
 		if (ret)
-			return ret;
+			goto err_unpin;
 	}
 
 	return 0;
+
+err_unpin:
+	/* Cleanup already-processed planes */
+	while (i--)
+		msm_gem_vma_put(fb->obj[i]);
+	atomic_dec(&msm_fb->prepare_count);
+	if (needs_dirtyfb)
+		refcount_dec(&msm_fb->dirtyfb);
+	return ret;
 }
 
 void msm_framebuffer_cleanup(struct drm_framebuffer *fb, bool needed_dirtyfb)
