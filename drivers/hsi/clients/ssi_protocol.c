@@ -401,7 +401,11 @@ static void ssip_reset(struct hsi_client *cl)
 	timer_delete(&ssi->rx_wd);
 	timer_delete(&ssi->tx_wd);
 	timer_delete(&ssi->keep_alive);
+	spin_unlock_bh(&ssi->lock);
+
 	cancel_work_sync(&ssi->work);
+
+	spin_lock_bh(&ssi->lock);
 	ssi->main_state = 0;
 	ssi->send_state = 0;
 	ssi->recv_state = 0;
