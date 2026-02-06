@@ -207,10 +207,20 @@ void f2fs_stop_gc_thread(struct f2fs_sb_info *sbi)
 
 	if (!gc_th)
 		return;
-	kthread_stop(gc_th->f2fs_gc_task);
-	wake_up_all(&gc_th->fggc_wq);
-	kfree(gc_th);
+
+	/* Prevent new waiters from accessing gc_thread */
 	sbi->gc_thread = NULL;
+
+	kthread_stop(gc_th->f2fs_gc_task);
+
+	/* Wake up any waiters blocked on fggc_wq */
+	wake_up_all(&gc_th->fggc_wq);
+
+	/* Wait for all waiters to complete finish_wait() */
+	while (waitqueue_active(&gc_th->fggc_wq))
+		schedule_timeout_uninterruptible(1);
+
+	kfree(gc_th);
 }
 
 static int select_gc_type(struct f2fs_sb_info *sbi, int gc_type)
