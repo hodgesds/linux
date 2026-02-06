@@ -431,6 +431,8 @@ static void pnv_kexec_wait_secondaries_down(void)
 			}
 		}
 	}
+
+	put_cpu();
 }
 
 static void pnv_kexec_cpu_down(int crash_shutdown, int secondary)
