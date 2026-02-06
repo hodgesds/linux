@@ -1597,6 +1597,13 @@ abts_pending:
 	 */
 	wait_for_completion_timeout(&tm_done, SNIC_ABTS_TIMEOUT);
 
+	/* Clear abts_done to prevent use-after-free if fw completes later */
+	spin_lock_irqsave(io_lock, flags);
+	rqi = (struct snic_req_info *) CMD_SP(sc);
+	if (rqi)
+		rqi->abts_done = NULL;
+	spin_unlock_irqrestore(io_lock, flags);
+
 send_abts_end:
 	return ret;
 } /* end of snic_send_abort_and_wait */
@@ -2060,6 +2067,13 @@ snic_send_dr_and_wait(struct snic *snic, struct scsi_cmnd *sc)
 	ret = 0;
 
 	wait_for_completion_timeout(&tm_done, SNIC_LUN_RESET_TIMEOUT);
+
+	/* Clear dr_done to prevent use-after-free if fw completes later */
+	spin_lock_irqsave(io_lock, flags);
+	rqi = (struct snic_req_info *) CMD_SP(sc);
+	if (rqi)
+		rqi->dr_done = NULL;
+	spin_unlock_irqrestore(io_lock, flags);
 
 send_dr_end:
 	return ret;
