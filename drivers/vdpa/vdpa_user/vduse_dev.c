@@ -1624,7 +1624,7 @@ static int vduse_dev_init_vqs(struct vduse_dev *dev, u32 vq_align, u32 vq_num)
 		ret = kobject_add(&dev->vqs[i]->kobj,
 				  &dev->dev->kobj, "vq%d", i);
 		if (ret) {
-			kfree(dev->vqs[i]);
+			kobject_put(&dev->vqs[i]->kobj);
 			goto err;
 		}
 	}
