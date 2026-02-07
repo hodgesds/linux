@@ -75,7 +75,7 @@ static struct nr_neigh *nr_neigh_get_dev(ax25_address *callsign,
 	return found;
 }
 
-static void nr_remove_neigh(struct nr_neigh *);
+static inline void __nr_remove_neigh(struct nr_neigh *);
 
 /*      re-sort the routes in quality order.    */
 static void re_sort_routes(struct nr_node *nr_node, int x, int y)
@@ -245,8 +245,12 @@ static int __must_check nr_add_node(ax25_address *nr, const char *mnemonic,
 				nr_node->routes[2].neighbour->count--;
 				nr_neigh_put(nr_node->routes[2].neighbour);
 
-				if (nr_node->routes[2].neighbour->count == 0 && !nr_node->routes[2].neighbour->locked)
-					nr_remove_neigh(nr_node->routes[2].neighbour);
+				if (nr_node->routes[2].neighbour->count == 0 && !nr_node->routes[2].neighbour->locked) {
+					spin_lock_bh(&nr_neigh_list_lock);
+					if (!hlist_unhashed(&nr_node->routes[2].neighbour->neigh_node))
+						__nr_remove_neigh(nr_node->routes[2].neighbour);
+					spin_unlock_bh(&nr_neigh_list_lock);
+				}
 
 				nr_node->routes[2].quality   = quality;
 				nr_node->routes[2].obs_count = obs_count;
@@ -310,13 +314,6 @@ static inline void __nr_remove_neigh(struct nr_neigh *nr_neigh)
 #define nr_remove_neigh_locked(__neigh) \
 	__nr_remove_neigh(__neigh)
 
-static void nr_remove_neigh(struct nr_neigh *nr_neigh)
-{
-	spin_lock_bh(&nr_neigh_list_lock);
-	__nr_remove_neigh(nr_neigh);
-	spin_unlock_bh(&nr_neigh_list_lock);
-}
-
 /*
  *	"Delete" a node. Strictly speaking remove a route to a node. The node
  *	is only deleted if no routes are left to it.
@@ -345,8 +342,12 @@ static int nr_del_node(ax25_address *callsign, ax25_address *neighbour, struct n
 			nr_neigh->count--;
 			nr_neigh_put(nr_neigh);
 
-			if (nr_neigh->count == 0 && !nr_neigh->locked)
-				nr_remove_neigh(nr_neigh);
+			if (nr_neigh->count == 0 && !nr_neigh->locked) {
+				spin_lock_bh(&nr_neigh_list_lock);
+				if (!hlist_unhashed(&nr_neigh->neigh_node))
+					__nr_remove_neigh(nr_neigh);
+				spin_unlock_bh(&nr_neigh_list_lock);
+			}
 			nr_neigh_put(nr_neigh);
 
 			nr_node->count--;
@@ -440,8 +441,10 @@ static int nr_del_neigh(ax25_address *callsign, struct net_device *dev, unsigned
 	nr_neigh->quality = quality;
 	nr_neigh->locked  = 0;
 
-	if (nr_neigh->count == 0)
-		nr_remove_neigh(nr_neigh);
+	spin_lock_bh(&nr_neigh_list_lock);
+	if (nr_neigh->count == 0 && !hlist_unhashed(&nr_neigh->neigh_node))
+		__nr_remove_neigh(nr_neigh);
+	spin_unlock_bh(&nr_neigh_list_lock);
 	nr_neigh_put(nr_neigh);
 
 	return 0;
@@ -473,8 +476,12 @@ static int nr_dec_obs(void)
 				nr_neigh->count--;
 				nr_neigh_put(nr_neigh);
 
-				if (nr_neigh->count == 0 && !nr_neigh->locked)
-					nr_remove_neigh(nr_neigh);
+				if (nr_neigh->count == 0 && !nr_neigh->locked) {
+					spin_lock_bh(&nr_neigh_list_lock);
+					if (!hlist_unhashed(&nr_neigh->neigh_node))
+						__nr_remove_neigh(nr_neigh);
+					spin_unlock_bh(&nr_neigh_list_lock);
+				}
 
 				s->count--;
 
