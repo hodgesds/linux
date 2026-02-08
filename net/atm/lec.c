@@ -351,6 +351,10 @@ static int lec_atm_send(struct atm_vcc *vcc, struct sk_buff *skb)
 	char *tmp;		/* FIXME */
 
 	WARN_ON(refcount_sub_and_test(skb->truesize, &sk_atm(vcc)->sk_wmem_alloc));
+	if (skb->len < sizeof(struct atmlec_msg)) {
+		dev_kfree_skb(skb);
+		return -EINVAL;
+	}
 	mesg = (struct atmlec_msg *)skb->data;
 	tmp = skb->data;
 	tmp += sizeof(struct atmlec_msg);
