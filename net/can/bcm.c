@@ -497,8 +497,14 @@ static void bcm_rx_changed(struct bcm_op *op, struct canfd_frame *data)
 	head.opcode  = RX_CHANGED;
 	head.flags   = op->flags;
 	head.count   = op->count;
-	head.ival1   = op->ival1;
-	head.ival2   = op->ival2;
+	/*
+	 * bcm_rx_changed() can run concurrently with bcm_rx_setup()
+	 * which updates ival1/ival2 from process context. These reads
+	 * are purely informational for the notification header sent to
+	 * userspace, so a torn read is benign.
+	 */
+	head.ival1   = data_race(op->ival1);
+	head.ival2   = data_race(op->ival2);
 	head.can_id  = op->can_id;
 	head.nframes = 1;
 
