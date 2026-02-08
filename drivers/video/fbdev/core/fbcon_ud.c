@@ -269,6 +269,8 @@ static void ud_cursor(struct vc_data *vc, struct fb_info *info, int mode,
 
  	c = scr_readw((u16 *) vc->vc_pos);
 	attribute = get_attribute(info, c);
+	if ((c & charmask) >= vc->vc_font.charcount)
+		return;
 	src = ops->fontbuffer + ((c & charmask) * (w * vc->vc_font.height));
 
 	if (ops->cursor_state.image.data != src ||
