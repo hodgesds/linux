@@ -209,7 +209,9 @@ int hfsplus_find_cat(struct super_block *sb, u32 cnid,
 		return -EIO;
 	}
 
-	if (be16_to_cpu(tmp.thread.nodeName.length) > 255) {
+	if (be16_to_cpu(tmp.thread.nodeName.length) > 255 ||
+	    fd->entrylength < offsetof(struct hfsplus_cat_thread, nodeName) +
+	    2 + be16_to_cpu(tmp.thread.nodeName.length) * 2) {
 		pr_err("catalog name length corrupted\n");
 		return -EIO;
 	}
