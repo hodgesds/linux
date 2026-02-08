@@ -242,11 +242,16 @@ static int __must_check nr_add_node(ax25_address *nr, const char *mnemonic,
 		} else {
 			/* It must be better than the worst */
 			if (quality > nr_node->routes[2].quality) {
-				nr_node->routes[2].neighbour->count--;
-				nr_neigh_put(nr_node->routes[2].neighbour);
+				struct nr_neigh *nr_neigh_old;
 
-				if (nr_node->routes[2].neighbour->count == 0 && !nr_node->routes[2].neighbour->locked)
-					nr_remove_neigh(nr_node->routes[2].neighbour);
+				nr_neigh_old = nr_node->routes[2].neighbour;
+				nr_neigh_old->count--;
+
+				if (nr_neigh_old->count == 0 &&
+				    !nr_neigh_old->locked)
+					nr_remove_neigh(nr_neigh_old);
+
+				nr_neigh_put(nr_neigh_old);
 
 				nr_node->routes[2].quality   = quality;
 				nr_node->routes[2].obs_count = obs_count;
@@ -336,10 +341,11 @@ static int nr_del_node(ax25_address *callsign, ax25_address *neighbour, struct n
 	for (i = 0; i < nr_node->count; i++) {
 		if (nr_node->routes[i].neighbour == nr_neigh) {
 			nr_neigh->count--;
-			nr_neigh_put(nr_neigh);
 
 			if (nr_neigh->count == 0 && !nr_neigh->locked)
 				nr_remove_neigh(nr_neigh);
+
+			nr_neigh_put(nr_neigh);
 			nr_neigh_put(nr_neigh);
 
 			nr_node->count--;
@@ -466,10 +472,11 @@ static int nr_dec_obs(void)
 				nr_neigh = s->routes[i].neighbour;
 
 				nr_neigh->count--;
-				nr_neigh_put(nr_neigh);
 
 				if (nr_neigh->count == 0 && !nr_neigh->locked)
 					nr_remove_neigh(nr_neigh);
+
+				nr_neigh_put(nr_neigh);
 
 				s->count--;
 
