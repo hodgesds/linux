@@ -268,7 +268,7 @@ int txInit(void)
 	TxLockVHWM = (nTxLock * 8) / 10;
 
 	size = sizeof(struct tblock) * nTxBlock;
-	TxBlock = vmalloc(size);
+	TxBlock = vzalloc(size);
 	if (TxBlock == NULL)
 		return -ENOMEM;
 
@@ -294,7 +294,7 @@ int txInit(void)
 	 * tlock id = 0 is reserved.
 	 */
 	size = sizeof(struct tlock) * nTxLock;
-	TxLock = vmalloc(size);
+	TxLock = vzalloc(size);
 	if (TxLock == NULL) {
 		vfree(TxBlock);
 		return -ENOMEM;
