@@ -392,7 +392,18 @@ static int fat_mirror_bhs(struct super_block *sb, struct buffer_head **bhs,
 			}
 			/* Avoid race with userspace read via bdev */
 			lock_buffer(c_bh);
+			/*
+			 * FAT12 entries span byte boundaries, so
+			 * fat12_ent_put() uses fat12_entry_lock to
+			 * protect its read-modify-write of two bytes.
+			 * Hold the same lock here to avoid reading a
+			 * torn FAT12 entry from the source buffer.
+			 */
+			if (is_fat12(sbi))
+				spin_lock(&fat12_entry_lock);
 			memcpy(c_bh->b_data, bhs[n]->b_data, sb->s_blocksize);
+			if (is_fat12(sbi))
+				spin_unlock(&fat12_entry_lock);
 			set_buffer_uptodate(c_bh);
 			unlock_buffer(c_bh);
 			mark_buffer_dirty_inode(c_bh, sbi->fat_inode);
