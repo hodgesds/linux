@@ -2128,7 +2128,8 @@ rcv:
 	}
 
 	/* Discard unicast link messages destined for another node */
-	if (unlikely(!msg_short(hdr) && (msg_destnode(hdr) != self)))
+	if (unlikely(msg_hdr_sz(hdr) >= BASIC_H_SIZE &&
+		     (msg_destnode(hdr) != self)))
 		goto discard;
 
 	/* Locate neighboring node that sent packet */
