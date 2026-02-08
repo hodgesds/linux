@@ -2917,6 +2917,8 @@ int ni_add_name(struct ntfs_inode *dir_ni, struct ntfs_inode *ni,
 	fname = ni_fname_name(ni, NULL, NULL, NULL, NULL);
 	if (fname)
 		memcpy(&de_name->dup, &fname->dup, sizeof(fname->dup));
+	else
+		memset(&de_name->dup, 0, sizeof(de_name->dup));
 	de_name->dup.fa = ni->std_fa;
 
 	/* Insert new name into MFT. */
