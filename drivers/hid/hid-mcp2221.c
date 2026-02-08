@@ -849,6 +849,11 @@ static int mcp2221_raw_event(struct hid_device *hdev,
 	u8 *buf;
 	struct mcp2221 *mcp = hid_get_drvdata(hdev);
 
+	if (size < 64) {
+		hid_err(hdev, "short report received: %d < 64\n", size);
+		return 0;
+	}
+
 	switch (data[0]) {
 
 	case MCP2221_I2C_WR_DATA:
