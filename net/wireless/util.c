@@ -962,12 +962,26 @@ unsigned int cfg80211_classify8021d(struct sk_buff *skb,
 	}
 
 	switch (skb->protocol) {
-	case htons(ETH_P_IP):
-		dscp = ipv4_get_dsfield(ip_hdr(skb)) & 0xfc;
+	case htons(ETH_P_IP): {
+		struct iphdr iph_tmp, *iph;
+
+		iph = skb_header_pointer(skb, skb_network_offset(skb),
+					 sizeof(iph_tmp), &iph_tmp);
+		if (!iph)
+			return 0;
+		dscp = ipv4_get_dsfield(iph) & 0xfc;
 		break;
-	case htons(ETH_P_IPV6):
-		dscp = ipv6_get_dsfield(ipv6_hdr(skb)) & 0xfc;
+	}
+	case htons(ETH_P_IPV6): {
+		struct ipv6hdr ipv6h_tmp, *ipv6h;
+
+		ipv6h = skb_header_pointer(skb, skb_network_offset(skb),
+					   sizeof(ipv6h_tmp), &ipv6h_tmp);
+		if (!ipv6h)
+			return 0;
+		dscp = ipv6_get_dsfield(ipv6h) & 0xfc;
 		break;
+	}
 	case htons(ETH_P_MPLS_UC):
 	case htons(ETH_P_MPLS_MC): {
 		struct mpls_label mpls_tmp, *mpls;
