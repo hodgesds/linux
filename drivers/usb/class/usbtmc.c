@@ -2291,6 +2291,11 @@ static void usbtmc_interrupt(struct urb *urb)
 
 	switch (status) {
 	case 0: /* SUCCESS */
+		if (urb->actual_length < 2) {
+			dev_warn(dev, "short interrupt packet: %d bytes\n",
+				 urb->actual_length);
+			goto exit;
+		}
 		/* check for valid STB notification */
 		if (data->iin_buffer[0] > 0x81) {
 			data->bNotify1 = data->iin_buffer[0];
