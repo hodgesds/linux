@@ -330,8 +330,8 @@ static s32 i2c_smbus_xfer_emulated(struct i2c_adapter *adapter, u16 addr,
 	 * initialize most things with sane defaults, to keep the code below
 	 * somewhat simpler.
 	 */
-	unsigned char msgbuf0[I2C_SMBUS_BLOCK_MAX+3];
-	unsigned char msgbuf1[I2C_SMBUS_BLOCK_MAX+2];
+	unsigned char msgbuf0[I2C_SMBUS_BLOCK_MAX+3] = {};
+	unsigned char msgbuf1[I2C_SMBUS_BLOCK_MAX+2] = {};
 	int nmsgs = read_write == I2C_SMBUS_READ ? 2 : 1;
 	u8 partial_pec = 0;
 	int status;
