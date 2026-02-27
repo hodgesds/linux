@@ -1991,9 +1991,9 @@ static int __init futex_init(void)
 		struct futex_hash_bucket *table;
 
 		if (order > MAX_PAGE_ORDER)
-			table = vmalloc_huge_node(size, GFP_KERNEL, n);
+			table = vmalloc_huge_node(size, GFP_KERNEL | __GFP_ZERO, n);
 		else
-			table = alloc_pages_exact_nid(n, size, GFP_KERNEL);
+			table = alloc_pages_exact_nid(n, size, GFP_KERNEL | __GFP_ZERO);
 
 		BUG_ON(!table);
 
