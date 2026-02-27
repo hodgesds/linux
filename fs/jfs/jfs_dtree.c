@@ -130,6 +130,19 @@ do {									\
 /* for consistency */
 #define DT_PUTPAGE(MP) BT_PUTPAGE(MP)
 
+/*
+ * Return the maximum valid slot index for the given dtree page.
+ * For root pages the slot array has DTROOTMAXSLOT entries;
+ * for non-root pages it is p->header.maxslot (validated by DT_GETPAGE
+ * to be <= DTPAGEMAXSLOT).
+ */
+static inline int dt_maxslot(dtpage_t *p)
+{
+	if (p->header.flag & BT_ROOT)
+		return DTROOTMAXSLOT;
+	return p->header.maxslot;
+}
+
 #define DT_GETSEARCH(IP, LEAF, BN, MP, P, INDEX) \
 	BT_GETSEARCH(IP, LEAF, BN, MP, dtpage_t, P, INDEX, i_dtroot)
 
@@ -169,8 +182,8 @@ static void dtGetKey(dtpage_t * p, int i, struct component_name * key,
 static int ciGetLeafPrefixKey(dtpage_t * lp, int li, dtpage_t * rp,
 			      int ri, struct component_name * key, int flag);
 
-static void dtInsertEntry(dtpage_t * p, int index, struct component_name * key,
-			  ddata_t * data, struct dt_lock **);
+static int dtInsertEntry(dtpage_t * p, int index, struct component_name * key,
+			 ddata_t * data, struct dt_lock **);
 
 static void dtMoveEntry(dtpage_t * sp, int si, dtpage_t * dp,
 			struct dt_lock ** sdtlock, struct dt_lock ** ddtlock,
@@ -888,7 +901,11 @@ int dtInsert(tid_t tid, struct inode *ip,
 	lv->length = 1;
 	dtlck->index++;
 
-	dtInsertEntry(p, index, name, &data, &dtlck);
+	rc = dtInsertEntry(p, index, name, &data, &dtlck);
+	if (rc) {
+		DT_PUTPAGE(mp);
+		return rc;
+	}
 
 	/* linelock stbl of non-root leaf page */
 	if (!(p->header.flag & BT_ROOT)) {
@@ -1276,7 +1293,7 @@ static int dtSplitUp(tid_t tid,
 				dtlck->index++;
 			}
 
-			dtInsertEntry(sp, skip, &key, data, &dtlck);
+			rc = dtInsertEntry(sp, skip, &key, data, &dtlck);
 
 			/* exit propagate up */
 			break;
@@ -1452,7 +1469,7 @@ static int dtSplitPage(tid_t tid, struct inode *ip, struct dtsplit * split,
 		f->next = -1;
 
 		/* insert entry at the first entry of the new right page */
-		dtInsertEntry(rp, 0, split->key, split->data, &rdtlck);
+		rc = dtInsertEntry(rp, 0, split->key, split->data, &rdtlck);
 
 		goto out;
 	}
@@ -1590,7 +1607,9 @@ static int dtSplitPage(tid_t tid, struct inode *ip, struct dtsplit * split,
 	 */
 	if (skip <= off) {
 		/* insert the new entry in the split page */
-		dtInsertEntry(sp, skip, split->key, split->data, &sdtlck);
+		rc = dtInsertEntry(sp, skip, split->key, split->data, &sdtlck);
+		if (rc)
+			goto out;
 
 		/* linelock stbl of split page */
 		if (sdtlck->index >= sdtlck->maxcnt)
@@ -1610,7 +1629,7 @@ static int dtSplitPage(tid_t tid, struct inode *ip, struct dtsplit * split,
 		skip -= nxt;
 
 		/* insert the new entry in the right page */
-		dtInsertEntry(rp, skip, split->key, split->data, &rdtlck);
+		rc = dtInsertEntry(rp, skip, split->key, split->data, &rdtlck);
 	}
 
       out:
@@ -1799,6 +1818,8 @@ static int dtExtendPage(tid_t tid,
 		sp->header.freelist = n;
 	else {
 		do {
+			if (fsi >= sp->header.maxslot)
+				break;
 			f = &sp->slot[fsi];
 			fsi = f->next;
 		} while (fsi != -1);
@@ -1811,7 +1832,11 @@ static int dtExtendPage(tid_t tid,
 	/*
 	 * insert the new entry
 	 */
-	dtInsertEntry(sp, split->index, split->key, split->data, &dtlck);
+	rc = dtInsertEntry(sp, split->index, split->key, split->data, &dtlck);
+	if (rc) {
+		DT_PUTPAGE(pmp);
+		return rc;
+	}
 
 	BT_MARK_DIRTY(pmp, ip);
 	/*
@@ -1973,6 +1998,8 @@ static int dtSplitRoot(tid_t tid,
 		rp->header.freelist = fsi;
 
 		do {
+			if (fsi >= rp->header.maxslot)
+				break;
 			f = &rp->slot[fsi];
 			fsi = f->next;
 		} while (fsi >= 0);
@@ -2003,7 +2030,9 @@ static int dtSplitRoot(tid_t tid,
 	 * insert the new entry into the new right/child page
 	 * (skip index in the new right page will not change)
 	 */
-	dtInsertEntry(rp, split->index, split->key, split->data, &dtlck);
+	rc = dtInsertEntry(rp, split->index, split->key, split->data, &dtlck);
+	if (rc)
+		return rc;
 
 	/*
 	 *	reset parent/root page
@@ -2949,6 +2978,14 @@ int jfs_readdir(struct file *file, struct dir_context *ctx)
 			/* copy name in the additional segment(s) */
 			next = d->next;
 			while (next >= 0) {
+				if (next >= p->header.maxslot) {
+					jfs_error(ip->i_sb,
+						  "JFS: dtree slot chain corrupt: ino = %ld, bn=%lld, next=%d maxslot=%d\n",
+						  (long)ip->i_ino,
+						  (long long)bn,
+						  next, p->header.maxslot);
+					goto skip_one;
+				}
 				t = (struct dtslot *) & p->slot[next];
 				name_ptr += outlen;
 				d_namleft -= len;
@@ -3329,6 +3366,8 @@ static int dtCompare(struct component_name * key,	/* search key */
 	kname += len;
 	while (klen > 0 && namlen > 0) {
 		/* compare with next name segment */
+		if (si < 0 || si >= dt_maxslot(p))
+			return -1;
 		t = (struct dtslot *) & p->slot[si];
 		len = min(namlen, DTSLOTDATALEN);
 		len = min(klen, len);
@@ -3432,6 +3471,8 @@ static int ciCompare(struct component_name * key,	/* search key */
 	/* compare with additional segment(s) */
 	while (klen > 0 && namlen > 0) {
 		/* compare with next name segment */
+		if (si < 0 || si >= dt_maxslot(p))
+			return -1;
 		t = (struct dtslot *) & p->slot[si];
 		len = min(namlen, DTSLOTDATALEN);
 		len = min(klen, len);
@@ -3578,6 +3619,8 @@ static void dtGetKey(dtpage_t * p, int i,	/* entry index */
 	 */
 	while (si >= 0) {
 		/* get next segment */
+		if (si >= dt_maxslot(p))
+			break;
 		t = &p->slot[si];
 		kname += len;
 		namlen -= len;
@@ -3597,8 +3640,8 @@ static void dtGetKey(dtpage_t * p, int i,	/* entry index */
  *
  * return: entry slot index
  */
-static void dtInsertEntry(dtpage_t * p, int index, struct component_name * key,
-			  ddata_t * data, struct dt_lock ** dtlock)
+static int dtInsertEntry(dtpage_t * p, int index, struct component_name * key,
+			 ddata_t * data, struct dt_lock ** dtlock)
 {
 	struct dtslot *h, *t;
 	struct ldtentry *lh = NULL;
@@ -3619,6 +3662,8 @@ static void dtInsertEntry(dtpage_t * p, int index, struct component_name * key,
 
 	/* allocate a free slot */
 	hsi = fsi = p->header.freelist;
+	if (fsi < 0 || fsi >= dt_maxslot(p))
+		return -EIO;
 	h = &p->slot[fsi];
 	p->header.freelist = h->next;
 	--p->header.freecnt;
@@ -3667,6 +3712,8 @@ static void dtInsertEntry(dtpage_t * p, int index, struct component_name * key,
 	while (klen) {
 		/* get free slot */
 		fsi = p->header.freelist;
+		if (fsi < 0 || fsi >= dt_maxslot(p))
+			return -EIO;
 		t = &p->slot[fsi];
 		p->header.freelist = t->next;
 		--p->header.freecnt;
@@ -3744,6 +3791,8 @@ static void dtInsertEntry(dtpage_t * p, int index, struct component_name * key,
 
 	/* advance next available entry index of stbl */
 	++p->header.nextindex;
+
+	return 0;
 }
 
 
@@ -3867,6 +3916,8 @@ static void dtMoveEntry(dtpage_t * sp, int si, dtpage_t * dp,
 		 */
 		snamlen -= len;
 		while ((ssi = next) >= 0) {
+			if (ssi >= dt_maxslot(sp))
+				break;
 			/* is next slot contiguous ? */
 			if (ssi != xssi + 1) {
 				/* close current linelock */
@@ -3991,6 +4042,8 @@ static void dtDeleteEntry(dtpage_t * p, int fi, struct dt_lock ** dtlock)
 
 	/* find the last/only segment */
 	while (si >= 0) {
+		if (si >= dt_maxslot(p))
+			break;
 		/* is next slot contiguous ? */
 		if (si != xsi + 1) {
 			/* close current linelock */
@@ -4086,6 +4139,8 @@ static void dtTruncateEntry(dtpage_t * p, int ti, struct dt_lock ** dtlock)
 
 	/* find the last/only segment */
 	while (si >= 0) {
+		if (si >= dt_maxslot(p))
+			break;
 		/* is next slot contiguous ? */
 		if (si != xsi + 1) {
 			/* close current linelock */
@@ -4144,6 +4199,9 @@ static void dtLinelockFreelist(dtpage_t * p,	/* directory page */
 
 	/* get free entry slot index */
 	fsi = p->header.freelist;
+
+	if (fsi < 0 || fsi >= m)
+		return;
 
 	/* open new linelock */
 	if (dtlck->index >= dtlck->maxcnt)
