@@ -367,6 +367,8 @@ struct jfs_log {
 
 	struct lbuf *lbuf_free;	/* 4: free lbufs */
 	wait_queue_head_t free_wait;	/* 4: */
+	int lbuf_active;	/* count of lbufs not on freelist */
+	wait_queue_head_t lbuf_idle;	/* wait for all lbufs to return */
 
 	/* log write */
 	int logtid;		/* 4: log tid */

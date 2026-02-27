@@ -1809,6 +1809,8 @@ static int lbmLogInit(struct jfs_log * log)
 	init_waitqueue_head(&log->free_wait);
 
 	log->lbuf_free = NULL;
+	log->lbuf_active = 0;
+	init_waitqueue_head(&log->lbuf_idle);
 
 	for (i = 0; i < LOGPAGES;) {
 		char *buffer;
@@ -1855,8 +1857,19 @@ static int lbmLogInit(struct jfs_log * log)
 static void lbmLogShutdown(struct jfs_log * log)
 {
 	struct lbuf *lbuf;
+	unsigned long flags;
 
 	jfs_info("lbmLogShutdown: log:0x%p", log);
+
+	/*
+	 * Wait for all in-flight lbufs to return to the freelist.
+	 * Outstanding I/O completions (lbmIODone) and redrives
+	 * (jfsIOWait -> lbmStartIO) may still reference bp->l_log,
+	 * so we must not free the lbufs or the log until they finish.
+	 */
+	LCACHE_LOCK(flags);
+	LCACHE_SLEEP_COND(log->lbuf_idle, (log->lbuf_active == 0), flags);
+	LCACHE_UNLOCK(flags);
 
 	lbuf = log->lbuf_free;
 	while (lbuf) {
@@ -1884,6 +1897,7 @@ static struct lbuf *lbmAllocate(struct jfs_log * log, int pn)
 	LCACHE_LOCK(flags);
 	LCACHE_SLEEP_COND(log->free_wait, (bp = log->lbuf_free), flags);
 	log->lbuf_free = bp->l_freelist;
+	log->lbuf_active++;
 	LCACHE_UNLOCK(flags);
 
 	bp->l_flag = 0;
@@ -1926,8 +1940,11 @@ static void lbmfree(struct lbuf * bp)
 	 */
 	bp->l_freelist = log->lbuf_free;
 	log->lbuf_free = bp;
+	log->lbuf_active--;
 
 	wake_up(&log->free_wait);
+	if (log->lbuf_active == 0)
+		wake_up(&log->lbuf_idle);
 	return;
 }
 
