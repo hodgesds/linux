@@ -3125,6 +3125,11 @@ static int vc_con_write_normal(struct vc_data *vc, int tc, int c,
 		}
 		if (vc->vc_decim)
 			insert_char(vc, 1);
+
+		if (WARN_ON_ONCE(vc->vc_pos < vc->vc_origin ||
+				 vc->vc_pos >= vc->vc_scr_end))
+			break;
+
 		vc_uniscr_putc(vc, next_c);
 
 		if (himask)
@@ -3398,6 +3403,9 @@ static void vt_console_print(struct console *co, const char *b, unsigned count)
 			if (c == ASCII_LINEFEED || c == ASCII_CAR_RET)
 				continue;
 		}
+		if (WARN_ON_ONCE(vc->vc_pos < vc->vc_origin ||
+				 vc->vc_pos >= vc->vc_scr_end))
+			break;
 		vc_uniscr_putc(vc, c);
 		scr_writew((vc->vc_attr << 8) + c, (unsigned short *)vc->vc_pos);
 		notify_write(vc, c);
