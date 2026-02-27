@@ -482,6 +482,14 @@ static int fuse_dentry_init(struct dentry *dentry)
 	RB_CLEAR_NODE(&fd->node);
 	dentry->d_fsdata = fd;
 
+	/*
+	 * Initialize d_time to zero so that any new dentry will be treated
+	 * as stale by fuse_dentry_revalidate(), which compares d_time against
+	 * fc->epoch (initialized to 1).  This ensures the dentry is properly
+	 * revalidated before first use.
+	 */
+	dentry->d_time = 0;
+
 	return 0;
 }
 
