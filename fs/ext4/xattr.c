@@ -645,6 +645,8 @@ ext4_xattr_ibody_get(struct inode *inode, int name_index, const char *name,
 
 	if (!ext4_test_inode_state(inode, EXT4_STATE_XATTR))
 		return -ENODATA;
+	if (!EXT4_INODE_HAS_XATTR_SPACE(inode))
+		return -ENODATA;
 	error = ext4_get_inode_loc(inode, &iloc);
 	if (error)
 		return error;
@@ -785,6 +787,8 @@ ext4_xattr_ibody_list(struct dentry *dentry, char *buffer, size_t buffer_size)
 
 	if (!ext4_test_inode_state(inode, EXT4_STATE_XATTR))
 		return 0;
+	if (!EXT4_INODE_HAS_XATTR_SPACE(inode))
+		return 0;
 	error = ext4_get_inode_loc(inode, &iloc);
 	if (error)
 		return error;
@@ -864,7 +868,8 @@ int ext4_get_inode_usage(struct inode *inode, qsize_t *usage)
 
 	lockdep_assert_held_read(&EXT4_I(inode)->xattr_sem);
 
-	if (ext4_test_inode_state(inode, EXT4_STATE_XATTR)) {
+	if (ext4_test_inode_state(inode, EXT4_STATE_XATTR) &&
+	    EXT4_INODE_HAS_XATTR_SPACE(inode)) {
 		ret = ext4_get_inode_loc(inode, &iloc);
 		if (ret)
 			goto out;
