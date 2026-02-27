@@ -1177,10 +1177,12 @@ static int udf_load_vat(struct super_block *sb, int p_index, int type1_index)
 {
 	struct udf_sb_info *sbi = UDF_SB(sb);
 	struct udf_part_map *map = &sbi->s_partmaps[p_index];
+	struct udf_virtual_data *vdata = &map->s_type_specific.s_virtual;
 	struct buffer_head *bh = NULL;
 	struct udf_inode_info *vati;
 	struct virtualAllocationTable20 *vat20;
 	sector_t blocks = sb_bdev_nr_blocks(sb);
+	loff_t vat_len;
 
 	udf_find_vat_block(sb, p_index, type1_index, sbi->s_last_block);
 	if (!sbi->s_vat_inode &&
@@ -1194,8 +1196,13 @@ static int udf_load_vat(struct super_block *sb, int p_index, int type1_index)
 		return -EIO;
 
 	if (map->s_partition_type == UDF_VIRTUAL_MAP15) {
-		map->s_type_specific.s_virtual.s_start_offset = 0;
-		map->s_type_specific.s_virtual.s_num_entries =
+		vdata->s_start_offset = 0;
+		if (sbi->s_vat_inode->i_size < 36 + sizeof(uint32_t)) {
+			udf_err(sb, "VAT inode too small (%lld bytes)\n",
+				(long long)sbi->s_vat_inode->i_size);
+			return -EFSCORRUPTED;
+		}
+		vdata->s_num_entries =
 			(sbi->s_vat_inode->i_size - 36) >> 2;
 	} else if (map->s_partition_type == UDF_VIRTUAL_MAP20) {
 		vati = UDF_I(sbi->s_vat_inode);
@@ -1214,12 +1221,16 @@ static int udf_load_vat(struct super_block *sb, int p_index, int type1_index)
 							vati->i_data;
 		}
 
-		map->s_type_specific.s_virtual.s_start_offset =
-			le16_to_cpu(vat20->lengthHeader);
-		map->s_type_specific.s_virtual.s_num_entries =
-			(sbi->s_vat_inode->i_size -
-				map->s_type_specific.s_virtual.
-					s_start_offset) >> 2;
+		vdata->s_start_offset = le16_to_cpu(vat20->lengthHeader);
+		vat_len = sbi->s_vat_inode->i_size - vdata->s_start_offset;
+		if (vat_len < 0 || vat_len < sizeof(uint32_t)) {
+			udf_err(sb, "VAT20 header too large (%u, file size %lld)\n",
+				vdata->s_start_offset,
+				(long long)sbi->s_vat_inode->i_size);
+			brelse(bh);
+			return -EFSCORRUPTED;
+		}
+		vdata->s_num_entries = vat_len >> 2;
 		brelse(bh);
 	}
 	return 0;
