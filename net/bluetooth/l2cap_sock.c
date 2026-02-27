@@ -185,16 +185,8 @@ static int l2cap_sock_connect(struct socket *sock, struct sockaddr_unsized *addr
 	struct l2cap_chan *chan = l2cap_pi(sk)->chan;
 	struct sockaddr_l2 la;
 	int len, err = 0;
-	bool zapped;
 
 	BT_DBG("sk %p", sk);
-
-	lock_sock(sk);
-	zapped = sock_flag(sk, SOCK_ZAPPED);
-	release_sock(sk);
-
-	if (zapped)
-		return -EINVAL;
 
 	if (!addr || alen < offsetofend(struct sockaddr, sa_family) ||
 	    addr->sa_family != AF_BLUETOOTH)
@@ -210,6 +202,13 @@ static int l2cap_sock_connect(struct socket *sock, struct sockaddr_unsized *addr
 	if (!bdaddr_type_is_valid(la.l2_bdaddr_type))
 		return -EINVAL;
 
+	lock_sock(sk);
+
+	if (sock_flag(sk, SOCK_ZAPPED)) {
+		err = -EINVAL;
+		goto done;
+	}
+
 	/* Check that the socket wasn't bound to something that
 	 * conflicts with the address given to connect(). If chan->src
 	 * is BDADDR_ANY it means bind() was never used, in which case
@@ -224,8 +223,10 @@ static int l2cap_sock_connect(struct socket *sock, struct sockaddr_unsized *addr
 		 * ATT. Anything else is an invalid combination.
 		 */
 		if (chan->scid != L2CAP_CID_ATT ||
-		    la.l2_cid != cpu_to_le16(L2CAP_CID_ATT))
-			return -EINVAL;
+		    la.l2_cid != cpu_to_le16(L2CAP_CID_ATT)) {
+			err = -EINVAL;
+			goto done;
+		}
 
 		/* We don't have the hdev available here to make a
 		 * better decision on random vs public, but since all
@@ -236,14 +237,18 @@ static int l2cap_sock_connect(struct socket *sock, struct sockaddr_unsized *addr
 		chan->src_type = BDADDR_LE_PUBLIC;
 	}
 
-	if (chan->src_type != BDADDR_BREDR && la.l2_bdaddr_type == BDADDR_BREDR)
-		return -EINVAL;
+	if (chan->src_type != BDADDR_BREDR && la.l2_bdaddr_type == BDADDR_BREDR) {
+		err = -EINVAL;
+		goto done;
+	}
 
 	if (bdaddr_type_is_le(la.l2_bdaddr_type)) {
 		/* We only allow ATT user space socket */
 		if (la.l2_cid &&
-		    la.l2_cid != cpu_to_le16(L2CAP_CID_ATT))
-			return -EINVAL;
+		    la.l2_cid != cpu_to_le16(L2CAP_CID_ATT)) {
+			err = -EINVAL;
+			goto done;
+		}
 	}
 
 	/* Use L2CAP_MODE_LE_FLOWCTL (CoC) in case of LE address and
@@ -252,6 +257,8 @@ static int l2cap_sock_connect(struct socket *sock, struct sockaddr_unsized *addr
 	if (chan->psm && bdaddr_type_is_le(chan->src_type) &&
 	    chan->mode != L2CAP_MODE_EXT_FLOWCTL)
 		chan->mode = L2CAP_MODE_LE_FLOWCTL;
+
+	release_sock(sk);
 
 	err = l2cap_chan_connect(chan, la.l2_psm, __le16_to_cpu(la.l2_cid),
 				 &la.l2_bdaddr, la.l2_bdaddr_type,
@@ -264,6 +271,7 @@ static int l2cap_sock_connect(struct socket *sock, struct sockaddr_unsized *addr
 	err = bt_sock_wait_state(sk, BT_CONNECTED,
 				 sock_sndtimeo(sk, flags & O_NONBLOCK));
 
+done:
 	release_sock(sk);
 
 	return err;
