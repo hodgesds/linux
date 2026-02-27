@@ -2370,7 +2370,7 @@ EXPORT_SYMBOL(file_remove_privs);
  */
 struct timespec64 current_time(struct inode *inode)
 {
-	struct timespec64 now;
+	struct timespec64 now = { };
 	u32 cns;
 
 	ktime_get_coarse_real_ts64_mg(&now);
@@ -2831,8 +2831,8 @@ EXPORT_SYMBOL(timestamp_truncate);
  */
 struct timespec64 inode_set_ctime_current(struct inode *inode)
 {
-	struct timespec64 now;
-	u32 cns, cur;
+	struct timespec64 now = { };
+	u32 cns = 0, cur;
 
 	ktime_get_coarse_real_ts64_mg(&now);
 	now = timestamp_truncate(now, inode);
