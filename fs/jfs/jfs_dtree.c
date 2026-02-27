@@ -1467,7 +1467,7 @@ static int dtSplitPage(tid_t tid, struct inode *ip, struct dtsplit * split,
 	if (nextbn != 0) {
 		DT_GETPAGE(ip, nextbn, mp, PSIZE, p, rc);
 		if (rc) {
-			discard_metapage(rmp);
+			release_metapage(rmp);
 			return rc;
 		}
 
