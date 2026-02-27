@@ -991,7 +991,8 @@ static inline bool pte_user_accessible_page(pte_t pte, unsigned long addr)
 
 static inline bool pmd_user_accessible_page(pmd_t pmd, unsigned long addr)
 {
-	return pmd_leaf(pmd) && pmd_user(pmd);
+	return pmd_leaf(pmd) && (pmd_val(pmd) & _PAGE_PRESENT) &&
+	       pmd_user(pmd);
 }
 
 static inline bool pud_user_accessible_page(pud_t pud, unsigned long addr)
