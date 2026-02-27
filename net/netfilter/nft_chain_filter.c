@@ -340,6 +340,7 @@ static int nft_netdev_event(unsigned long event, struct net_device *dev,
 				nf_unregister_net_hook(dev_net(dev), ops);
 
 			list_del_rcu(&ops->list);
+			dev_put(ops->dev);
 			kfree_rcu(ops, rcu);
 			break;
 		case NETDEV_REGISTER:
@@ -354,9 +355,11 @@ static int nft_netdev_event(unsigned long event, struct net_device *dev,
 				return 1;
 
 			ops->dev = dev;
+			dev_hold(dev);
 
 			if (!(table->flags & NFT_TABLE_F_DORMANT) &&
 			    nf_register_net_hook(dev_net(dev), ops)) {
+				dev_put(dev);
 				kfree(ops);
 				return 1;
 			}

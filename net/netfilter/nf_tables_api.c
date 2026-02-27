@@ -352,6 +352,7 @@ static void nft_netdev_hook_free_ops(struct nft_hook *hook)
 
 	list_for_each_entry_safe(ops, next, &hook->ops_list, list) {
 		list_del(&ops->list);
+		dev_put(ops->dev);
 		kfree(ops);
 	}
 }
@@ -2375,6 +2376,7 @@ static struct nft_hook *nft_netdev_hook_alloc(struct net *net,
 			goto err_hook_free;
 		}
 		ops->dev = dev;
+		dev_hold(dev);
 		list_add_tail(&ops->list, &hook->ops_list);
 	}
 	return hook;
@@ -9674,6 +9676,7 @@ static int nft_flowtable_event(unsigned long event, struct net_device *dev,
 			nft_unregister_flowtable_ops(dev_net(dev),
 						     flowtable, ops);
 			list_del_rcu(&ops->list);
+			dev_put(ops->dev);
 			kfree_rcu(ops, rcu);
 			break;
 		case NETDEV_REGISTER:
@@ -9693,8 +9696,10 @@ static int nft_flowtable_event(unsigned long event, struct net_device *dev,
 			ops->hook		= flowtable->data.type->hook;
 			ops->hook_ops_type	= NF_HOOK_OP_NFT_FT;
 			ops->dev		= dev;
+			dev_hold(dev);
 			if (nft_register_flowtable_ops(dev_net(dev),
 						       flowtable, ops)) {
+				dev_put(dev);
 				kfree(ops);
 				return 1;
 			}
