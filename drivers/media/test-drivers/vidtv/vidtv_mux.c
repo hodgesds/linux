@@ -220,12 +220,15 @@ static u32 vidtv_mux_push_si(struct vidtv_mux *m)
 
 static u32 vidtv_mux_push_pcr(struct vidtv_mux *m)
 {
-	struct pcr_write_args args = {};
 	struct vidtv_mux_pid_ctx *ctx;
+	struct pcr_write_args args;
 	u32 nbytes = 0;
 
 	ctx                     = vidtv_mux_get_pid_ctx(m, m->pcr_pid);
+
+	memset(&args, 0, sizeof(args));
 	args.dest_buf           = m->mux_buf;
+	args.dest_offset        = m->mux_buf_offset;
 	args.pid                = m->pcr_pid;
 	args.buf_sz             = m->mux_buf_sz;
 	args.continuity_counter = &ctx->cc;
@@ -348,18 +351,21 @@ static u32 vidtv_mux_poll_encoders(struct vidtv_mux *m)
 
 static u32 vidtv_mux_pad_with_nulls(struct vidtv_mux *m, u32 npkts)
 {
-	struct null_packet_write_args args = {
-		.dest_buf           = m->mux_buf,
-		.buf_sz             = m->mux_buf_sz,
-		.dest_offset        = m->mux_buf_offset,
-	};
+	struct null_packet_write_args args;
 	u32 initial_offset = m->mux_buf_offset;
 	struct vidtv_mux_pid_ctx *ctx;
 	u32 nbytes;
 	u32 i;
 
 	ctx = vidtv_mux_get_pid_ctx(m, TS_NULL_PACKET_PID);
+	if (!ctx)
+		return 0;
 
+	memset(&args, 0, sizeof(args));
+
+	args.dest_buf           = m->mux_buf;
+	args.buf_sz             = m->mux_buf_sz;
+	args.dest_offset        = m->mux_buf_offset;
 	args.continuity_counter = &ctx->cc;
 
 	for (i = 0; i < npkts; ++i) {
