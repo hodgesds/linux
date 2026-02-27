@@ -3782,6 +3782,15 @@ static void bpf_raw_tp_link_release(struct bpf_link *link)
 		container_of(link, struct bpf_raw_tp_link, link);
 
 	bpf_probe_unregister(raw_tp->btp, raw_tp);
+	/*
+	 * After bpf_probe_unregister, no new tracepoint invocations will
+	 * reference this link. However, active tracepoint readers are
+	 * protected by tracepoint_srcu (SRCU-fast), not regular RCU.
+	 * Since bpf_link_free will use call_rcu() to defer freeing, we
+	 * must first wait for any in-progress SRCU readers to complete
+	 * to prevent use-after-free in __bpf_trace_run.
+	 */
+	synchronize_srcu(&tracepoint_srcu);
 	bpf_put_raw_tracepoint(raw_tp->btp);
 }
 
