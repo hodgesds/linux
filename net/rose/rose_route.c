@@ -951,7 +951,8 @@ int rose_route_frame(struct sk_buff *skb, ax25_cb *ax25)
 	if (frametype == ROSE_CALL_REQUEST)
 		if ((dev = rose_dev_get(dest_addr)) != NULL) {
 			res = rose_rx_call_request(skb, dev, rose_neigh, lci);
-			dev_put(dev);
+			if (res == 0)
+				dev_put(dev);
 			goto out;
 		}
 

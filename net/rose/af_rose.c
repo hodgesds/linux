@@ -1063,6 +1063,10 @@ int rose_rx_call_request(struct sk_buff *skb, struct net_device *dev, struct ros
 	for (n = 0 ; n < facilities.source_ndigis ; n++)
 		make_rose->source_digis[n] = facilities.source_digis[n];
 	make_rose->neighbour     = neigh;
+	/* Release the device reference inherited from the listening socket
+	 * in rose_make_new() before replacing it with the caller's device.
+	 */
+	netdev_put(make_rose->device, &make_rose->dev_tracker);
 	make_rose->device        = dev;
 	/* Caller got a reference for us. */
 	netdev_tracker_alloc(make_rose->device, &make_rose->dev_tracker,
