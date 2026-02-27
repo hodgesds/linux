@@ -362,6 +362,12 @@ int hfsplus_delete_cat(u32 cnid, struct inode *dir, const struct qstr *str)
 		fd.search_key->cat.parent = cpu_to_be32(dir->i_ino);
 		hfs_bnode_read(fd.bnode,
 			&fd.search_key->cat.name.length, off, 2);
+		if (be16_to_cpu(fd.search_key->cat.name.length) >
+						HFSPLUS_MAX_STRLEN) {
+			pr_err("catalog name length corrupted\n");
+			err = -EIO;
+			goto out;
+		}
 		len = be16_to_cpu(fd.search_key->cat.name.length) * 2;
 		hfs_bnode_read(fd.bnode,
 			&fd.search_key->cat.name.unicode,
