@@ -430,14 +430,26 @@ static void ems_usb_read_bulk_callback(struct urb *urb)
 	if (urb->actual_length > CPC_HEADER_SIZE) {
 		struct ems_cpc_msg *msg;
 		u8 *ibuf = urb->transfer_buffer;
-		u8 msg_count, start;
+		u8 msg_count;
+		unsigned int start;
 
 		msg_count = ibuf[0] & ~0x80;
 
 		start = CPC_HEADER_SIZE;
 
 		while (msg_count) {
+			if (start + CPC_MSG_HEADER_LEN > urb->actual_length) {
+				netdev_err(netdev, "format error\n");
+				break;
+			}
+
 			msg = (struct ems_cpc_msg *)&ibuf[start];
+
+			if (start + CPC_MSG_HEADER_LEN + msg->length >
+			    urb->actual_length) {
+				netdev_err(netdev, "format error\n");
+				break;
+			}
 
 			switch (msg->type) {
 			case CPC_MSG_TYPE_CAN_STATE:
@@ -465,11 +477,6 @@ static void ems_usb_read_bulk_callback(struct urb *urb)
 
 			start += CPC_MSG_HEADER_LEN + msg->length;
 			msg_count--;
-
-			if (start > urb->transfer_buffer_length) {
-				netdev_err(netdev, "format error\n");
-				break;
-			}
 		}
 	}
 
