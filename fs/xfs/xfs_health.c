@@ -314,6 +314,38 @@ xfs_rgno_mark_sick(
 	xfs_rtgroup_put(rtg);
 }
 
+/*
+ * Report an inode health error via fserror.  If the inode hasn't been added
+ * to the VFS inode list (i_sb_list), it's a temporary inode that will be
+ * destroyed directly (via __destroy_inode + xfs_inode_free) when initialization
+ * fails, bypassing the normal iput path.  In that case, we must not call
+ * fserror_report_file_metadata because igrab() would take a reference that
+ * outlives the inode's slab allocation, leading to a use-after-free when
+ * fserror_worker later calls iput on the freed inode.  Report at the
+ * filesystem level instead.
+ */
+static void
+xfs_inode_report_fserror(
+	struct xfs_inode	*ip)
+{
+	if (list_empty(&VFS_I(ip)->i_sb_list)) {
+		fserror_report_metadata(ip->i_mount->m_super, -EFSCORRUPTED,
+				GFP_NOFS);
+		return;
+	}
+
+	/*
+	 * Keep this inode around so we don't lose the sickness report.  Scrub
+	 * grabs inodes with DONTCACHE assuming that most inodes are ok, which
+	 * is not the case here.
+	 */
+	spin_lock(&VFS_I(ip)->i_lock);
+	inode_state_clear(VFS_I(ip), I_DONTCACHE);
+	spin_unlock(&VFS_I(ip)->i_lock);
+
+	fserror_report_file_metadata(VFS_I(ip), -EFSCORRUPTED, GFP_NOFS);
+}
+
 /* Mark the unhealthy parts of an inode. */
 void
 xfs_inode_mark_sick(
@@ -330,16 +362,7 @@ xfs_inode_mark_sick(
 	ip->i_sick |= mask;
 	spin_unlock(&ip->i_flags_lock);
 
-	/*
-	 * Keep this inode around so we don't lose the sickness report.  Scrub
-	 * grabs inodes with DONTCACHE assuming that most inode are ok, which
-	 * is not the case here.
-	 */
-	spin_lock(&VFS_I(ip)->i_lock);
-	inode_state_clear(VFS_I(ip), I_DONTCACHE);
-	spin_unlock(&VFS_I(ip)->i_lock);
-
-	fserror_report_file_metadata(VFS_I(ip), -EFSCORRUPTED, GFP_NOFS);
+	xfs_inode_report_fserror(ip);
 	if (mask)
 		xfs_healthmon_report_inode(ip, XFS_HEALTHMON_SICK, old_mask,
 				mask);
@@ -362,16 +385,7 @@ xfs_inode_mark_corrupt(
 	ip->i_checked |= mask;
 	spin_unlock(&ip->i_flags_lock);
 
-	/*
-	 * Keep this inode around so we don't lose the sickness report.  Scrub
-	 * grabs inodes with DONTCACHE assuming that most inode are ok, which
-	 * is not the case here.
-	 */
-	spin_lock(&VFS_I(ip)->i_lock);
-	inode_state_clear(VFS_I(ip), I_DONTCACHE);
-	spin_unlock(&VFS_I(ip)->i_lock);
-
-	fserror_report_file_metadata(VFS_I(ip), -EFSCORRUPTED, GFP_NOFS);
+	xfs_inode_report_fserror(ip);
 	if (mask)
 		xfs_healthmon_report_inode(ip, XFS_HEALTHMON_CORRUPT, old_mask,
 				mask);
