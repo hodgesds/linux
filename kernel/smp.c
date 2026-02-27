@@ -26,6 +26,7 @@
 #include <linux/sched/debug.h>
 #include <linux/jump_label.h>
 #include <linux/string_choices.h>
+#include <linux/kmsan-checks.h>
 
 #include <trace/events/ipi.h>
 #define CREATE_TRACE_POINTS
@@ -494,6 +495,19 @@ static void __flush_smp_call_function_queue(bool warn_cpu_offline)
 	head = this_cpu_ptr(&call_single_queue);
 	entry = llist_del_all(head);
 	entry = llist_reverse_order(entry);
+
+	/*
+	 * Unpoison the u_flags of each CSD entry for KMSAN.
+	 *
+	 * CSD nodes are initialized on the sending CPU and consumed here
+	 * on the receiving CPU via IPI. Although the llist_add/llist_del_all
+	 * operations provide proper data ordering, KMSAN cannot track the
+	 * shadow memory initialization across CPUs because shadow writes
+	 * are not ordered by the same barriers. Explicitly mark the flags
+	 * as initialized to prevent false positive uninit-value reports.
+	 */
+	llist_for_each_entry(csd, entry, node.llist)
+		kmsan_unpoison_memory(&csd->node.u_flags, sizeof(csd->node.u_flags));
 
 	/* There shouldn't be any pending callbacks on an offline CPU. */
 	if (unlikely(warn_cpu_offline && !cpu_online(smp_processor_id()) &&
