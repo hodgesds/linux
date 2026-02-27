@@ -1783,11 +1783,13 @@ int __udp_enqueue_schedule_skb(struct sock *sk, struct sk_buff *skb)
 	spin_unlock(&list->lock);
 
 	if (!sock_flag(sk, SOCK_DEAD)) {
+		void (*sk_data_ready)(struct sock *sk) =
+			READ_ONCE(sk->sk_data_ready);
 		/* Multiple threads might be blocked in recvmsg(),
 		 * using prepare_to_wait_exclusive().
 		 */
 		while (nb) {
-			INDIRECT_CALL_1(sk->sk_data_ready,
+			INDIRECT_CALL_1(sk_data_ready,
 					sock_def_readable, sk);
 			nb--;
 		}
