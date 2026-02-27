@@ -783,7 +783,7 @@ static int ntfs_iomap_begin(struct inode *inode, loff_t offset, loff_t length,
 	loff_t endbyte = offset + length;
 	void *res = NULL;
 	int err;
-	CLST lcn, clen, clen_max = 1;
+	CLST lcn = 0, clen = 0, clen_max = 1;
 	bool new_clst = false;
 	bool no_da;
 	bool zero = false;

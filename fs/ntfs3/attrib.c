@@ -1109,6 +1109,7 @@ again:
 		} else if (!new) {
 			/* Here we may return -ENOENT.
 			 * In any case caller gets zero length. */
+			*lcn = SPARSE_LCN;
 			goto ok;
 		}
 	}
