@@ -80,10 +80,18 @@ vxfs_read_olt(struct super_block *sbp, u_long bsize)
 	oaddr = bp->b_data + fs32_to_cpu(infp, op->olt_size);
 	eaddr = bp->b_data + (infp->vsi_oltsize * sbp->s_blocksize);
 
+	if (oaddr >= eaddr || oaddr < bp->b_data)
+		goto fail;
+
 	while (oaddr < eaddr) {
 		struct vxfs_oltcommon	*ocp =
 			(struct vxfs_oltcommon *)oaddr;
-		
+		u_long			size;
+
+		size = fs32_to_cpu(infp, ocp->olt_size);
+		if (size < sizeof(*ocp) || oaddr + size > eaddr)
+			goto fail;
+
 		switch (fs32_to_cpu(infp, ocp->olt_type)) {
 		case VXFS_OLT_FSHEAD:
 			vxfs_get_fshead((struct vxfs_oltfshead *)oaddr, infp);
@@ -93,7 +101,7 @@ vxfs_read_olt(struct super_block *sbp, u_long bsize)
 			break;
 		}
 
-		oaddr += fs32_to_cpu(infp, ocp->olt_size);
+		oaddr += size;
 	}
 
 	brelse(bp);
