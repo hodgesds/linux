@@ -46,10 +46,18 @@ static efs_ino_t efs_find_entry(struct inode *inode, const char *name, int len)
 		}
 
 		for (slot = 0; slot < dirblock->slots; slot++) {
-			dirslot  = (struct efs_dentry *) (((char *) bh->b_data) + EFS_SLOTAT(dirblock, slot));
+			unsigned int off = EFS_SLOTAT(dirblock, slot);
+
+			if (off + EFS_DENTSIZE > EFS_DIRBSIZE)
+				continue;
+
+			dirslot  = (struct efs_dentry *) (((char *) bh->b_data) + off);
 
 			namelen  = dirslot->namelen;
 			nameptr  = dirslot->name;
+
+			if (nameptr - (char *) dirblock + namelen > EFS_DIRBSIZE)
+				continue;
 
 			if ((namelen == len) && (!memcmp(name, nameptr, len))) {
 				inodenum = be32_to_cpu(dirslot->inode);

@@ -63,11 +63,19 @@ static int efs_readdir(struct file *file, struct dir_context *ctx)
 			efs_ino_t inodenum;
 			const char *nameptr;
 			int namelen;
+			unsigned int off;
 
 			if (dirblock->space[slot] == 0)
 				continue;
 
-			dirslot  = (struct efs_dentry *) (((char *) bh->b_data) + EFS_SLOTAT(dirblock, slot));
+			off = EFS_SLOTAT(dirblock, slot);
+			if (off + EFS_DENTSIZE > EFS_DIRBSIZE) {
+				pr_warn("%s(): slot %d has invalid offset %u\n",
+					__func__, slot, off);
+				continue;
+			}
+
+			dirslot  = (struct efs_dentry *) (((char *) bh->b_data) + off);
 
 			inodenum = be32_to_cpu(dirslot->inode);
 			namelen  = dirslot->namelen;
