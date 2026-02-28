@@ -538,8 +538,13 @@ static int mctp_dst_input(struct mctp_dst *dst, struct sk_buff *skb)
 			/* we can queue without the key lock here, as the
 			 * key isn't observable yet
 			 */
-			mctp_frag_queue(key, skb);
+			rc = mctp_frag_queue(key, skb);
 			skb = NULL;
+			if (rc) {
+				mctp_key_unref(key);
+				key = NULL;
+				goto out_unlock;
+			}
 
 			/* if the key_add fails, we've raced with another
 			 * SOM packet with the same src, dest and tag. There's
