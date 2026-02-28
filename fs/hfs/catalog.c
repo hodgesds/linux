@@ -292,6 +292,7 @@ int hfs_correct_next_unused_CNID(struct super_block *sb, u32 cnid)
 				pr_err("fail to get the keylen: "
 					"node_id %lld, record index %d\n",
 					node_id, i);
+				hfs_bnode_put(node);
 				return -EINVAL;
 			}
 
@@ -302,6 +303,7 @@ int hfs_correct_next_unused_CNID(struct super_block *sb, u32 cnid)
 				pr_err("unexpected record length: "
 					"entrylength %d\n",
 					entrylength);
+				hfs_bnode_put(node);
 				return -EINVAL;
 			}
 
