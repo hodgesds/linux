@@ -180,8 +180,18 @@ int lapb_unregister(struct net_device *dev)
 		goto out;
 	lapb_put(lapb);
 
-	/* Wait for other refs to "lapb" to drop */
-	while (refcount_read(&lapb->refcnt) > 2)
+	/* Remove from the list to prevent new references via
+	 * lapb_devtostruct(), then release the lock before waiting
+	 * so we don't sleep in atomic context.
+	 */
+	__lapb_remove_cb(lapb);
+	write_unlock_bh(&lapb_list_lock);
+
+	/* Wait for in-flight references obtained before removal to drop.
+	 * After list removal, no new lookups can succeed, so only the
+	 * initial creation reference (refcnt == 1) should remain.
+	 */
+	while (refcount_read(&lapb->refcnt) > 1)
 		usleep_range(1, 10);
 
 	spin_lock_bh(&lapb->lock);
@@ -197,10 +207,9 @@ int lapb_unregister(struct net_device *dev)
 	del_timer_sync(&lapb->t1timer);
 	del_timer_sync(&lapb->t2timer);
 
-	__lapb_remove_cb(lapb);
-
 	lapb_put(lapb);
-	rc = LAPB_OK;
+
+	return LAPB_OK;
 out:
 	write_unlock_bh(&lapb_list_lock);
 	return rc;
