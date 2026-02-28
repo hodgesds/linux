@@ -55,7 +55,7 @@ static void x25_t20timer_expiry(struct timer_list *t)
 
 static inline void x25_stop_t20timer(struct x25_neigh *nb)
 {
-	del_timer(&nb->t20timer);
+	del_timer_sync(&nb->t20timer);
 }
 
 /*
@@ -289,21 +289,6 @@ void x25_link_device_up(struct net_device *dev)
 	write_unlock_bh(&x25_neigh_list_lock);
 }
 
-/**
- *	__x25_remove_neigh - remove neighbour from x25_neigh_list
- *	@nb: - neigh to remove
- *
- *	Remove neighbour from x25_neigh_list. If it was there.
- *	Caller must hold x25_neigh_list_lock.
- */
-static void __x25_remove_neigh(struct x25_neigh *nb)
-{
-	if (nb->node.next) {
-		list_del(&nb->node);
-		x25_neigh_put(nb);
-	}
-}
-
 /*
  *	A device has been removed, remove its links.
  */
@@ -318,8 +303,14 @@ void x25_link_device_down(struct net_device *dev)
 		nb = list_entry(entry, struct x25_neigh, node);
 
 		if (nb->dev == dev) {
-			__x25_remove_neigh(nb);
+			list_del(&nb->node);
+			write_unlock_bh(&x25_neigh_list_lock);
+
+			del_timer_sync(&nb->t20timer);
+			skb_queue_purge(&nb->queue);
+			x25_neigh_put(nb);
 			dev_put(dev);
+			return;
 		}
 	}
 
@@ -414,8 +405,15 @@ void __exit x25_link_free(void)
 
 		nb = list_entry(entry, struct x25_neigh, node);
 		dev = nb->dev;
-		__x25_remove_neigh(nb);
+		list_del(&nb->node);
+		write_unlock_bh(&x25_neigh_list_lock);
+
+		del_timer_sync(&nb->t20timer);
+		skb_queue_purge(&nb->queue);
+		x25_neigh_put(nb);
 		dev_put(dev);
+
+		write_lock_bh(&x25_neigh_list_lock);
 	}
 	write_unlock_bh(&x25_neigh_list_lock);
 }
