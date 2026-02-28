@@ -109,6 +109,12 @@ unsigned long qnx4_block_map( struct inode *inode, long iblock )
 				xblk = (struct qnx4_xblk*)bh->b_data;
 				if ( memcmp( xblk->xblk_signature, "IamXblk", 7 ) ) {
 					QNX4DEBUG((KERN_ERR "qnx4: block at %ld is not a valid xtnt\n", qnx4_inode->i_xblk));
+					brelse(bh);
+					return -EIO;
+				}
+				if (xblk->xblk_num_xtnts > QNX4_MAX_XTNTS_PER_XBLK) {
+					QNX4DEBUG((KERN_ERR "qnx4: too many extents in xblk\n"));
+					brelse(bh);
 					return -EIO;
 				}
 			}
