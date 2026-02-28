@@ -20,7 +20,10 @@ secno hpfs_bplus_lookup(struct super_block *s, struct inode *inode,
 	int i;
 	int c1, c2 = 0;
 	go_down:
-	if (hpfs_sb(s)->sb_chk) if (hpfs_stop_cycles(s, a, &c1, &c2, "hpfs_bplus_lookup")) return -1;
+	if (hpfs_sb(s)->sb_chk) if (hpfs_stop_cycles(s, a, &c1, &c2, "hpfs_bplus_lookup")) {
+		brelse(bh);
+		return -1;
+	}
 	if (bp_internal(btree)) {
 		for (i = 0; i < btree->n_used_nodes; i++)
 			if (le32_to_cpu(btree->u.internal[i].file_secno) > sec) {
@@ -299,12 +302,15 @@ void hpfs_remove_btree(struct super_block *s, struct bplus_header *btree)
 		hpfs_free_sectors(s, le32_to_cpu(btree1->u.external[i].disk_secno), le32_to_cpu(btree1->u.external[i].length));
 	go_up:
 	if (!level) return;
-	brelse(bh);
-	if (hpfs_sb(s)->sb_chk)
-		if (hpfs_stop_cycles(s, ano, &c1, &c2, "hpfs_remove_btree #2")) return;
-	hpfs_free_sectors(s, ano, 1);
-	oano = ano;
-	ano = le32_to_cpu(anode->up);
+	{
+		anode_secno up = le32_to_cpu(anode->up);
+		brelse(bh);
+		if (hpfs_sb(s)->sb_chk)
+			if (hpfs_stop_cycles(s, ano, &c1, &c2, "hpfs_remove_btree #2")) return;
+		hpfs_free_sectors(s, ano, 1);
+		oano = ano;
+		ano = up;
+	}
 	if (--level) {
 		if (!(anode = hpfs_map_anode(s, ano, &bh))) return;
 		btree1 = &anode->btree;
