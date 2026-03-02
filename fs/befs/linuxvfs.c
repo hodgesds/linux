@@ -670,7 +670,8 @@ static struct dentry *befs_get_parent(struct dentry *child)
 	struct befs_inode_info *befs_ino = BEFS_I(d_inode(child));
 
 	parent = befs_iget(child->d_sb,
-			   (unsigned long)befs_ino->i_parent.start);
+			   (unsigned long)iaddr2blockno(child->d_sb,
+					&befs_ino->i_parent));
 	return d_obtain_alias(parent);
 }
 
