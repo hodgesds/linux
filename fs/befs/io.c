@@ -34,7 +34,7 @@ befs_bread_iaddr(struct super_block *sb, befs_inode_addr iaddr)
 		   "[%u, %hu, %hu]", __func__, iaddr.allocation_group,
 		   iaddr.start, iaddr.len);
 
-	if (iaddr.allocation_group > befs_sb->num_ags) {
+	if (iaddr.allocation_group >= befs_sb->num_ags) {
 		befs_error(sb, "BEFS: Invalid allocation group %u, max is %u",
 			   iaddr.allocation_group, befs_sb->num_ags);
 		goto error;
