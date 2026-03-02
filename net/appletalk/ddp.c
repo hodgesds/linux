@@ -118,6 +118,8 @@ static struct sock *atalk_search_socket(struct sockaddr_at *to,
 	}
 	s = NULL;
 found:
+	if (s)
+		sock_hold(s);
 	read_unlock_bh(&atalk_sockets_lock);
 	return s;
 }
@@ -1460,9 +1462,12 @@ static int atalk_rcv(struct sk_buff *skb, struct net_device *dev,
 		goto drop;
 
 	/* Queue packet (standard) */
-	if (sock_queue_rcv_skb(sock, skb) < 0)
+	if (sock_queue_rcv_skb(sock, skb) < 0) {
+		sock_put(sock);
 		goto drop;
+	}
 
+	sock_put(sock);
 	return NET_RX_SUCCESS;
 
 drop:
