@@ -378,10 +378,14 @@ befs_find_key(struct super_block *sb, struct befs_btree_node *node,
 	}
 
 	/* return an existing value so caller can arrive to a leaf node */
-	if (eq < 0)
-		*value = fs64_to_cpu(sb, valarray[mid + 1]);
-	else
+	if (eq < 0) {
+		if (mid + 1 < node->head.all_key_count)
+			*value = fs64_to_cpu(sb, valarray[mid + 1]);
+		else
+			return BEFS_BT_OVERFLOW;
+	} else {
 		*value = fs64_to_cpu(sb, valarray[mid]);
+	}
 	befs_error(sb, "<--- %s %s not found", __func__, findkey);
 	befs_debug(sb, "<--- %s ERROR", __func__);
 	return BEFS_BT_NOT_FOUND;
@@ -679,7 +683,7 @@ befs_bt_get_key(struct super_block *sb, struct befs_btree_node *node,
 	char *keystart;
 	fs16 *keylen_index;
 
-	if (index < 0 || index > node->head.all_key_count) {
+	if (index < 0 || index >= node->head.all_key_count) {
 		*keylen = 0;
 		return NULL;
 	}
