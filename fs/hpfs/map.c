@@ -168,6 +168,15 @@ struct fnode *hpfs_map_fnode(struct super_block *s, ino_t ino, struct buffer_hea
 		return NULL;
 	}
 	if ((fnode = hpfs_map_sector(s, ino, bhp, FNODE_RD_AHEAD))) {
+		if (!fnode_is_dir(fnode)) {
+			unsigned max_nodes = bp_internal(GET_BTREE_PTR(&fnode->btree)) ? 12 : 8;
+			if (fnode->btree.n_used_nodes > max_nodes) {
+				hpfs_error(s, "fnode %08lx has n_used_nodes %u > max %u",
+					   (unsigned long)ino,
+					   fnode->btree.n_used_nodes, max_nodes);
+				goto bail;
+			}
+		}
 		if (hpfs_sb(s)->sb_chk) {
 			struct extended_attribute *ea;
 			struct extended_attribute *ea_end;
@@ -221,8 +230,15 @@ struct fnode *hpfs_map_fnode(struct super_block *s, ino_t ino, struct buffer_hea
 struct anode *hpfs_map_anode(struct super_block *s, anode_secno ano, struct buffer_head **bhp)
 {
 	struct anode *anode;
+	unsigned max_nodes;
 	if (hpfs_sb(s)->sb_chk) if (hpfs_chk_sectors(s, ano, 1, "anode")) return NULL;
-	if ((anode = hpfs_map_sector(s, ano, bhp, ANODE_RD_AHEAD)))
+	if ((anode = hpfs_map_sector(s, ano, bhp, ANODE_RD_AHEAD))) {
+		max_nodes = bp_internal(GET_BTREE_PTR(&anode->btree)) ? 60 : 40;
+		if (anode->btree.n_used_nodes > max_nodes) {
+			hpfs_error(s, "anode %08x has n_used_nodes %u > max %u",
+				   ano, anode->btree.n_used_nodes, max_nodes);
+			goto bail;
+		}
 		if (hpfs_sb(s)->sb_chk) {
 			if (le32_to_cpu(anode->magic) != ANODE_MAGIC) {
 				hpfs_error(s, "bad magic on anode %08x", ano);
@@ -233,7 +249,7 @@ struct anode *hpfs_map_anode(struct super_block *s, anode_secno ano, struct buff
 				goto bail;
 			}
 			if ((unsigned)anode->btree.n_used_nodes + (unsigned)anode->btree.n_free_nodes !=
-			    (bp_internal(GET_BTREE_PTR(&anode->btree)) ? 60 : 40)) {
+			    max_nodes) {
 				hpfs_error(s, "bad number of nodes in anode %08x", ano);
 				goto bail;
 			}
@@ -243,6 +259,7 @@ struct anode *hpfs_map_anode(struct super_block *s, anode_secno ano, struct buff
 				goto bail;
 			}
 		}
+	}
 	return anode;
 	bail:
 	brelse(*bhp);
