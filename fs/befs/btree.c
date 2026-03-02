@@ -219,8 +219,37 @@ befs_bt_read_node(struct super_block *sb, const befs_data_stream *ds,
 	node->head.all_key_length =
 	    fs16_to_cpu(sb, node->od_node->all_key_length);
 
+	/* Validate that all node data fits within the block buffer */
+	{
+		u32 node_size = BEFS_SB(sb)->block_size;
+		u32 key_start = sizeof(befs_btree_nodehead);
+		u32 keylen_idx_off = key_start + node->head.all_key_length;
+
+		/* Align up to 8 bytes for keylen index */
+		keylen_idx_off = ALIGN(keylen_idx_off, 8);
+
+		if (keylen_idx_off > node_size ||
+		    node->head.all_key_count >
+			(node_size - keylen_idx_off) /
+			(sizeof(fs16) + sizeof(fs64))) {
+			befs_error(sb,
+				   "%s: node at %llu has invalid key_count %u "
+				   "or key_length %u for block_size %u",
+				   __func__, node_off,
+				   node->head.all_key_count,
+				   node->head.all_key_length, node_size);
+			goto error;
+		}
+	}
+
 	befs_debug(sb, "<--- %s", __func__);
 	return BEFS_OK;
+
+      error:
+	brelse(node->bh);
+	node->bh = NULL;
+	befs_debug(sb, "<--- %s ERROR", __func__);
+	return BEFS_ERR;
 }
 
 /**
@@ -343,6 +372,11 @@ befs_find_key(struct super_block *sb, struct befs_btree_node *node,
 
 	/* if node can not contain key, just skip this node */
 	last = node->head.all_key_count - 1;
+	if (last < 0) {
+		befs_error(sb, "%s: node has no keys", __func__);
+		*value = 0;
+		return BEFS_BT_OVERFLOW;
+	}
 	thiskey = befs_bt_get_key(sb, node, last, &keylen);
 
 	eq = befs_compare_strings(thiskey, keylen, findkey, findkey_len);
