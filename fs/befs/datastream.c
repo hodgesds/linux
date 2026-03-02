@@ -456,7 +456,7 @@ befs_find_brun_dblindirect(struct super_block *sb,
 
 	dblindir_indx = dbl_indir_off / diblklen;
 	dblindir_leftover = dbl_indir_off % diblklen;
-	indir_indx = dblindir_leftover / diblklen;
+	indir_indx = dblindir_leftover / iblklen;
 
 	/* Read double indirect block */
 	dbl_which_block = dblindir_indx / befs_iaddrs_per_block(sb);
