@@ -507,19 +507,19 @@ static int ufs_read_cylinder_structures(struct super_block *sb)
 	struct ufs_sb_private_info *uspi = sbi->s_uspi;
 	struct ufs_buffer_head * ubh;
 	unsigned char * base, * space;
-	unsigned size, blks, i;
+	unsigned size, blks, i, cssize;
 
 	UFSD("ENTER\n");
 
 	/*
 	 * Read cs structures from (usually) first data block
-	 * on the device. 
+	 * on the device.
 	 */
-	size = uspi->s_cssize;
-	blks = (size + uspi->s_fsize - 1) >> uspi->s_fshift;
-	base = space = kmalloc(size, GFP_NOFS);
+	cssize = uspi->s_cssize;
+	blks = (cssize + uspi->s_fsize - 1) >> uspi->s_fshift;
+	base = space = kmalloc(cssize, GFP_NOFS);
 	if (!base)
-		goto failed; 
+		goto failed;
 	sbi->s_csp = (struct ufs_csum *)space;
 	for (i = 0; i < blks; i += uspi->s_fpb) {
 		size = uspi->s_bsize;
@@ -527,12 +527,16 @@ static int ufs_read_cylinder_structures(struct super_block *sb)
 			size = (blks - i) * uspi->s_fsize;
 
 		ubh = ubh_bread(sb, uspi->s_csaddr + i, size);
-		
+
 		if (!ubh)
 			goto failed;
 
+		/* Don't copy more than what remains in the allocated buffer */
+		if (size > cssize)
+			size = cssize;
 		ubh_ubhcpymem (space, ubh, size);
 
+		cssize -= size;
 		space += size;
 		ubh_brelse (ubh);
 		ubh = NULL;
@@ -647,14 +651,14 @@ static void ufs_put_super_internal(struct super_block *sb)
 	struct ufs_sb_private_info *uspi = sbi->s_uspi;
 	struct ufs_buffer_head * ubh;
 	unsigned char * base, * space;
-	unsigned blks, size, i;
+	unsigned blks, size, i, cssize;
 
-	
+
 	UFSD("ENTER\n");
 
 	ufs_put_cstotal(sb);
-	size = uspi->s_cssize;
-	blks = (size + uspi->s_fsize - 1) >> uspi->s_fshift;
+	cssize = uspi->s_cssize;
+	blks = (cssize + uspi->s_fsize - 1) >> uspi->s_fshift;
 	base = space = (char*) sbi->s_csp;
 	for (i = 0; i < blks; i += uspi->s_fpb) {
 		size = uspi->s_bsize;
@@ -663,7 +667,11 @@ static void ufs_put_super_internal(struct super_block *sb)
 
 		ubh = ubh_bread(sb, uspi->s_csaddr + i, size);
 
+		/* Don't read more than what remains in the allocated buffer */
+		if (size > cssize)
+			size = cssize;
 		ubh_memcpyubh (ubh, space, size);
+		cssize -= size;
 		space += size;
 		ubh_mark_buffer_uptodate (ubh, 1);
 		ubh_mark_buffer_dirty (ubh);
@@ -1084,6 +1092,11 @@ magic_found:
 		       __func__, uspi->s_fsize);
 		goto failed;
 	}
+	if (uspi->s_fshift != ilog2(uspi->s_fsize)) {
+		pr_err("%s(): fragment shift %u does not match fragment size %u\n",
+		       __func__, uspi->s_fshift, uspi->s_fsize);
+		goto failed;
+	}
 	if (!is_power_of_2(uspi->s_bsize)) {
 		pr_err("%s(): block size %u is not a power of 2\n",
 		       __func__, uspi->s_bsize);
@@ -1180,11 +1193,28 @@ magic_found:
 	/* s_bsize already set */
 	/* s_fsize already set */
 	uspi->s_fpb = fs32_to_cpu(sb, usb1->fs_frag);
+	if (uspi->s_fpb == 0 ||
+	    uspi->s_fpb != uspi->s_bsize / uspi->s_fsize) {
+		pr_err("%s(): bad fragments per block %u (expected %u)\n",
+		       __func__, uspi->s_fpb,
+		       uspi->s_bsize / uspi->s_fsize);
+		goto failed;
+	}
 	uspi->s_minfree = fs32_to_cpu(sb, usb1->fs_minfree);
 	uspi->s_bmask = fs32_to_cpu(sb, usb1->fs_bmask);
 	uspi->s_fmask = fs32_to_cpu(sb, usb1->fs_fmask);
 	uspi->s_bshift = fs32_to_cpu(sb, usb1->fs_bshift);
 	uspi->s_fshift = fs32_to_cpu(sb, usb1->fs_fshift);
+	if (uspi->s_bshift != ilog2(uspi->s_bsize)) {
+		pr_err("%s(): block shift %u does not match block size %u\n",
+		       __func__, uspi->s_bshift, uspi->s_bsize);
+		goto failed;
+	}
+	if (uspi->s_fshift != ilog2(uspi->s_fsize)) {
+		pr_err("%s(): fragment shift %u does not match fragment size %u\n",
+		       __func__, uspi->s_fshift, uspi->s_fsize);
+		goto failed;
+	}
 	UFSD("uspi->s_bshift = %d,uspi->s_fshift = %d", uspi->s_bshift,
 		uspi->s_fshift);
 	uspi->s_fpbshift = fs32_to_cpu(sb, usb1->fs_fragshift);
@@ -1205,6 +1235,12 @@ magic_found:
 		uspi->s_csaddr = fs32_to_cpu(sb, usb1->fs_csaddr);
 
 	uspi->s_cssize = fs32_to_cpu(sb, usb1->fs_cssize);
+	if (uspi->s_cssize < sizeof(struct ufs_csum) ||
+	    uspi->s_cssize > (16 << 20)) {
+		pr_err("%s(): bad cylinder summary size %u\n",
+		       __func__, uspi->s_cssize);
+		goto failed;
+	}
 	uspi->s_cgsize = fs32_to_cpu(sb, usb1->fs_cgsize);
 	uspi->s_ntrak = fs32_to_cpu(sb, usb1->fs_ntrak);
 	uspi->s_nsect = fs32_to_cpu(sb, usb1->fs_nsect);
