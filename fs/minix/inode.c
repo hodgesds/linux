@@ -154,18 +154,34 @@ static int minix_remount (struct super_block * sb, int * flags, char * data)
 static bool minix_check_superblock(struct super_block *sb)
 {
 	struct minix_sb_info *sbi = minix_sb(sb);
+	loff_t max_bytes;
 
 	if (sbi->s_imap_blocks == 0 || sbi->s_zmap_blocks == 0)
 		return false;
 
 	/*
-	 * s_max_size must not exceed the block mapping limitation.  This check
-	 * is only needed for V1 filesystems, since V2/V3 support an extra level
-	 * of indirect blocks which places the limit well above U32_MAX.
+	 * s_max_size must not exceed the block mapping limitation.
+	 *
+	 * For V1 (DEPTH=3, u16 block pointers, 1024-byte blocks):
+	 *   INDIRCOUNT = 512, max blocks = 7 + 512 + 512^2 = 262663
+	 *
+	 * For V2/V3 (DEPTH=4, u32 block pointers, variable block size):
+	 *   INDIRCOUNT = blocksize/4, max blocks = 7 + IC + IC^2 + IC^3
+	 *
+	 * With small block sizes (e.g., 512 bytes for V3), the limit can
+	 * be well below U32_MAX, so clamping is needed for all versions.
 	 */
-	if (sbi->s_version == MINIX_V1 &&
-	    sb->s_maxbytes > (7 + 512 + 512*512) * BLOCK_SIZE)
-		return false;
+	if (sbi->s_version == MINIX_V1) {
+		max_bytes = (7LL + 512 + 512*512) * BLOCK_SIZE;
+	} else {
+		unsigned long ic = sb->s_blocksize >> 2;
+
+		max_bytes = (7LL + ic + (loff_t)ic*ic + (loff_t)ic*ic*ic) *
+			    sb->s_blocksize;
+	}
+
+	if (sb->s_maxbytes > max_bytes)
+		sb->s_maxbytes = max_bytes;
 
 	return true;
 }
