@@ -607,6 +607,8 @@ static bool rootdir_empty(struct super_block *sb, unsigned long block)
 			break;
 		files++;
 		offset += de_len;
+		if (offset >= sb->s_blocksize)
+			break;
 	}
 	brelse(bh);
 	return files < 3;
