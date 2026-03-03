@@ -169,6 +169,11 @@ static void local_cleanup(struct nfc_llcp_local *local)
 	local->rx_pending = NULL;
 	del_timer_sync(&local->sdreq_timer);
 	cancel_work_sync(&local->sdreq_timeout_work);
+	/* sdreq_timeout_work may have re-armed sdreq_timer (mod_timer is
+	 * called if pending_sdreqs is not empty), so we need to sync it
+	 * again to prevent a use-after-free.
+	 */
+	del_timer_sync(&local->sdreq_timer);
 	nfc_llcp_free_sdp_tlv_list(&local->pending_sdreqs);
 }
 
