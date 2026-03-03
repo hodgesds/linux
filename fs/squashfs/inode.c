@@ -161,6 +161,11 @@ int squashfs_read_inode(struct inode *inode, long long ino)
 				err = frag_size;
 				goto failed_read;
 			}
+			if (frag_offset + (inode->i_size & (msblk->block_size
+					- 1)) > msblk->block_size) {
+				err = -EINVAL;
+				goto failed_read;
+			}
 		} else {
 			frag_blk = SQUASHFS_INVALID_BLK;
 			frag_size = 0;
@@ -217,6 +222,11 @@ int squashfs_read_inode(struct inode *inode, long long ino)
 				err = frag_size;
 				goto failed_read;
 			}
+			if (frag_offset + (inode->i_size & (msblk->block_size
+					- 1)) > msblk->block_size) {
+				err = -EINVAL;
+				goto failed_read;
+			}
 		} else {
 			frag_blk = SQUASHFS_INVALID_BLK;
 			frag_size = 0;
@@ -229,7 +239,8 @@ int squashfs_read_inode(struct inode *inode, long long ino)
 		inode->i_fop = &squashfs_file_operations;
 		inode->i_mode |= S_IFREG;
 		inode->i_blocks = (inode->i_size -
-				le64_to_cpu(sqsh_ino->sparse) + 511) >> 9;
+				min_t(u64, le64_to_cpu(sqsh_ino->sparse),
+					inode->i_size) + 511) >> 9;
 
 		squashfs_i(inode)->fragment_block = frag_blk;
 		squashfs_i(inode)->fragment_size = frag_size;
