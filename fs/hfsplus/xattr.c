@@ -235,8 +235,10 @@ check_attr_tree_state_again:
 	hfsplus_mark_inode_dirty(attr_file, HFSPLUS_I_ATTR_DIRTY);
 
 	sbi->attr_tree = hfs_btree_open(sb, HFSPLUS_ATTR_CNID);
-	if (!sbi->attr_tree)
+	if (!sbi->attr_tree) {
 		pr_err("failed to load attributes file\n");
+		err = -EIO;
+	}
 
 failed_header_node_init:
 	kfree(buf);
