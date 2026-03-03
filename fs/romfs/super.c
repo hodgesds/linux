@@ -288,7 +288,10 @@ static struct inode *romfs_iget(struct super_block *sb, unsigned long pos)
 
 	/* we might have to traverse a chain of "hard link" file entries to get
 	 * to the actual file */
-	for (;;) {
+	for (unsigned int nlinks = 0; ; nlinks++) {
+		if (nlinks > 10)
+			goto eio;
+
 		ret = romfs_dev_read(sb, pos, &ri, sizeof(ri));
 		if (ret < 0)
 			goto error;
