@@ -180,7 +180,10 @@ static int jffs2_zlib_decompress(unsigned char *data_in,
 	while((ret = zlib_inflate(&inf_strm, Z_FINISH)) == Z_OK)
 		;
 	if (ret != Z_STREAM_END) {
-		pr_notice("inflate returned %d\n", ret);
+		pr_warn("inflate returned %d\n", ret);
+		zlib_inflateEnd(&inf_strm);
+		mutex_unlock(&inflate_mutex);
+		return -EIO;
 	}
 	zlib_inflateEnd(&inf_strm);
 	mutex_unlock(&inflate_mutex);
