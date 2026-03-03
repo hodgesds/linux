@@ -83,10 +83,16 @@ static int jffs2_rtime_decompress(unsigned char *data_in,
 
 	memset(positions,0,sizeof(positions));
 
-	while (outpos<destlen) {
+	while (outpos < destlen) {
 		unsigned char value;
 		int backoffs;
 		int repeat;
+
+		if (pos + 2 > srclen) {
+			pr_warn("rtime: input data underrun at pos %d (srclen %u)\n",
+				pos, srclen);
+			return -EIO;
+		}
 
 		value = data_in[pos++];
 		cpage_out[outpos++] = value; /* first the verbatim copied byte */
@@ -95,6 +101,11 @@ static int jffs2_rtime_decompress(unsigned char *data_in,
 
 		positions[value]=outpos;
 		if (repeat) {
+			if (outpos + repeat > destlen) {
+				pr_warn("rtime: repeat %d would overflow output buffer\n",
+					repeat);
+				return -EIO;
+			}
 			if (backoffs + repeat >= outpos) {
 				while(repeat) {
 					cpage_out[outpos++] = cpage_out[backoffs++];
