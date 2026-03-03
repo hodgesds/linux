@@ -74,6 +74,15 @@ struct inode *bfs_iget(struct super_block *sb, unsigned long ino)
 
 	BFS_I(inode)->i_sblock =  le32_to_cpu(di->i_sblock);
 	BFS_I(inode)->i_eblock =  le32_to_cpu(di->i_eblock);
+
+	if (BFS_I(inode)->i_sblock &&
+	    (BFS_I(inode)->i_sblock > BFS_I(inode)->i_eblock ||
+	     BFS_I(inode)->i_eblock >= BFS_SB(sb)->si_blocks)) {
+		brelse(bh);
+		printf("Inode %s:%08lx corrupted\n", sb->s_id, ino);
+		goto error;
+	}
+
 	BFS_I(inode)->i_dsk_ino = le16_to_cpu(di->i_ino);
 	i_uid_write(inode, le32_to_cpu(di->i_uid));
 	i_gid_write(inode,  le32_to_cpu(di->i_gid));
@@ -198,8 +207,12 @@ static void bfs_evict_inode(struct inode *inode)
 	 * "last block of the last file" even if there is no
 	 * real file there, saves us 1 gap.
 	 */
-	if (info->si_lf_eblk == bi->i_eblock)
-		info->si_lf_eblk = bi->i_sblock - 1;
+	if (info->si_lf_eblk == bi->i_eblock) {
+		if (bi->i_sblock)
+			info->si_lf_eblk = bi->i_sblock - 1;
+		else
+			info->si_lf_eblk = 0;
+	}
 	mutex_unlock(&info->bfs_lock);
 }
 
@@ -355,6 +368,20 @@ static int bfs_fill_super(struct super_block *s, void *data, int silent)
 	for (i = 0; i < BFS_ROOT_INO; i++)
 		set_bit(i, info->si_imap);
 
+	info->si_blocks = (le32_to_cpu(bfs_sb->s_end) + 1) >> BFS_BSIZE_BITS;
+	info->si_freeb = (le32_to_cpu(bfs_sb->s_end) + 1 - le32_to_cpu(bfs_sb->s_start)) >> BFS_BSIZE_BITS;
+	info->si_freei = 0;
+	info->si_lf_eblk = 0;
+
+	/* can we read the last block? */
+	bh = sb_bread(s, info->si_blocks - 1);
+	if (!bh) {
+		printf("Last block not available on %s: %lu\n", s->s_id, info->si_blocks - 1);
+		ret = -EIO;
+		goto out1;
+	}
+	brelse(bh);
+
 	s->s_op = &bfs_sops;
 	inode = bfs_iget(s, BFS_ROOT_INO);
 	if (IS_ERR(inode)) {
@@ -366,20 +393,6 @@ static int bfs_fill_super(struct super_block *s, void *data, int silent)
 		ret = -ENOMEM;
 		goto out1;
 	}
-
-	info->si_blocks = (le32_to_cpu(bfs_sb->s_end) + 1) >> BFS_BSIZE_BITS;
-	info->si_freeb = (le32_to_cpu(bfs_sb->s_end) + 1 - le32_to_cpu(bfs_sb->s_start)) >> BFS_BSIZE_BITS;
-	info->si_freei = 0;
-	info->si_lf_eblk = 0;
-
-	/* can we read the last block? */
-	bh = sb_bread(s, info->si_blocks - 1);
-	if (!bh) {
-		printf("Last block not available on %s: %lu\n", s->s_id, info->si_blocks - 1);
-		ret = -EIO;
-		goto out2;
-	}
-	brelse(bh);
 
 	bh = NULL;
 	for (i = BFS_ROOT_INO; i <= info->si_lasti; i++) {
@@ -405,8 +418,8 @@ static int bfs_fill_super(struct super_block *s, void *data, int silent)
 		i_eblock = le32_to_cpu(di->i_eblock);
 		s_size = le32_to_cpu(bfs_sb->s_end);
 
-		if (i_sblock > info->si_blocks ||
-			i_eblock > info->si_blocks ||
+		if (i_sblock >= info->si_blocks ||
+			i_eblock >= info->si_blocks ||
 			i_sblock > i_eblock ||
 			(i_eoff != le32_to_cpu(-1) && i_eoff > s_size) ||
 			i_sblock * BFS_BSIZE > i_eoff) {
