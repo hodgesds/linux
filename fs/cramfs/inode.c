@@ -137,8 +137,25 @@ static struct inode *get_cramfs_inode(struct super_block *sb,
 
 	/* if the lower 2 bits are zero, the inode contains data */
 	if (!(inode->i_ino & 3)) {
+		unsigned long ino_offset = inode->i_ino;
+		unsigned long fs_size = CRAMFS_SB(sb)->size;
+
+		/*
+		 * Validate that the data offset doesn't point beyond the
+		 * filesystem image. The offset is used as a byte offset
+		 * into the image by cramfs_read(), cramfs_readdir(), and
+		 * cramfs_read_folio(), so an out-of-range value from a
+		 * corrupted image would cause out-of-bounds reads.
+		 */
+		if (ino_offset >= fs_size) {
+			pr_err("inode %lu: data offset %lu beyond filesystem size %lu\n",
+			       inode->i_ino, ino_offset, fs_size);
+			iget_failed(inode);
+			return ERR_PTR(-EIO);
+		}
 		inode->i_size = cramfs_inode->size;
-		inode->i_blocks = (cramfs_inode->size - 1) / 512 + 1;
+		if (inode->i_size)
+			inode->i_blocks = (inode->i_size - 1) / 512 + 1;
 	}
 
 	/* Struct copy intentional */
@@ -775,7 +792,7 @@ static struct dentry *cramfs_lookup(struct inode *dir, struct dentry *dentry, un
 		struct cramfs_inode *de;
 		char *name;
 		int namelen, retval;
-		int dir_off = OFFSET(dir) + offset;
+		unsigned int dir_off = OFFSET(dir) + offset;
 
 		de = cramfs_read(dir->i_sb, dir_off, sizeof(*de)+CRAMFS_MAXPATHLEN);
 		name = (char *)(de+1);
