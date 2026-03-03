@@ -294,6 +294,9 @@ static int mcp2200_raw_event(struct hid_device *hdev, struct hid_report *report,
 	struct mcp2200 *mcp = hid_get_drvdata(hdev);
 	struct mcp_read_all_resp *all_resp;
 
+	if (size < sizeof(struct mcp_read_all_resp))
+		return -EINVAL;
+
 	switch (data[0]) {
 	case READ_ALL:
 		all_resp = (struct mcp_read_all_resp *) data;
