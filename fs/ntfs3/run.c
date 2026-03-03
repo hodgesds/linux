@@ -959,7 +959,13 @@ int run_unpack(struct runs_tree *run, struct ntfs_sb_info *sbi, CLST ino,
 		 * Large positive number requires to store 5 bytes
 		 * e.g.: 05 FF 7E FF FF 00 00 00
 		 */
-		if (size_size > 8)
+		if (size_size > 8 || offset_size > 8)
+			return -EINVAL;
+
+		/* Ensure the run buffer has enough bytes to read
+		 * the length and offset fields.
+		 */
+		if (run_buf + size_size + offset_size > run_last)
 			return -EINVAL;
 
 		len = run_unpack_s64(run_buf, size_size, 0);
@@ -971,7 +977,7 @@ int run_unpack(struct runs_tree *run, struct ntfs_sb_info *sbi, CLST ino,
 
 		if (!offset_size)
 			lcn = SPARSE_LCN64;
-		else if (offset_size <= 8) {
+		else {
 			s64 dlcn;
 
 			/* Initial value of dlcn is -1 or 0. */
@@ -984,8 +990,7 @@ int run_unpack(struct runs_tree *run, struct ntfs_sb_info *sbi, CLST ino,
 				return -EINVAL;
 			lcn = prev_lcn + dlcn;
 			prev_lcn = lcn;
-		} else
-			return -EINVAL;
+		}
 
 		next_vcn = vcn64 + len;
 		/* Check boundary. */
