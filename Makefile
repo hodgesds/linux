@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: GPL-2.0
-VERSION = 6
-PATCHLEVEL = 8
+VERSION = 7
+PATCHLEVEL = 0
 SUBLEVEL = 0
-EXTRAVERSION =
-NAME = Hurr durr I'ma ninja sloth
+EXTRAVERSION = -rc3
+NAME = Baby Opossum Posse
 
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"
