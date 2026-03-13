@@ -122,6 +122,39 @@ config ZSWAP_COMPRESSOR_DEFAULT
        default "zstd" if ZSWAP_COMPRESSOR_DEFAULT_ZSTD
        default ""
 
+config GSWAP
+	bool "GPU VRAM-backed compressed swap cache"
+	depends on SWAP
+	depends on PCI
+	select CRYPTO
+	select CRYPTO_LZ4
+	help
+	  A compressed swap cache that stores pages in GPU VRAM via MMIO.
+	  It sits between zswap (RAM-backed) and disk swap in the swap
+	  hierarchy, providing ~2-5us latency while consuming zero system
+	  RAM for data storage.
+
+	  Modern GPUs have significant VRAM (8-80GB) that often sits idle.
+	  GPU VRAM accessed over PCIe 4.0/5.0 offers 32-64 GB/s bandwidth
+	  with ~500ns latency -- roughly 200x faster than NVMe for random
+	  4K access. By combining VRAM storage with CPU compression, gswap
+	  creates a high-performance swap tier without consuming system RAM.
+
+	  Swap tier hierarchy:
+	    zswap (RAM, ~1us) -> gswap (VRAM, ~2-5us) -> disk swap (~100us)
+
+	  When CONFIG_DRM is also enabled, gswap allocates VRAM through
+	  the GPU driver's memory manager (via DRM client dumb buffers),
+	  ensuring safe coexistence with the GPU driver. Without DRM,
+	  gswap falls back to direct PCI BAR mapping which may conflict
+	  with GPU driver VRAM usage.
+
+	  VRAM can also be specified manually via boot parameters
+	  (gswap.vram_base, gswap.vram_size). ReBAR (resizable BAR) is
+	  recommended for best performance.
+
+	  If unsure, say N.
+
 config ZSMALLOC
 	tristate
 
