@@ -621,6 +621,9 @@ out:
 	return ret;
 }
 
+/* Backoff delay when writeback fails repeatedly (100ms) */
+#define GSWAP_WRITEBACK_RETRY_DELAY	(HZ / 10)
+
 static void gswap_writeback_worker(struct work_struct *work)
 {
 	struct gswap_entry *entry;
@@ -629,22 +632,27 @@ static void gswap_writeback_worker(struct work_struct *work)
 	unsigned long nr_writeback = 0;
 	unsigned long nr_failures = 0;
 	unsigned long max_writeback = atomic_long_read(&gswap_pool.used_slots) / 4;
-	unsigned int noio_flag;
+	unsigned int nofs_flag;
 	int ret;
 
 	if (max_writeback < 16)
 		max_writeback = 16;
 
 	/*
-	 * Prevent recursive I/O: this worker writes swap data to the
-	 * swap device. GFP_KERNEL allocations inside (e.g.
-	 * swap_cache_alloc_folio, xa_cmpxchg) could trigger direct
-	 * reclaim, which can re-enter the swap path.  Unlike zswap
-	 * (whose writeback runs from a shrinker in PF_MEMALLOC reclaim
-	 * context), this worker has no reclaim protection.  Stripping
-	 * __GFP_IO from all allocations breaks the cycle.
+	 * Prevent filesystem recursion: allocations inside (e.g.
+	 * swap_cache_alloc_folio, xa_cmpxchg) can trigger direct
+	 * reclaim, which can re-enter the swap path.  Stripping
+	 * __GFP_FS prevents filesystem-level recursion.
+	 *
+	 * We allow __GFP_IO so reclaim can write dirty pages and
+	 * swap pages to disk -- without this, folio allocation fails
+	 * under memory pressure because reclaim has nothing clean to
+	 * free, and VRAM never drains.  The recursive swap-out path
+	 * is safe: gswap_store() rejects at the pool limit check and
+	 * falls through to __swap_writepage(), and no gswap locks are
+	 * held across that allocation.
 	 */
-	noio_flag = memalloc_noio_save();
+	nofs_flag = memalloc_nofs_save();
 
 	spin_lock(&gswap_lru_lock);
 	while (!list_empty(&gswap_lru_list) && nr_writeback < max_writeback) {
@@ -705,7 +713,19 @@ static void gswap_writeback_worker(struct work_struct *work)
 	}
 	spin_unlock(&gswap_lru_lock);
 
-	memalloc_noio_restore(noio_flag);
+	memalloc_nofs_restore(nofs_flag);
+
+	/*
+	 * If we bailed out due to consecutive failures but there are
+	 * still entries to write back, reschedule with a delay to
+	 * avoid busy-looping when folio allocation is persistently
+	 * failing.  Without this, the worker never re-runs and VRAM
+	 * never drains under sustained memory pressure.
+	 */
+	if (nr_failures >= 4 && !list_empty_careful(&gswap_lru_list))
+		queue_delayed_work(gswap_writeback_wq,
+				   &gswap_writeback_work,
+				   GSWAP_WRITEBACK_RETRY_DELAY);
 }
 
 /*
