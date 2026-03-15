@@ -39,6 +39,7 @@
 #include <crypto/scatterwalk.h>
 #include <linux/gswap.h>
 #include <linux/mm_types.h>
+#include <linux/sched/mm.h>
 #include <linux/page-flags.h>
 #include <linux/swapops.h>
 #include <linux/workqueue.h>
@@ -52,8 +53,9 @@
 
 #ifdef CONFIG_DRM
 #include <drm/drm_client.h>
+#include <drm/drm_dumb_buffers.h>
 #include <drm/drm_file.h>
-#include <drm/drm_fourcc.h>
+#include <drm/drm_gem.h>
 #endif
 #include <linux/rcupdate.h>
 #include <linux/pagemap.h>
@@ -168,6 +170,7 @@ struct gswap_pool {
 	unsigned long		*bitmap;	/* allocation bitmap */
 	spinlock_t		lock;		/* protects bitmap */
 	atomic_long_t		used_slots;	/* number of allocated slots */
+	unsigned long		next_hint;	/* bitmap scan start hint */
 };
 
 static struct gswap_pool gswap_pool;
@@ -196,7 +199,7 @@ static bool gswap_has_pool;
 
 #ifdef CONFIG_DRM
 static struct drm_client_dev gswap_drm_client;
-static struct drm_client_buffer *gswap_drm_bufs[GSWAP_MAX_BUFFERS];
+static struct drm_gem_object *gswap_drm_gems[GSWAP_MAX_BUFFERS];
 static unsigned int gswap_drm_nr_bufs;
 static struct notifier_block gswap_pci_nb;
 static struct work_struct gswap_drm_work;
@@ -252,15 +255,30 @@ static bool gswap_device_matches(struct pci_dev *pdev)
 
 static long gswap_alloc_slot(void)
 {
-	unsigned long index;
+	unsigned long index, hint;
+
+	/* Fast reject: avoid the spinlock when the bitmap is full */
+	if (atomic_long_read(&gswap_pool.used_slots) >= gswap_pool.nr_slots)
+		return -ENOMEM;
 
 	spin_lock(&gswap_pool.lock);
-	index = find_first_zero_bit(gswap_pool.bitmap, gswap_pool.nr_slots);
+	hint = gswap_pool.next_hint;
+	if (hint >= gswap_pool.nr_slots)
+		hint = 0;
+
+	/* Scan from hint to end */
+	index = find_next_zero_bit(gswap_pool.bitmap, gswap_pool.nr_slots,
+				   hint);
+	/* Wrap around: scan from 0 to hint */
+	if (index >= gswap_pool.nr_slots && hint)
+		index = find_next_zero_bit(gswap_pool.bitmap, hint, 0);
+
 	if (index >= gswap_pool.nr_slots) {
 		spin_unlock(&gswap_pool.lock);
 		return -ENOMEM;
 	}
 	set_bit(index, gswap_pool.bitmap);
+	gswap_pool.next_hint = index + 1;
 	spin_unlock(&gswap_pool.lock);
 
 	atomic_long_inc(&gswap_pool.used_slots);
@@ -269,11 +287,12 @@ static long gswap_alloc_slot(void)
 
 static void gswap_free_slot(unsigned long index)
 {
-	spin_lock(&gswap_pool.lock);
 	clear_bit(index, gswap_pool.bitmap);
-	spin_unlock(&gswap_pool.lock);
-
 	atomic_long_dec(&gswap_pool.used_slots);
+
+	/* Nudge the hint so the allocator finds this slot sooner */
+	if (index < gswap_pool.next_hint)
+		WRITE_ONCE(gswap_pool.next_hint, index);
 }
 
 /*
@@ -295,18 +314,30 @@ static unsigned long gswap_max_usable_slots(void)
 	return gswap_pool.usable_size / GSWAP_SLOT_SIZE;
 }
 
-static bool gswap_check_limits(void)
+/*
+ * Check pool utilization and return:
+ *   0 = below high watermark, store may proceed
+ *   1 = above high watermark (90%), store proceeds but writeback triggered
+ *   2 = at hard limit (100%), store rejected
+ */
+static int gswap_check_limits(void)
 {
 	unsigned long used = atomic_long_read(&gswap_pool.used_slots);
 	unsigned long max = gswap_max_usable_slots();
 
 	if (used >= max) {
 		atomic_long_inc(&gswap_pool_limit_hit);
-		gswap_pool_reached_full = true;
-	} else if (gswap_pool_reached_full && used <= max * 90 / 100) {
-		gswap_pool_reached_full = false;
+		WRITE_ONCE(gswap_pool_reached_full, true);
+		return 2;
 	}
-	return gswap_pool_reached_full;
+
+	if (READ_ONCE(gswap_pool_reached_full) && used <= max * 4 / 5)
+		WRITE_ONCE(gswap_pool_reached_full, false);
+
+	if (used >= max * 9 / 10)
+		return 1;
+
+	return 0;
 }
 
 /*********************************
@@ -478,7 +509,7 @@ static int gswap_writeback_entry(struct gswap_entry *entry,
 	 */
 	si = get_swap_device(swpentry);
 	if (!si)
-		return -EEXIST;
+		return -EAGAIN;
 
 	mpol = get_task_policy(current);
 	folio = swap_cache_alloc_folio(swpentry, GFP_KERNEL, mpol,
@@ -486,12 +517,55 @@ static int gswap_writeback_entry(struct gswap_entry *entry,
 				       &folio_was_allocated);
 	put_swap_device(si);
 	if (!folio)
-		return -ENOMEM;
+		return -EAGAIN;
 
-	/* Raced with swapin -- folio is already hot, skip it */
+	/*
+	 * Folio already in swap cache -- it still contains the original
+	 * page data that gswap_store() compressed.  Use it directly
+	 * instead of allocating a new folio.  This avoids the livelock
+	 * where writeback keeps failing with -EAGAIN because the
+	 * original folio sits in the swap cache, and no VRAM slots are
+	 * ever freed.
+	 *
+	 * folio_trylock avoids blocking against concurrent swapin which
+	 * will handle the entry itself via gswap_load().
+	 */
 	if (!folio_was_allocated) {
-		ret = -EEXIST;
-		goto out;
+		if (!folio_trylock(folio)) {
+			folio_put(folio);
+			return -EAGAIN;
+		}
+
+		/*
+		 * Verify the folio is still in the swap cache -- it may
+		 * have been reclaimed between swap_cache_get_folio and
+		 * our trylock, invalidating the swap entry.
+		 */
+		if (!folio_test_swapcache(folio)) {
+			folio_unlock(folio);
+			folio_put(folio);
+			return -EAGAIN;
+		}
+
+		/*
+		 * Claim the gswap entry.  If a concurrent load/invalidate
+		 * already erased it, the folio is being handled elsewhere.
+		 */
+		tree = swap_gswap_tree(swpentry);
+		if (xa_cmpxchg(tree, offset, entry, NULL, GFP_KERNEL) != entry) {
+			folio_unlock(folio);
+			folio_put(folio);
+			return -ENOMEM;
+		}
+
+		gswap_entry_free(entry);
+
+		/* Folio already has correct data -- write it to disk */
+		folio_mark_uptodate(folio);
+		folio_set_reclaim(folio);
+		__swap_writepage(folio, NULL);
+		folio_put(folio);
+		return 0;
 	}
 
 	/*
@@ -539,7 +613,7 @@ static int gswap_writeback_entry(struct gswap_entry *entry,
 	__swap_writepage(folio, NULL);
 
 out:
-	if (ret && ret != -EEXIST) {
+	if (ret) {
 		swap_cache_del_folio(folio);
 		folio_unlock(folio);
 	}
@@ -550,13 +624,27 @@ out:
 static void gswap_writeback_worker(struct work_struct *work)
 {
 	struct gswap_entry *entry;
+	struct xarray *tree;
 	swp_entry_t swpentry;
 	unsigned long nr_writeback = 0;
+	unsigned long nr_failures = 0;
 	unsigned long max_writeback = atomic_long_read(&gswap_pool.used_slots) / 4;
+	unsigned int noio_flag;
 	int ret;
 
 	if (max_writeback < 16)
 		max_writeback = 16;
+
+	/*
+	 * Prevent recursive I/O: this worker writes swap data to the
+	 * swap device. GFP_KERNEL allocations inside (e.g.
+	 * swap_cache_alloc_folio, xa_cmpxchg) could trigger direct
+	 * reclaim, which can re-enter the swap path.  Unlike zswap
+	 * (whose writeback runs from a shrinker in PF_MEMALLOC reclaim
+	 * context), this worker has no reclaim protection.  Stripping
+	 * __GFP_IO from all allocations breaks the cycle.
+	 */
+	noio_flag = memalloc_noio_save();
 
 	spin_lock(&gswap_lru_lock);
 	while (!list_empty(&gswap_lru_list) && nr_writeback < max_writeback) {
@@ -577,14 +665,47 @@ static void gswap_writeback_worker(struct work_struct *work)
 
 		ret = gswap_writeback_entry(entry, swpentry);
 
-		if (ret == 0)
+		if (ret == 0) {
 			atomic_long_inc(&gswap_written_back_pages);
+			nr_failures = 0;
+		} else if (ret == -EAGAIN) {
+			/*
+			 * Writeback failed before xa_cmpxchg could claim
+			 * the entry (folio alloc failure, swap device
+			 * gone, or swapin race).  The entry may still be
+			 * in the xarray consuming a VRAM slot.
+			 *
+			 * We cannot safely dereference entry here -- a
+			 * concurrent gswap_load() may have freed it.
+			 * Hold the xa_lock to prevent concurrent xa_erase
+			 * while we validate and re-add to the LRU.
+			 */
+			tree = swap_gswap_tree(swpentry);
+			xa_lock(tree);
+			if (xa_load(tree, swp_offset(swpentry)) == entry) {
+				spin_lock(&gswap_lru_lock);
+				if (list_empty(&entry->lru))
+					list_add(&entry->lru,
+						 &gswap_lru_list);
+				spin_unlock(&gswap_lru_lock);
+			}
+			xa_unlock(tree);
+
+			if (++nr_failures >= 4) {
+				cond_resched();
+				nr_writeback++;
+				spin_lock(&gswap_lru_lock);
+				break;
+			}
+		}
 		nr_writeback++;
 
 		cond_resched();
 		spin_lock(&gswap_lru_lock);
 	}
 	spin_unlock(&gswap_lru_lock);
+
+	memalloc_noio_restore(noio_flag);
 }
 
 /*
@@ -747,6 +868,7 @@ bool gswap_store(struct folio *folio)
 	long nr_pages = folio_nr_pages(folio);
 	swp_entry_t swp = folio->swap;
 	long index;
+	int limit;
 
 	VM_WARN_ON_ONCE(!folio_test_locked(folio));
 	VM_WARN_ON_ONCE(!folio_test_swapcache(folio));
@@ -765,7 +887,8 @@ bool gswap_store(struct folio *folio)
 		goto check_old;
 	}
 
-	if (gswap_check_limits()) {
+	limit = gswap_check_limits();
+	if (limit == 2) {
 		percpu_ref_put(&gswap_active_ref);
 		goto check_old;
 	}
@@ -778,6 +901,10 @@ bool gswap_store(struct folio *folio)
 			goto check_old;
 		}
 	}
+
+	/* Above high watermark -- start draining to make room */
+	if (limit == 1 && gswap_writeback_wq)
+		mod_delayed_work(gswap_writeback_wq, &gswap_writeback_work, 0);
 
 	percpu_ref_put(&gswap_active_ref);
 	return true;
@@ -801,7 +928,7 @@ check_old:
 		}
 	}
 
-	if (gswap_pool_reached_full && gswap_writeback_wq)
+	if (READ_ONCE(gswap_pool_reached_full) && gswap_writeback_wq)
 		mod_delayed_work(gswap_writeback_wq, &gswap_writeback_work, 0);
 
 	return false;
@@ -1182,9 +1309,10 @@ static void gswap_pool_destroy(void)
 #ifdef CONFIG_DRM
 	if (gswap_drm_nr_bufs) {
 		for (i = 0; i < gswap_drm_nr_bufs; i++) {
-			drm_client_buffer_vunmap(gswap_drm_bufs[i]);
-			drm_client_buffer_delete(gswap_drm_bufs[i]);
-			gswap_drm_bufs[i] = NULL;
+			drm_gem_vunmap(gswap_drm_gems[i],
+				       &gswap_pool.maps[i]);
+			drm_gem_object_put(gswap_drm_gems[i]);
+			gswap_drm_gems[i] = NULL;
 		}
 		gswap_drm_nr_bufs = 0;
 		drm_client_release(&gswap_drm_client);
@@ -1310,9 +1438,9 @@ static void gswap_debugfs_exit(void);
 #ifdef CONFIG_DRM
 
 /* Dumb buffer dimensions for VRAM allocation */
-#define GSWAP_DRM_FB_WIDTH	4096
-#define GSWAP_DRM_FB_BPP	4	/* bytes per pixel, XRGB8888 */
-#define GSWAP_DRM_STRIDE	(GSWAP_DRM_FB_WIDTH * GSWAP_DRM_FB_BPP)
+#define GSWAP_DRM_WIDTH		4096
+#define GSWAP_DRM_BPP		8	/* bits per pixel */
+#define GSWAP_DRM_STRIDE	(GSWAP_DRM_WIDTH * (GSWAP_DRM_BPP / 8))
 
 /*
  * Maximum size per dumb buffer.  drm_mode_create_dumb() checks
@@ -1402,7 +1530,7 @@ static struct drm_device *gswap_find_drm_for_pci(struct pci_dev *pdev)
 static int gswap_drm_alloc_vram(struct pci_dev *pdev)
 {
 	struct drm_device *drm;
-	struct drm_client_buffer *bufs[GSWAP_MAX_BUFFERS];
+	struct drm_gem_object *gems[GSWAP_MAX_BUFFERS];
 	struct iosys_map maps[GSWAP_MAX_BUFFERS];
 	unsigned long bar_size, alloc_size, buf_size, remaining;
 	unsigned int nr_bufs = 0;
@@ -1458,7 +1586,8 @@ static int gswap_drm_alloc_vram(struct pci_dev *pdev)
 
 	remaining = alloc_size;
 	while (remaining && nr_bufs < GSWAP_MAX_BUFFERS) {
-		struct drm_client_buffer *buf;
+		struct drm_mode_create_dumb dumb_args = {};
+		struct drm_gem_object *obj;
 		unsigned long chunk = min(remaining, buf_size);
 		u32 height;
 
@@ -1467,30 +1596,42 @@ static int gswap_drm_alloc_vram(struct pci_dev *pdev)
 			break;
 		chunk = (unsigned long)height * GSWAP_DRM_STRIDE;
 
-		buf = drm_client_buffer_create_dumb(&gswap_drm_client,
-						    GSWAP_DRM_FB_WIDTH,
-						    height,
-						    DRM_FORMAT_XRGB8888);
-		if (IS_ERR(buf)) {
-			pr_err("DRM dumb buffer %u creation failed: %pe\n",
-			       nr_bufs, buf);
-			if (!nr_bufs) {
-				ret = PTR_ERR(buf);
-				goto fail_client;
-			}
-			break;
-		}
-
-		ret = drm_client_buffer_vmap(buf, &maps[nr_bufs]);
+		dumb_args.width = GSWAP_DRM_WIDTH;
+		dumb_args.height = height;
+		dumb_args.bpp = GSWAP_DRM_BPP;
+		ret = drm_mode_create_dumb(drm, &dumb_args,
+					   gswap_drm_client.file);
 		if (ret) {
-			pr_err("DRM buffer %u vmap failed: %d\n", nr_bufs, ret);
-			drm_client_buffer_delete(buf);
+			pr_err("DRM dumb buffer %u creation failed: %d\n",
+			       nr_bufs, ret);
 			if (!nr_bufs)
 				goto fail_client;
 			break;
 		}
 
-		bufs[nr_bufs] = buf;
+		obj = drm_gem_object_lookup(gswap_drm_client.file,
+					    dumb_args.handle);
+		drm_mode_destroy_dumb(drm, dumb_args.handle,
+				      gswap_drm_client.file);
+		if (!obj) {
+			pr_err("DRM buffer %u GEM lookup failed\n", nr_bufs);
+			if (!nr_bufs) {
+				ret = -ENOENT;
+				goto fail_client;
+			}
+			break;
+		}
+
+		ret = drm_gem_vmap(obj, &maps[nr_bufs]);
+		if (ret) {
+			pr_err("DRM buffer %u vmap failed: %d\n", nr_bufs, ret);
+			drm_gem_object_put(obj);
+			if (!nr_bufs)
+				goto fail_client;
+			break;
+		}
+
+		gems[nr_bufs] = obj;
 		nr_bufs++;
 		remaining -= chunk;
 	}
@@ -1498,14 +1639,14 @@ static int gswap_drm_alloc_vram(struct pci_dev *pdev)
 	alloc_size -= remaining;
 
 	if (nr_bufs == 1) {
-		gswap_drm_bufs[0] = bufs[0];
+		gswap_drm_gems[0] = gems[0];
 		gswap_drm_nr_bufs = 1;
 		ret = gswap_pool_init(&maps[0], alloc_size, alloc_size);
 	} else {
 		unsigned int i;
 
 		for (i = 0; i < nr_bufs; i++)
-			gswap_drm_bufs[i] = bufs[i];
+			gswap_drm_gems[i] = gems[i];
 		gswap_drm_nr_bufs = nr_bufs;
 		ret = gswap_pool_init_multi(maps, nr_bufs, buf_size,
 					    alloc_size, alloc_size);
@@ -1531,8 +1672,8 @@ static int gswap_drm_alloc_vram(struct pci_dev *pdev)
 
 fail_bufs:
 	while (nr_bufs--) {
-		drm_client_buffer_vunmap(bufs[nr_bufs]);
-		drm_client_buffer_delete(bufs[nr_bufs]);
+		drm_gem_vunmap(gems[nr_bufs], &maps[nr_bufs]);
+		drm_gem_object_put(gems[nr_bufs]);
 	}
 	gswap_drm_nr_bufs = 0;
 fail_client:
@@ -1548,12 +1689,48 @@ static void gswap_drm_setup_work_fn(struct work_struct *work)
 {
 	int ret;
 
-	if (!gswap_gpu_pdev || gswap_has_pool)
+	if (!gswap_gpu_pdev)
 		return;
 
-	ret = gswap_drm_alloc_vram(gswap_gpu_pdev);
-	if (ret)
+	/* Already DRM-backed -- nothing to do */
+	if (gswap_has_pool && gswap_drm_nr_bufs)
 		return;
+
+	/*
+	 * Transition from direct BAR to DRM: stop stores, drain all
+	 * pages to disk, destroy the old pool, then allocate via DRM.
+	 */
+	if (gswap_has_pool) {
+		pr_info("transitioning VRAM pool from direct BAR to DRM\n");
+		gswap_has_pool = false;
+
+		percpu_ref_kill(&gswap_active_ref);
+		wait_for_completion(&gswap_active_ref_done);
+
+		gswap_drain_pool();
+		if (gswap_writeback_wq)
+			cancel_delayed_work_sync(&gswap_writeback_work);
+		gswap_pool_destroy();
+
+		/* Reinitialize percpu_ref for the new pool */
+		percpu_ref_exit(&gswap_active_ref);
+		init_completion(&gswap_active_ref_done);
+		ret = percpu_ref_init(&gswap_active_ref,
+				      gswap_active_ref_release,
+				      0, GFP_KERNEL);
+		if (ret) {
+			pr_err("percpu_ref reinit failed: %d, gswap disabled\n",
+			       ret);
+			return;
+		}
+	}
+
+	ret = gswap_drm_alloc_vram(gswap_gpu_pdev);
+	if (ret) {
+		pr_err("DRM VRAM allocation failed: %d, gswap disabled\n",
+		       ret);
+		return;
+	}
 
 	gswap_has_pool = true;
 
@@ -1587,7 +1764,8 @@ static int gswap_pci_notifier_fn(struct notifier_block *nb,
 	if (!gswap_device_matches(pdev))
 		return NOTIFY_DONE;
 
-	if (gswap_has_pool)
+	/* Already DRM-backed -- nothing to do */
+	if (gswap_has_pool && gswap_drm_nr_bufs)
 		return NOTIFY_DONE;
 
 	gswap_gpu_pdev = pdev;

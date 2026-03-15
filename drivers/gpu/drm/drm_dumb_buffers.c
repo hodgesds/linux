@@ -226,6 +226,7 @@ int drm_mode_create_dumb(struct drm_device *dev,
 
 	return dev->driver->dumb_create(file_priv, dev, args);
 }
+EXPORT_SYMBOL(drm_mode_create_dumb);
 
 int drm_mode_create_dumb_ioctl(struct drm_device *dev,
 			       void *data, struct drm_file *file_priv)
@@ -290,6 +291,7 @@ int drm_mode_destroy_dumb(struct drm_device *dev, u32 handle,
 
 	return drm_gem_handle_delete(file_priv, handle);
 }
+EXPORT_SYMBOL(drm_mode_destroy_dumb);
 
 int drm_mode_destroy_dumb_ioctl(struct drm_device *dev,
 				void *data, struct drm_file *file_priv)
