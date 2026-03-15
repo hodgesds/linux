@@ -56,6 +56,7 @@
 #include <drm/drm_dumb_buffers.h>
 #include <drm/drm_file.h>
 #include <drm/drm_gem.h>
+#include <drm/drm_cache.h>
 #endif
 #include <linux/rcupdate.h>
 #include <linux/pagemap.h>
@@ -72,6 +73,9 @@
 /* Slot size for VRAM allocator -- lz4 compresses most pages to <2KB */
 #define GSWAP_SLOT_SIZE		2048
 
+/* Maximum readahead window (compile-time buffer size) */
+#define GSWAP_RA_SIZE		32
+
 /* Default compressor */
 #define GSWAP_COMPRESSOR_DEFAULT "lz4"
 
@@ -86,6 +90,11 @@ MODULE_PARM_DESC(enabled, "Enable/disable gswap");
 static char *gswap_compressor = GSWAP_COMPRESSOR_DEFAULT;
 module_param_named(compressor, gswap_compressor, charp, 0444);
 MODULE_PARM_DESC(compressor, "Compression algorithm");
+
+/* Readahead window: 0 disables, max GSWAP_RA_SIZE */
+static unsigned int gswap_ra_size = GSWAP_RA_SIZE;
+module_param_named(ra_size, gswap_ra_size, uint, 0644);
+MODULE_PARM_DESC(ra_size, "VRAM readahead window (0 to disable, max 32)");
 
 /* Maximum percentage of VRAM to use */
 static unsigned int gswap_max_pool_percent = 50;
@@ -121,10 +130,31 @@ static atomic_long_t gswap_reject_kmemcache_fail = ATOMIC_LONG_INIT(0);
 static atomic_long_t gswap_decompress_fail = ATOMIC_LONG_INIT(0);
 static atomic_long_t gswap_written_back_pages = ATOMIC_LONG_INIT(0);
 static atomic_long_t gswap_pool_limit_hit = ATOMIC_LONG_INIT(0);
+static atomic_long_t gswap_ra_hits = ATOMIC_LONG_INIT(0);
+static atomic_long_t gswap_ra_misses = ATOMIC_LONG_INIT(0);
+static atomic_long_t gswap_ra_skips = ATOMIC_LONG_INIT(0);
 
 /*********************************
 * data structures
 **********************************/
+
+struct gswap_ra_entry {
+	pgoff_t			offset;
+	int			swp_type;
+	struct gswap_entry	*gentry;	/* xarray pointer at fill time */
+	u32			length;
+	u32			buf_offset;
+};
+
+struct gswap_ra_cache {
+	struct gswap_ra_entry	entries[GSWAP_RA_SIZE];
+	u8			*buf;		/* GSWAP_RA_SIZE * GSWAP_SLOT_SIZE */
+	int			count;
+	pgoff_t			last_offset;	/* last loaded offset (sequentiality) */
+	unsigned int		window;		/* adaptive window size */
+	unsigned int		hits;		/* rolling hit count */
+	unsigned int		accesses;	/* rolling access count */
+};
 
 struct gswap_crypto_ctx {
 	struct crypto_acomp *acomp;
@@ -132,6 +162,7 @@ struct gswap_crypto_ctx {
 	struct crypto_wait wait;
 	u8 *buffer;
 	struct mutex mutex;
+	struct gswap_ra_cache ra;
 };
 
 /*
@@ -363,7 +394,23 @@ static void gswap_read_from_vram(unsigned long slot_index,
 	unsigned long offset;
 
 	gswap_slot_location(slot_index, &buf_idx, &offset);
+
+#ifdef CONFIG_DRM
+	{
+		struct iosys_map src, dst_map = IOSYS_MAP_INIT_VADDR(dst);
+
+		src = gswap_pool.maps[buf_idx];
+		iosys_map_incr(&src, offset);
+		/*
+		 * Round up to 16 bytes for MOVNTDQA fast path in
+		 * drm_memcpy_from_wc.  Callers' buffers are always
+		 * large enough for the padding.
+		 */
+		drm_memcpy_from_wc(&dst_map, &src, ALIGN(len, 16));
+	}
+#else
 	iosys_map_memcpy_from(dst, &gswap_pool.maps[buf_idx], offset, len);
+#endif
 }
 
 /*********************************
@@ -399,6 +446,23 @@ static int gswap_cpu_comp_prepare(unsigned int cpu)
 		return -ENOMEM;
 	}
 
+	if (!ctx->ra.buf) {
+		ctx->ra.buf = kmalloc_node(GSWAP_RA_SIZE * GSWAP_SLOT_SIZE,
+					   GFP_KERNEL, cpu_to_node(cpu));
+		if (!ctx->ra.buf) {
+			acomp_request_free(req);
+			crypto_free_acomp(acomp);
+			kfree(buffer);
+			return -ENOMEM;
+		}
+		ctx->ra.count = 0;
+		ctx->ra.last_offset = (pgoff_t)-1;
+		ctx->ra.window = min_t(unsigned int,
+				       gswap_ra_size, GSWAP_RA_SIZE);
+		ctx->ra.hits = 0;
+		ctx->ra.accesses = 0;
+	}
+
 	mutex_lock(&ctx->mutex);
 	crypto_init_wait(&ctx->wait);
 	acomp_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
@@ -432,6 +496,10 @@ static int gswap_cpu_comp_destroy(unsigned int cpu)
 	if (acomp)
 		crypto_free_acomp(acomp);
 	kfree(buffer);
+	kfree(ctx->ra.buf);
+	ctx->ra.buf = NULL;
+	ctx->ra.count = 0;
+	ctx->ra.window = 0;
 	return 0;
 }
 
@@ -954,11 +1022,122 @@ check_old:
 	return false;
 }
 
+/*********************************
+* readahead cache
+**********************************/
+
+/**
+ * gswap_ra_fill() - prefetch compressed data for upcoming offsets
+ * @ra: per-CPU readahead cache
+ * @type: swap type
+ * @offset: current page offset (fills offset+1 .. offset+window)
+ *
+ * Reads compressed data from VRAM for the next several swap offsets
+ * into the readahead buffer. Only entries present in the xarray are
+ * cached; gaps are skipped.
+ */
+static void gswap_ra_fill(struct gswap_ra_cache *ra, int type, pgoff_t offset)
+{
+	unsigned int window = min_t(unsigned int, ra->window, GSWAP_RA_SIZE);
+	unsigned int i;
+	u32 buf_off = 0;
+
+	ra->count = 0;
+
+	if (!window)
+		return;
+
+	for (i = 0; i < window; i++) {
+		pgoff_t ra_offset = offset + 1 + i;
+		unsigned int tree_idx = ra_offset >> GSWAP_ADDRESS_SPACE_SHIFT;
+		struct xarray *tree;
+		struct gswap_entry *gentry;
+		u32 slot_index, length;
+
+		if (tree_idx >= nr_gswap_trees[type])
+			break;
+
+		tree = &gswap_trees[type][tree_idx];
+
+		/*
+		 * Hold xa_lock while reading entry fields to prevent
+		 * concurrent gswap_invalidate/writeback from freeing
+		 * the entry between xa_load and field access.
+		 */
+		xa_lock(tree);
+		gentry = xa_load(tree, ra_offset);
+		if (!gentry) {
+			xa_unlock(tree);
+			continue;
+		}
+		slot_index = gentry->slot_index;
+		length = gentry->length;
+		xa_unlock(tree);
+
+		if (buf_off + ALIGN(length, 16) > GSWAP_RA_SIZE * GSWAP_SLOT_SIZE)
+			break;
+
+		gswap_read_from_vram(slot_index,
+				     ra->buf + buf_off, length);
+
+		ra->entries[ra->count].offset = ra_offset;
+		ra->entries[ra->count].swp_type = type;
+		ra->entries[ra->count].gentry = gentry;
+		ra->entries[ra->count].length = length;
+		ra->entries[ra->count].buf_offset = buf_off;
+
+		buf_off += length;
+		ra->count++;
+	}
+}
+
+/**
+ * gswap_ra_lookup() - check if a page's compressed data is in the RA cache
+ * @ra: per-CPU readahead cache
+ * @type: swap type
+ * @offset: swap offset to look up
+ * @dst: destination buffer for compressed data
+ * @lenp: output — compressed data length
+ *
+ * Validates the cached pointer against the current xarray state to
+ * handle races with writeback.
+ *
+ * Return: true if cache hit (data copied to dst), false on miss.
+ */
+static bool gswap_ra_lookup(struct gswap_ra_cache *ra, int type,
+			     pgoff_t offset, void *dst, u32 *lenp)
+{
+	int i;
+
+	for (i = 0; i < ra->count; i++) {
+		struct gswap_ra_entry *rae = &ra->entries[i];
+		struct xarray *tree;
+
+		if (rae->swp_type != type || rae->offset != offset)
+			continue;
+
+		/* Validate: entry must still be in xarray (writeback race) */
+		tree = &gswap_trees[type][offset >> GSWAP_ADDRESS_SPACE_SHIFT];
+		if (xa_load(tree, offset) != rae->gentry)
+			return false;
+
+		memcpy(dst, ra->buf + rae->buf_offset, rae->length);
+		*lenp = rae->length;
+		return true;
+	}
+
+	return false;
+}
+
 /**
  * gswap_load_page() - decompress a single page from VRAM into the folio
  * @folio: target folio
  * @page_index: page index within the folio
  * @entry: gswap entry containing VRAM location and compressed length
+ *
+ * Uses the per-CPU readahead cache to avoid redundant VRAM reads for
+ * sequential access patterns. On a cache miss, reads from VRAM and
+ * prefetches the next several entries.
  *
  * Return: 0 on success, -EIO on decompression failure.
  */
@@ -969,15 +1148,63 @@ static int gswap_load_page(struct folio *folio, long page_index,
 	struct scatterlist input, output;
 	int ret;
 	unsigned int dlen;
+	u32 cached_len;
+	int type = swp_type(entry->swpentry);
+	pgoff_t offset = swp_offset(entry->swpentry);
 
 	ctx = gswap_comp_ctx_get();
-	gswap_read_from_vram(entry->slot_index, ctx->buffer, entry->length);
 
-	sg_init_one(&input, ctx->buffer, entry->length);
+	if (gswap_ra_size &&
+	    gswap_ra_lookup(&ctx->ra, type, offset, ctx->buffer, &cached_len)) {
+		atomic_long_inc(&gswap_ra_hits);
+		ctx->ra.hits++;
+	} else {
+		atomic_long_inc(&gswap_ra_misses);
+		gswap_read_from_vram(entry->slot_index, ctx->buffer,
+				     entry->length);
+		cached_len = entry->length;
+
+		/*
+		 * Only fill readahead when the access looks sequential --
+		 * random loads would waste PCIe bandwidth reading entries
+		 * that are never consumed.
+		 */
+		if (gswap_ra_size &&
+		    offset == ctx->ra.last_offset + 1)
+			gswap_ra_fill(&ctx->ra, type, offset);
+		else if (gswap_ra_size)
+			atomic_long_inc(&gswap_ra_skips);
+	}
+
+	ctx->ra.last_offset = offset;
+
+	/*
+	 * Adaptive window: every 64 accesses, adjust the window based
+	 * on hit rate.  Shrink toward 1 when hits are rare, grow back
+	 * toward gswap_ra_size when readahead is effective.
+	 */
+	if (gswap_ra_size && ++ctx->ra.accesses >= 64) {
+		unsigned int max_win = min_t(unsigned int,
+					     gswap_ra_size, GSWAP_RA_SIZE);
+
+		if (ctx->ra.hits >= 48)
+			ctx->ra.window = max_win;
+		else if (ctx->ra.hits >= 32)
+			ctx->ra.window = max(max_win / 2, 1U);
+		else if (ctx->ra.hits >= 16)
+			ctx->ra.window = max(max_win / 4, 1U);
+		else
+			ctx->ra.window = 1;
+
+		ctx->ra.hits = 0;
+		ctx->ra.accesses = 0;
+	}
+
+	sg_init_one(&input, ctx->buffer, cached_len);
 	sg_init_table(&output, 1);
 	sg_set_page(&output, folio_page(folio, page_index), PAGE_SIZE, 0);
 	acomp_request_set_params(ctx->req, &input, &output,
-				 entry->length, PAGE_SIZE);
+				 cached_len, PAGE_SIZE);
 
 	ret = crypto_wait_req(crypto_acomp_decompress(ctx->req), &ctx->wait);
 	dlen = ctx->req->dlen;
@@ -987,8 +1214,8 @@ static int gswap_load_page(struct folio *folio, long page_index,
 		atomic_long_inc(&gswap_decompress_fail);
 		pr_alert_ratelimited(
 			"Decompression error from gswap (%d:%lu %s %u->%u)\n",
-			swp_type(entry->swpentry), swp_offset(entry->swpentry),
-			gswap_compressor, entry->length, dlen);
+			type, offset,
+			gswap_compressor, cached_len, dlen);
 		return -EIO;
 	}
 
@@ -1845,6 +2072,9 @@ GSWAP_DEBUGFS_COUNTER(reject_kmemcache_fail);
 GSWAP_DEBUGFS_COUNTER(decompress_fail);
 GSWAP_DEBUGFS_COUNTER(pool_limit_hit);
 GSWAP_DEBUGFS_COUNTER(written_back_pages);
+GSWAP_DEBUGFS_COUNTER(ra_hits);
+GSWAP_DEBUGFS_COUNTER(ra_misses);
+GSWAP_DEBUGFS_COUNTER(ra_skips);
 
 static int gswap_debugfs_init(void)
 {
@@ -1884,6 +2114,15 @@ static int gswap_debugfs_init(void)
 	debugfs_create_file("written_back_pages", 0444,
 			    gswap_debugfs_root, NULL,
 			    &gswap_written_back_pages_fops);
+	debugfs_create_file("ra_hits", 0444,
+			    gswap_debugfs_root, NULL,
+			    &gswap_ra_hits_fops);
+	debugfs_create_file("ra_misses", 0444,
+			    gswap_debugfs_root, NULL,
+			    &gswap_ra_misses_fops);
+	debugfs_create_file("ra_skips", 0444,
+			    gswap_debugfs_root, NULL,
+			    &gswap_ra_skips_fops);
 
 	return 0;
 }
