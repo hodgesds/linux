@@ -756,6 +756,325 @@ static void gswap_entry_free(struct gswap_entry *entry)
 
 /*********************************
 
+* writeback (VRAM -> disk swap)
+**********************************/
+
+/*
+ * gswap_writeback_entry() - write a single entry back to the swap device.
+ *
+ * Decompresses the data from VRAM, allocates a swap cache folio, and
+ * writes it to the swap device so the data is preserved when we free
+ * the VRAM slot. Follows the same pattern as zswap_writeback_entry().
+ *
+ * Returns 0 on success, negative error on failure.
+ */
+static int gswap_writeback_entry(struct gswap_entry *entry,
+				 swp_entry_t swpentry)
+{
+	pgoff_t offset = swp_offset(swpentry);
+	struct xarray *tree;
+	struct gswap_crypto_ctx *ctx;
+	struct scatterlist input, output;
+	struct folio *folio;
+	struct mempolicy *mpol;
+	struct swap_info_struct *si;
+	bool folio_was_allocated;
+	int ret;
+	unsigned int dlen;
+
+	/*
+	 * Allocate a swap cache folio. This either finds an existing
+	 * folio (race with swapin) or creates a new one in the cache.
+	 */
+	si = get_swap_device(swpentry);
+	if (!si)
+		return -EAGAIN;
+
+	mpol = get_task_policy(current);
+	folio = swap_cache_alloc_folio(swpentry, GFP_KERNEL, mpol,
+				       NO_INTERLEAVE_INDEX,
+				       &folio_was_allocated);
+	put_swap_device(si);
+	if (!folio)
+		return -EAGAIN;
+
+	/*
+	 * Folio already in swap cache -- it still contains the original
+	 * page data that gswap_store() compressed.  Use it directly
+	 * instead of allocating a new folio.  This avoids the livelock
+	 * where writeback keeps failing with -EAGAIN because the
+	 * original folio sits in the swap cache, and no VRAM slots are
+	 * ever freed.
+	 *
+	 * folio_trylock avoids blocking against concurrent swapin which
+	 * will handle the entry itself via gswap_load().
+	 */
+	if (!folio_was_allocated) {
+		if (!folio_trylock(folio)) {
+			folio_put(folio);
+			return -EAGAIN;
+		}
+
+		/*
+		 * Verify the folio is still in the swap cache -- it may
+		 * have been reclaimed between swap_cache_get_folio and
+		 * our trylock, invalidating the swap entry.
+		 */
+		if (!folio_test_swapcache(folio)) {
+			folio_unlock(folio);
+			folio_put(folio);
+			return -EAGAIN;
+		}
+
+		/*
+		 * Claim the gswap entry.  If a concurrent load/invalidate
+		 * already erased it, the folio is being handled elsewhere.
+		 */
+		tree = swap_gswap_tree(swpentry);
+		if (xa_cmpxchg(tree, offset, entry, NULL, GFP_KERNEL) != entry) {
+			folio_unlock(folio);
+			folio_put(folio);
+			return -ENOMEM;
+		}
+
+		gswap_entry_free(entry);
+
+		/* Folio already has correct data -- write it to disk */
+		folio_mark_uptodate(folio);
+		folio_set_reclaim(folio);
+		__swap_writepage(folio, NULL);
+		folio_put(folio);
+		return 0;
+	}
+
+	/*
+	 * Folio is locked and in the swap cache. Atomically claim the
+	 * entry from the xarray using xa_cmpxchg. If the entry was
+	 * already erased by a concurrent swapcache gswap_load() or
+	 * gswap_invalidate(), the cmpxchg fails and we bail out.
+	 *
+	 * Only dereference entry after this check -- before this point,
+	 * a concurrent load may have freed it. We use the stack copy
+	 * of swpentry (passed by the caller) for all operations above.
+	 */
+	tree = swap_gswap_tree(swpentry);
+	if (xa_cmpxchg(tree, offset, entry, NULL, GFP_KERNEL) != entry) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	/* Entry is now exclusively ours -- decompress from VRAM */
+	ctx = gswap_comp_ctx_get();
+	gswap_read_from_vram(entry->vram_offset, ctx->buffer, entry->length);
+
+	sg_init_one(&input, ctx->buffer, entry->length);
+	sg_init_table(&output, 1);
+	sg_set_folio(&output, folio, PAGE_SIZE, 0);
+	acomp_request_set_params(ctx->req, &input, &output,
+				 entry->length, PAGE_SIZE);
+
+	ret = crypto_wait_req(crypto_acomp_decompress(ctx->req), &ctx->wait);
+	dlen = ctx->req->dlen;
+	gswap_comp_ctx_put(ctx);
+
+	if (ret || dlen != PAGE_SIZE) {
+		ret = -EIO;
+		gswap_entry_free(entry);
+		goto out;
+	}
+
+	gswap_entry_free(entry);
+
+	folio_mark_uptodate(folio);
+	folio_set_reclaim(folio);
+
+	/* Write the decompressed page to the swap device */
+	__swap_writepage(folio, NULL);
+
+out:
+	if (ret) {
+		swap_cache_del_folio(folio);
+		folio_unlock(folio);
+	}
+	folio_put(folio);
+	return ret;
+}
+
+/* Backoff delay when writeback fails repeatedly (100ms) */
+#define GSWAP_WRITEBACK_RETRY_DELAY	(HZ / 10)
+
+static void gswap_writeback_worker(struct work_struct *work)
+{
+	struct gswap_entry *entry;
+	struct xarray *tree;
+	swp_entry_t swpentry;
+	unsigned long nr_writeback = 0;
+	unsigned long nr_failures = 0;
+	unsigned long max_writeback = atomic_long_read(&gswap_pool.used_bytes) /
+				     (4 * PAGE_SIZE);
+	unsigned int nofs_flag;
+	int ret;
+
+	if (max_writeback < 16)
+		max_writeback = 16;
+
+	/*
+	 * Prevent filesystem recursion: allocations inside (e.g.
+	 * swap_cache_alloc_folio, xa_cmpxchg) can trigger direct
+	 * reclaim, which can re-enter the swap path.  Stripping
+	 * __GFP_FS prevents filesystem-level recursion.
+	 *
+	 * We allow __GFP_IO so reclaim can write dirty pages and
+	 * swap pages to disk -- without this, folio allocation fails
+	 * under memory pressure because reclaim has nothing clean to
+	 * free, and VRAM never drains.  The recursive swap-out path
+	 * is safe: gswap_store() rejects at the pool limit check and
+	 * falls through to __swap_writepage(), and no gswap locks are
+	 * held across that allocation.
+	 */
+	nofs_flag = memalloc_nofs_save();
+
+	spin_lock(&gswap_lru_lock);
+	while (!list_empty(&gswap_lru_list) && nr_writeback < max_writeback) {
+		entry = list_last_entry(&gswap_lru_list,
+					struct gswap_entry, lru);
+		list_del_init(&entry->lru);
+
+		/*
+		 * Copy swpentry to the stack while under the LRU lock.
+		 * Once we drop the lock, a concurrent gswap_load() can
+		 * erase and free the entry at any time. We pass the
+		 * stack copy to gswap_writeback_entry() so it can
+		 * operate without dereferencing entry until the
+		 * xa_cmpxchg validates the pointer.
+		 */
+		swpentry = entry->swpentry;
+		spin_unlock(&gswap_lru_lock);
+
+		ret = gswap_writeback_entry(entry, swpentry);
+
+		if (ret == 0) {
+			atomic_long_inc(&gswap_written_back_pages);
+			nr_failures = 0;
+		} else if (ret == -EAGAIN) {
+			/*
+			 * Writeback failed before xa_cmpxchg could claim
+			 * the entry (folio alloc failure, swap device
+			 * gone, or swapin race).  The entry may still be
+			 * in the xarray consuming a VRAM slot.
+			 *
+			 * We cannot safely dereference entry here -- a
+			 * concurrent gswap_load() may have freed it.
+			 * Hold the xa_lock to prevent concurrent xa_erase
+			 * while we validate and re-add to the LRU.
+			 */
+			tree = swap_gswap_tree(swpentry);
+			xa_lock(tree);
+			if (xa_load(tree, swp_offset(swpentry)) == entry) {
+				spin_lock(&gswap_lru_lock);
+				if (list_empty(&entry->lru))
+					list_add(&entry->lru,
+						 &gswap_lru_list);
+				spin_unlock(&gswap_lru_lock);
+			}
+			xa_unlock(tree);
+
+			if (++nr_failures >= 4) {
+				cond_resched();
+				nr_writeback++;
+				spin_lock(&gswap_lru_lock);
+				break;
+			}
+		}
+		nr_writeback++;
+
+		cond_resched();
+		spin_lock(&gswap_lru_lock);
+	}
+	spin_unlock(&gswap_lru_lock);
+
+	memalloc_nofs_restore(nofs_flag);
+
+	/*
+	 * If we bailed out due to consecutive failures but there are
+	 * still entries to write back, reschedule with a delay to
+	 * avoid busy-looping when folio allocation is persistently
+	 * failing.  Without this, the worker never re-runs and VRAM
+	 * never drains under sustained memory pressure.
+	 */
+	if (nr_failures >= 4 && !list_empty_careful(&gswap_lru_list))
+		queue_delayed_work(gswap_writeback_wq,
+				   &gswap_writeback_work,
+				   GSWAP_WRITEBACK_RETRY_DELAY);
+}
+
+/*
+ * gswap_drain_pool() - write back all stored pages to disk.
+ *
+ * Called during teardown (DRM unregister or module exit) to ensure no
+ * pages are lost when the VRAM pool is released. New store operations
+ * must already be prevented (gswap_has_pool = false, percpu_ref killed)
+ * before calling this.
+ */
+static void gswap_drain_pool(void)
+{
+	struct gswap_entry *entry;
+	swp_entry_t swpentry;
+	unsigned long nr_drained = 0;
+	unsigned long nr_orphaned = 0;
+	int type;
+
+	spin_lock(&gswap_lru_lock);
+	while (!list_empty(&gswap_lru_list)) {
+		entry = list_last_entry(&gswap_lru_list,
+					struct gswap_entry, lru);
+		list_del_init(&entry->lru);
+
+		swpentry = entry->swpentry;
+		spin_unlock(&gswap_lru_lock);
+
+		gswap_writeback_entry(entry, swpentry);
+		nr_drained++;
+
+		cond_resched();
+		spin_lock(&gswap_lru_lock);
+	}
+	spin_unlock(&gswap_lru_lock);
+
+	/*
+	 * Sweep xarrays for orphaned entries.  The writeback worker
+	 * removes entries from the LRU before attempting writeback;
+	 * if writeback fails (e.g. memory pressure), the entry stays
+	 * in the xarray but is no longer on the LRU.  Free them here
+	 * to prevent a use-after-free in gswap_free_vram()
+	 * after gswap_pool_destroy() releases the buddy bitmaps.
+	 */
+	for (type = 0; type < MAX_SWAPFILES; type++) {
+		struct xarray *trees = gswap_trees[type];
+		unsigned int nr, i;
+		unsigned long idx;
+
+		if (!trees)
+			continue;
+
+		nr = nr_gswap_trees[type];
+		for (i = 0; i < nr; i++) {
+			xa_for_each(&trees[i], idx, entry) {
+				entry = xa_erase(&trees[i], idx);
+				if (entry) {
+					gswap_entry_free(entry);
+					nr_orphaned++;
+				}
+			}
+		}
+	}
+
+	if (nr_drained || nr_orphaned)
+		pr_info("drained %lu pages, freed %lu orphaned entries\n",
+			nr_drained, nr_orphaned);
+}
+
+/*********************************
 /*********************************
 * main API (stubs, wired up by subsequent patches)
 **********************************/
