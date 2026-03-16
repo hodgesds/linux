@@ -25,6 +25,7 @@
 #include <linux/sched/task.h>
 #include <linux/delayacct.h>
 #include <linux/zswap.h>
+#include <linux/gswap.h>
 #include "swap.h"
 
 static void __end_swap_bio_write(struct bio *bio)
@@ -276,6 +277,8 @@ int swap_writeout(struct folio *folio, struct swap_iocb **swap_plug)
 		count_mthp_stat(folio_order(folio), MTHP_STAT_ZSWPOUT);
 		goto out_unlock;
 	}
+	if (gswap_store(folio))
+		goto out_unlock;
 	if (!mem_cgroup_zswap_writeback_enabled(folio_memcg(folio))) {
 		folio_mark_dirty(folio);
 		return AOP_WRITEPAGE_ACTIVATE;
@@ -635,6 +638,9 @@ void swap_read_folio(struct folio *folio, struct swap_iocb **plug)
 	}
 
 	if (zswap_load(folio) != -ENOENT)
+		goto finish;
+
+	if (gswap_load(folio) != -ENOENT)
 		goto finish;
 
 	/* We have to read from slower devices. Increase zswap protection. */

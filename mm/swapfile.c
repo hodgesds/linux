@@ -41,6 +41,7 @@
 #include <linux/completion.h>
 #include <linux/suspend.h>
 #include <linux/zswap.h>
+#include <linux/gswap.h>
 #include <linux/plist.h>
 
 #include <asm/tlbflush.h>
@@ -343,6 +344,18 @@ sector_t swap_folio_sector(struct folio *folio)
 	se = offset_to_swap_extent(sis, offset);
 	sector = se->start_block + (offset - se->start_page);
 	return sector << (PAGE_SHIFT - 9);
+}
+
+sector_t swap_entry_sector(swp_entry_t entry)
+{
+	struct swap_info_struct *sis = __swap_entry_to_info(entry);
+	struct swap_extent *se;
+	pgoff_t offset;
+
+	offset = swp_offset(entry);
+	se = offset_to_swap_extent(sis, offset);
+	return (se->start_block + (offset - se->start_page))
+		<< (PAGE_SHIFT - 9);
 }
 
 /*
@@ -1271,6 +1284,7 @@ static void swap_range_free(struct swap_info_struct *si, unsigned long offset,
 	for (i = 0; i < nr_entries; i++) {
 		clear_bit(offset + i, si->zeromap);
 		zswap_invalidate(swp_entry(si->type, offset + i));
+		gswap_invalidate(swp_entry(si->type, offset + i));
 	}
 
 	if (si->flags & SWP_BLKDEV)
@@ -2872,6 +2886,7 @@ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
 	spin_unlock(&swap_lock);
 	arch_swap_invalidate_area(p->type);
 	zswap_swapoff(p->type);
+	gswap_swapoff(p->type);
 	mutex_unlock(&swapon_mutex);
 	kfree(p->global_cluster);
 	p->global_cluster = NULL;
@@ -3509,6 +3524,10 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 	if (error)
 		goto bad_swap_unlock_inode;
 
+	error = gswap_swapon(si->type, maxpages, si->flags);
+	if (error)
+		goto free_swap_zswap;
+
 	/*
 	 * Flush any pending IO and dirty mappings before we start using this
 	 * swap device.
@@ -3517,7 +3536,7 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 	error = inode_drain_writes(inode);
 	if (error) {
 		inode->i_flags &= ~S_SWAPFILE;
-		goto free_swap_zswap;
+		goto free_swap_gswap;
 	}
 
 	mutex_lock(&swapon_mutex);
@@ -3540,6 +3559,8 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 
 	error = 0;
 	goto out;
+free_swap_gswap:
+	gswap_swapoff(si->type);
 free_swap_zswap:
 	zswap_swapoff(si->type);
 bad_swap_unlock_inode:
