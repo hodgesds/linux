@@ -49,6 +49,7 @@
 #include <linux/pci.h>
 #include <linux/iosys-map.h>
 #include <linux/cpuhotplug.h>
+#include <linux/local_lock.h>
 #include <linux/bio.h>
 
 #ifdef CONFIG_DRM
@@ -70,11 +71,20 @@
 * configuration
 **********************************/
 
-/* Slot size for VRAM allocator -- lz4 compresses most pages to <2KB */
-#define GSWAP_SLOT_SIZE		2048
+/*
+ * Buddy allocator for VRAM.  Variable-size allocations let us accept
+ * pages that compress to anything < PAGE_SIZE instead of rejecting
+ * everything above a fixed 2 KB slot.
+ *
+ * Order 0 = 256 bytes, order 4 = 4096 bytes (PAGE_SIZE).
+ */
+#define GSWAP_MIN_ALLOC_SHIFT	8
+#define GSWAP_MIN_ALLOC_SIZE	(1UL << GSWAP_MIN_ALLOC_SHIFT)
+#define GSWAP_NR_ORDERS		5	/* 256, 512, 1024, 2048, 4096 */
 
 /* Maximum readahead window (compile-time buffer size) */
 #define GSWAP_RA_SIZE		32
+#define GSWAP_RA_BUF_SIZE	(GSWAP_RA_SIZE * PAGE_SIZE)
 
 /* Default compressor */
 #define GSWAP_COMPRESSOR_DEFAULT "lz4"
@@ -148,7 +158,7 @@ struct gswap_ra_entry {
 
 struct gswap_ra_cache {
 	struct gswap_ra_entry	entries[GSWAP_RA_SIZE];
-	u8			*buf;		/* GSWAP_RA_SIZE * GSWAP_SLOT_SIZE */
+	u8			*buf;		/* GSWAP_RA_BUF_SIZE bytes */
 	int			count;
 	pgoff_t			last_offset;	/* last loaded offset (sequentiality) */
 	unsigned int		window;		/* adaptive window size */
@@ -168,12 +178,12 @@ struct gswap_crypto_ctx {
 /*
  * gswap_entry: metadata for one compressed page stored in VRAM.
  *
- * Stored in a per-swap-type xarray keyed by swap offset. The actual
- * compressed data lives in VRAM at slot_index * GSWAP_SLOT_SIZE.
+ * Stored in a per-swap-type xarray keyed by swap offset.  The actual
+ * compressed data lives in VRAM at the byte offset stored in vram_offset.
  */
 struct gswap_entry {
 	swp_entry_t swpentry;
-	u32 slot_index;		/* VRAM slot index */
+	unsigned long vram_offset; /* byte offset in VRAM */
 	u32 length;		/* compressed size in bytes */
 	struct list_head lru;
 };
@@ -181,27 +191,30 @@ struct gswap_entry {
 /*
  * gswap_pool: manages a region of GPU VRAM for compressed swap storage.
  *
- * Uses a fixed-slot bitmap allocator: VRAM is divided into GSWAP_SLOT_SIZE
- * chunks, each tracked by one bit in the bitmap.
+ * Uses a buddy allocator with power-of-2 block sizes from 256 bytes
+ * (order 0) to 4096 bytes (order 4).  This lets us accept pages that
+ * compress to anything under PAGE_SIZE, instead of rejecting all pages
+ * above a fixed slot threshold.
  *
  * VRAM may be split across multiple DRM dumb buffers because the DRM
  * dumb-buffer interface uses u32 size arithmetic, limiting each buffer
- * to ~4 GB.  The maps[] array holds one iosys_map per buffer; the
- * bitmap and slot indices span all buffers contiguously.
+ * to ~4 GB.  The maps[] array holds one iosys_map per buffer; byte
+ * offsets span all buffers contiguously.
  */
 #define GSWAP_MAX_BUFFERS	16
 
 struct gswap_pool {
 	struct iosys_map		maps[GSWAP_MAX_BUFFERS];
 	unsigned int		nr_maps;	/* number of valid maps */
-	unsigned long		buf_size;	/* size per buffer (for slot addressing) */
+	unsigned long		buf_size;	/* size per buffer */
 	unsigned long		total_size;	/* total VRAM region size */
 	unsigned long		usable_size;	/* max_pool_percent of total */
-	unsigned long		nr_slots;	/* total number of slots */
-	unsigned long		*bitmap;	/* allocation bitmap */
-	spinlock_t		lock;		/* protects bitmap */
-	atomic_long_t		used_slots;	/* number of allocated slots */
-	unsigned long		next_hint;	/* bitmap scan start hint */
+	unsigned long		nr_blocks;	/* total min-size blocks */
+	unsigned long		*free[GSWAP_NR_ORDERS]; /* buddy free bitmaps */
+	unsigned long		nr_free[GSWAP_NR_ORDERS]; /* free block count */
+	unsigned long		hint[GSWAP_NR_ORDERS];  /* bitmap scan start */
+	spinlock_t		lock;		/* protects free bitmaps + hints */
+	atomic_long_t		used_bytes;	/* bytes allocated */
 };
 
 static struct gswap_pool gswap_pool;
@@ -281,68 +294,246 @@ static bool gswap_device_matches(struct pci_dev *pdev)
 }
 
 /*********************************
-* VRAM slot allocator
+* VRAM buddy allocator
 **********************************/
 
-static long gswap_alloc_slot(void)
+/*
+ * Compute the buddy order needed for a given compressed size.
+ * Returns the smallest order whose block size >= @size.
+ */
+static unsigned int gswap_size_to_order(unsigned int size)
 {
-	unsigned long index, hint;
-
-	/* Fast reject: avoid the spinlock when the bitmap is full */
-	if (atomic_long_read(&gswap_pool.used_slots) >= gswap_pool.nr_slots)
-		return -ENOMEM;
-
-	spin_lock(&gswap_pool.lock);
-	hint = gswap_pool.next_hint;
-	if (hint >= gswap_pool.nr_slots)
-		hint = 0;
-
-	/* Scan from hint to end */
-	index = find_next_zero_bit(gswap_pool.bitmap, gswap_pool.nr_slots,
-				   hint);
-	/* Wrap around: scan from 0 to hint */
-	if (index >= gswap_pool.nr_slots && hint)
-		index = find_next_zero_bit(gswap_pool.bitmap, hint, 0);
-
-	if (index >= gswap_pool.nr_slots) {
-		spin_unlock(&gswap_pool.lock);
-		return -ENOMEM;
-	}
-	set_bit(index, gswap_pool.bitmap);
-	gswap_pool.next_hint = index + 1;
-	spin_unlock(&gswap_pool.lock);
-
-	atomic_long_inc(&gswap_pool.used_slots);
-	return index;
-}
-
-static void gswap_free_slot(unsigned long index)
-{
-	clear_bit(index, gswap_pool.bitmap);
-	atomic_long_dec(&gswap_pool.used_slots);
-
-	/* Nudge the hint so the allocator finds this slot sooner */
-	if (index < gswap_pool.next_hint)
-		WRITE_ONCE(gswap_pool.next_hint, index);
+	if (size <= GSWAP_MIN_ALLOC_SIZE)
+		return 0;
+	return order_base_2(size) - GSWAP_MIN_ALLOC_SHIFT;
 }
 
 /*
- * Translate a global slot index into a buffer index and byte offset
- * within that buffer.
+ * Per-CPU block cache to avoid global lock contention on the buddy
+ * allocator hot path.  Each CPU keeps a small stash of pre-split
+ * block offsets at each order.  Allocations drain the local cache
+ * under a local_lock (RT-safe); on miss, a batch is refilled
+ * from the global buddy under the pool lock.  Frees return blocks
+ * to the local cache; overflow flushes half the cache back.
  */
-static void gswap_slot_location(unsigned long index,
-				unsigned int *buf_idx,
-				unsigned long *offset)
-{
-	unsigned long slots_per_buf = gswap_pool.buf_size / GSWAP_SLOT_SIZE;
+#define GSWAP_PCPU_BATCH	16	/* blocks per order per CPU */
 
-	*buf_idx = index / slots_per_buf;
-	*offset  = (index % slots_per_buf) * GSWAP_SLOT_SIZE;
+struct gswap_pcpu_cache {
+	local_lock_t	lock;
+	unsigned long	blocks[GSWAP_NR_ORDERS][GSWAP_PCPU_BATCH];
+	unsigned int	count[GSWAP_NR_ORDERS];
+};
+
+static struct gswap_pcpu_cache __percpu *gswap_pcpu_alloc;
+
+/*
+ * Allocate a single block at @order from the global buddy.
+ * Caller must hold gswap_pool.lock.
+ * Returns block index or -1 on failure.
+ */
+static long __buddy_alloc_one(unsigned int order)
+{
+	unsigned int cur;
+	unsigned long block_idx;
+	unsigned long nr_at_order;
+
+	for (cur = order; cur < GSWAP_NR_ORDERS; cur++) {
+		unsigned long hint;
+
+		if (!gswap_pool.nr_free[cur])
+			continue;
+
+		nr_at_order = gswap_pool.nr_blocks >> cur;
+		hint = gswap_pool.hint[cur];
+		if (hint >= nr_at_order)
+			hint = 0;
+
+		block_idx = find_next_bit(gswap_pool.free[cur], nr_at_order,
+					  hint);
+		if (block_idx < nr_at_order)
+			goto found;
+
+		if (hint) {
+			block_idx = find_first_bit(gswap_pool.free[cur],
+						   hint);
+			if (block_idx < hint)
+				goto found;
+		}
+	}
+
+	return -1;
+
+found:
+	clear_bit(block_idx, gswap_pool.free[cur]);
+	gswap_pool.nr_free[cur]--;
+	gswap_pool.hint[cur] = block_idx + 1;
+
+	while (cur > order) {
+		cur--;
+		set_bit(block_idx * 2 + 1, gswap_pool.free[cur]);
+		gswap_pool.nr_free[cur]++;
+		block_idx *= 2;
+	}
+
+	return (long)block_idx;
 }
 
-static unsigned long gswap_max_usable_slots(void)
+/*
+ * Return a single block at @order to the global buddy with merging.
+ * Caller must hold gswap_pool.lock.
+ */
+static void __buddy_free_one(unsigned long block_idx, unsigned int order)
 {
-	return gswap_pool.usable_size / GSWAP_SLOT_SIZE;
+	unsigned long buddy_idx;
+
+	while (order < GSWAP_NR_ORDERS - 1) {
+		buddy_idx = block_idx ^ 1;
+
+		if (buddy_idx >= (gswap_pool.nr_blocks >> order) ||
+		    !test_bit(buddy_idx, gswap_pool.free[order]))
+			break;
+
+		clear_bit(buddy_idx, gswap_pool.free[order]);
+		gswap_pool.nr_free[order]--;
+		block_idx >>= 1;
+		order++;
+	}
+
+	set_bit(block_idx, gswap_pool.free[order]);
+	gswap_pool.nr_free[order]++;
+
+	if (block_idx < gswap_pool.hint[order])
+		gswap_pool.hint[order] = block_idx;
+}
+
+/*
+ * Refill the per-CPU cache for @order from the global buddy.
+ * Called with per-CPU local_lock held, takes pool lock internally.
+ */
+static void gswap_pcpu_refill(struct gswap_pcpu_cache *cache,
+			       unsigned int order)
+{
+	int i;
+
+	spin_lock(&gswap_pool.lock);
+	for (i = 0; i < GSWAP_PCPU_BATCH / 2; i++) {
+		long idx = __buddy_alloc_one(order);
+
+		if (idx < 0)
+			break;
+		cache->blocks[order][cache->count[order]++] = idx;
+	}
+	spin_unlock(&gswap_pool.lock);
+}
+
+/*
+ * Flush half the per-CPU cache for @order back to the global buddy.
+ * Called with per-CPU local_lock held, takes pool lock internally.
+ */
+static void gswap_pcpu_flush(struct gswap_pcpu_cache *cache,
+			      unsigned int order)
+{
+	unsigned int nr_flush = cache->count[order] / 2;
+	unsigned int i;
+
+	spin_lock(&gswap_pool.lock);
+	for (i = 0; i < nr_flush; i++) {
+		cache->count[order]--;
+		__buddy_free_one(cache->blocks[order][cache->count[order]],
+				 order);
+	}
+	spin_unlock(&gswap_pool.lock);
+}
+
+/*
+ * Allocate a VRAM region of the given order.
+ * Returns the byte offset in VRAM, or -ENOMEM on failure.
+ */
+static long gswap_buddy_alloc(unsigned int order)
+{
+	struct gswap_pcpu_cache *cache;
+	long block_idx;
+
+	local_lock(&gswap_pcpu_alloc->lock);
+	cache = this_cpu_ptr(gswap_pcpu_alloc);
+
+	if (likely(cache->count[order])) {
+		block_idx = cache->blocks[order][--cache->count[order]];
+		local_unlock(&gswap_pcpu_alloc->lock);
+		atomic_long_add(GSWAP_MIN_ALLOC_SIZE << order,
+				&gswap_pool.used_bytes);
+		return block_idx << (GSWAP_MIN_ALLOC_SHIFT + order);
+	}
+
+	/* Cache miss — refill from global buddy */
+	gswap_pcpu_refill(cache, order);
+
+	if (likely(cache->count[order])) {
+		block_idx = cache->blocks[order][--cache->count[order]];
+		local_unlock(&gswap_pcpu_alloc->lock);
+		atomic_long_add(GSWAP_MIN_ALLOC_SIZE << order,
+				&gswap_pool.used_bytes);
+		return block_idx << (GSWAP_MIN_ALLOC_SHIFT + order);
+	}
+
+	local_unlock(&gswap_pcpu_alloc->lock);
+	return -ENOMEM;
+}
+
+/*
+ * Free a VRAM region, returning it to the per-CPU cache.
+ * Overflows are flushed back to the global buddy with merging.
+ */
+static void gswap_buddy_free(unsigned long offset, unsigned int order)
+{
+	struct gswap_pcpu_cache *cache;
+	unsigned long block_idx = offset >> (GSWAP_MIN_ALLOC_SHIFT + order);
+
+	local_lock(&gswap_pcpu_alloc->lock);
+	cache = this_cpu_ptr(gswap_pcpu_alloc);
+
+	if (likely(cache->count[order] < GSWAP_PCPU_BATCH)) {
+		cache->blocks[order][cache->count[order]++] = block_idx;
+		local_unlock(&gswap_pcpu_alloc->lock);
+		return;
+	}
+
+	/* Cache full — flush half, then add */
+	gswap_pcpu_flush(cache, order);
+	cache->blocks[order][cache->count[order]++] = block_idx;
+	local_unlock(&gswap_pcpu_alloc->lock);
+}
+
+/*
+ * Convenience wrappers that derive the order from compressed size.
+ */
+static long gswap_alloc_vram(unsigned int comp_len)
+{
+	unsigned int order = gswap_size_to_order(comp_len);
+
+	if (order >= GSWAP_NR_ORDERS)
+		return -ENOMEM;
+	return gswap_buddy_alloc(order);
+}
+
+static void gswap_free_vram(unsigned long offset, unsigned int comp_len)
+{
+	unsigned int order = gswap_size_to_order(comp_len);
+
+	gswap_buddy_free(offset, order);
+	atomic_long_sub(GSWAP_MIN_ALLOC_SIZE << order, &gswap_pool.used_bytes);
+}
+
+/*
+ * Translate a byte offset into a buffer index and offset within
+ * that buffer.
+ */
+static void gswap_vram_location(unsigned long offset,
+				unsigned int *buf_idx,
+				unsigned long *buf_offset)
+{
+	*buf_idx    = offset / gswap_pool.buf_size;
+	*buf_offset = offset % gswap_pool.buf_size;
 }
 
 /*
@@ -353,8 +544,8 @@ static unsigned long gswap_max_usable_slots(void)
  */
 static int gswap_check_limits(void)
 {
-	unsigned long used = atomic_long_read(&gswap_pool.used_slots);
-	unsigned long max = gswap_max_usable_slots();
+	unsigned long used = atomic_long_read(&gswap_pool.used_bytes);
+	unsigned long max = gswap_pool.usable_size;
 
 	if (used >= max) {
 		atomic_long_inc(&gswap_pool_limit_hit);
@@ -375,32 +566,32 @@ static int gswap_check_limits(void)
 * VRAM I/O helpers
 **********************************/
 
-static void gswap_write_to_vram(unsigned long slot_index,
+static void gswap_write_to_vram(unsigned long vram_off,
 				const void *src, unsigned int len)
 {
 	unsigned int buf_idx;
-	unsigned long offset;
+	unsigned long buf_off;
 
-	gswap_slot_location(slot_index, &buf_idx, &offset);
-	iosys_map_memcpy_to(&gswap_pool.maps[buf_idx], offset, src, len);
+	gswap_vram_location(vram_off, &buf_idx, &buf_off);
+	iosys_map_memcpy_to(&gswap_pool.maps[buf_idx], buf_off, src, len);
 	/* Ensure write-combining buffers are flushed */
 	wmb();
 }
 
-static void gswap_read_from_vram(unsigned long slot_index,
+static void gswap_read_from_vram(unsigned long vram_off,
 				 void *dst, unsigned int len)
 {
 	unsigned int buf_idx;
-	unsigned long offset;
+	unsigned long buf_off;
 
-	gswap_slot_location(slot_index, &buf_idx, &offset);
+	gswap_vram_location(vram_off, &buf_idx, &buf_off);
 
 #ifdef CONFIG_DRM
 	{
 		struct iosys_map src, dst_map = IOSYS_MAP_INIT_VADDR(dst);
 
 		src = gswap_pool.maps[buf_idx];
-		iosys_map_incr(&src, offset);
+		iosys_map_incr(&src, buf_off);
 		/*
 		 * Round up to 16 bytes for MOVNTDQA fast path in
 		 * drm_memcpy_from_wc.  Callers' buffers are always
@@ -409,7 +600,7 @@ static void gswap_read_from_vram(unsigned long slot_index,
 		drm_memcpy_from_wc(&dst_map, &src, ALIGN(len, 16));
 	}
 #else
-	iosys_map_memcpy_from(dst, &gswap_pool.maps[buf_idx], offset, len);
+	iosys_map_memcpy_from(dst, &gswap_pool.maps[buf_idx], buf_off, len);
 #endif
 }
 
@@ -447,7 +638,7 @@ static int gswap_cpu_comp_prepare(unsigned int cpu)
 	}
 
 	if (!ctx->ra.buf) {
-		ctx->ra.buf = kmalloc_node(GSWAP_RA_SIZE * GSWAP_SLOT_SIZE,
+		ctx->ra.buf = kmalloc_node(GSWAP_RA_BUF_SIZE,
 					   GFP_KERNEL, cpu_to_node(cpu));
 		if (!ctx->ra.buf) {
 			acomp_request_free(req);
@@ -481,6 +672,24 @@ static int gswap_cpu_comp_destroy(unsigned int cpu)
 	struct acomp_req *req;
 	struct crypto_acomp *acomp;
 	u8 *buffer;
+
+	/* Drain per-CPU allocator cache back to global buddy */
+	if (gswap_pcpu_alloc) {
+		struct gswap_pcpu_cache *cache = per_cpu_ptr(gswap_pcpu_alloc,
+							     cpu);
+		int order;
+
+		spin_lock(&gswap_pool.lock);
+		for (order = 0; order < GSWAP_NR_ORDERS; order++) {
+			while (cache->count[order]) {
+				cache->count[order]--;
+				__buddy_free_one(
+					cache->blocks[order][cache->count[order]],
+					order);
+			}
+		}
+		spin_unlock(&gswap_pool.lock);
+	}
 
 	mutex_lock(&ctx->mutex);
 	req = ctx->req;
@@ -533,7 +742,7 @@ static void gswap_comp_ctx_put(struct gswap_crypto_ctx *ctx)
 
 static void gswap_entry_free(struct gswap_entry *entry)
 {
-	gswap_free_slot(entry->slot_index);
+	gswap_free_vram(entry->vram_offset, entry->length);
 
 	spin_lock(&gswap_lru_lock);
 	if (!list_empty(&entry->lru))
@@ -654,7 +863,7 @@ static int gswap_writeback_entry(struct gswap_entry *entry,
 
 	/* Entry is now exclusively ours -- decompress from VRAM */
 	ctx = gswap_comp_ctx_get();
-	gswap_read_from_vram(entry->slot_index, ctx->buffer, entry->length);
+	gswap_read_from_vram(entry->vram_offset, ctx->buffer, entry->length);
 
 	sg_init_one(&input, ctx->buffer, entry->length);
 	sg_init_table(&output, 1);
@@ -699,7 +908,8 @@ static void gswap_writeback_worker(struct work_struct *work)
 	swp_entry_t swpentry;
 	unsigned long nr_writeback = 0;
 	unsigned long nr_failures = 0;
-	unsigned long max_writeback = atomic_long_read(&gswap_pool.used_slots) / 4;
+	unsigned long max_writeback = atomic_long_read(&gswap_pool.used_bytes) /
+				     (4 * PAGE_SIZE);
 	unsigned int nofs_flag;
 	int ret;
 
@@ -834,8 +1044,8 @@ static void gswap_drain_pool(void)
 	 * removes entries from the LRU before attempting writeback;
 	 * if writeback fails (e.g. memory pressure), the entry stays
 	 * in the xarray but is no longer on the LRU.  Free them here
-	 * to prevent a NULL-pointer dereference in gswap_free_slot()
-	 * after gswap_pool_destroy() releases the bitmap.
+	 * to prevent a use-after-free in gswap_free_vram()
+	 * after gswap_pool_destroy() releases the buddy bitmaps.
 	 */
 	for (type = 0; type < MAX_SWAPFILES; type++) {
 		struct xarray *trees = gswap_trees[type];
@@ -898,14 +1108,14 @@ static bool gswap_store_page(struct page *page)
 		goto fail_unlock;
 	}
 
-	/* Reject pages that don't compress well enough to fit in a slot */
-	if (dlen > GSWAP_SLOT_SIZE) {
+	/* Reject pages that don't compress below page size */
+	if (dlen >= PAGE_SIZE) {
 		atomic_long_inc(&gswap_reject_compress_poor);
 		goto fail_unlock;
 	}
 
-	/* Allocate a VRAM slot */
-	slot = gswap_alloc_slot();
+	/* Allocate VRAM space for the compressed data */
+	slot = gswap_alloc_vram(dlen);
 	if (slot < 0) {
 		atomic_long_inc(&gswap_reject_alloc_fail);
 		goto fail_unlock;
@@ -918,7 +1128,7 @@ static bool gswap_store_page(struct page *page)
 
 	/* Set up the entry */
 	entry->swpentry = page_swpentry;
-	entry->slot_index = slot;
+	entry->vram_offset = slot;
 	entry->length = dlen;
 	INIT_LIST_HEAD(&entry->lru);
 
@@ -928,7 +1138,7 @@ static bool gswap_store_page(struct page *page)
 		       entry, GFP_KERNEL);
 	if (xa_is_err(old)) {
 		atomic_long_inc(&gswap_reject_alloc_fail);
-		gswap_free_slot(slot);
+		gswap_free_vram(slot, dlen);
 		gswap_entry_cache_free(entry);
 		return false;
 	}
@@ -1052,7 +1262,8 @@ static void gswap_ra_fill(struct gswap_ra_cache *ra, int type, pgoff_t offset)
 		unsigned int tree_idx = ra_offset >> GSWAP_ADDRESS_SPACE_SHIFT;
 		struct xarray *tree;
 		struct gswap_entry *gentry;
-		u32 slot_index, length;
+		unsigned long vram_off;
+		u32 length;
 
 		if (tree_idx >= nr_gswap_trees[type])
 			break;
@@ -1070,14 +1281,14 @@ static void gswap_ra_fill(struct gswap_ra_cache *ra, int type, pgoff_t offset)
 			xa_unlock(tree);
 			continue;
 		}
-		slot_index = gentry->slot_index;
+		vram_off = gentry->vram_offset;
 		length = gentry->length;
 		xa_unlock(tree);
 
-		if (buf_off + ALIGN(length, 16) > GSWAP_RA_SIZE * GSWAP_SLOT_SIZE)
+		if (buf_off + ALIGN(length, 16) > GSWAP_RA_BUF_SIZE)
 			break;
 
-		gswap_read_from_vram(slot_index,
+		gswap_read_from_vram(vram_off,
 				     ra->buf + buf_off, length);
 
 		ra->entries[ra->count].offset = ra_offset;
@@ -1160,7 +1371,7 @@ static int gswap_load_page(struct folio *folio, long page_index,
 		ctx->ra.hits++;
 	} else {
 		atomic_long_inc(&gswap_ra_misses);
-		gswap_read_from_vram(entry->slot_index, ctx->buffer,
+		gswap_read_from_vram(entry->vram_offset, ctx->buffer,
 				     entry->length);
 		cached_len = entry->length;
 
@@ -1469,38 +1680,146 @@ void gswap_swapoff(int type)
 **********************************/
 
 /*
+ * Set up buddy free bitmaps for @nr_blocks min-size blocks.
+ * Marks all space as free, starting from the highest order.
+ */
+static int gswap_buddy_init(unsigned long nr_blocks)
+{
+	unsigned long bitmap_bits;
+	unsigned long remaining, block_offset;
+	int i, order;
+
+	for (i = 0; i < GSWAP_NR_ORDERS; i++) {
+		bitmap_bits = nr_blocks >> i;
+		if (!bitmap_bits)
+			bitmap_bits = 1;
+		gswap_pool.free[i] = kvzalloc(
+			BITS_TO_LONGS(bitmap_bits) * sizeof(unsigned long),
+			GFP_KERNEL);
+		if (!gswap_pool.free[i])
+			goto err;
+	}
+
+	/*
+	 * Mark all blocks as free.  Process from highest to lowest
+	 * order so that the pool starts fully coalesced.  Works because
+	 * the space is contiguous starting at offset 0.
+	 */
+	remaining = nr_blocks;
+	block_offset = 0;
+	for (order = GSWAP_NR_ORDERS - 1; order > 0; order--) {
+		unsigned long order_blocks = 1UL << order;
+
+		while (remaining >= order_blocks) {
+			set_bit(block_offset >> order,
+				gswap_pool.free[order]);
+			gswap_pool.nr_free[order]++;
+			block_offset += order_blocks;
+			remaining -= order_blocks;
+		}
+	}
+	while (remaining > 0) {
+		set_bit(block_offset, gswap_pool.free[0]);
+		gswap_pool.nr_free[0]++;
+		block_offset++;
+		remaining--;
+	}
+
+	return 0;
+
+err:
+	for (i--; i >= 0; i--)
+		kvfree(gswap_pool.free[i]);
+	return -ENOMEM;
+}
+
+/*
+ * Drain all per-CPU caches back to the global buddy.
+ * Called during pool teardown with no concurrent allocators.
+ */
+static void gswap_pcpu_drain_all(void)
+{
+	int cpu, order;
+
+	if (!gswap_pcpu_alloc)
+		return;
+
+	for_each_possible_cpu(cpu) {
+		struct gswap_pcpu_cache *cache = per_cpu_ptr(gswap_pcpu_alloc,
+							     cpu);
+
+		spin_lock(&gswap_pool.lock);
+		for (order = 0; order < GSWAP_NR_ORDERS; order++) {
+			while (cache->count[order]) {
+				cache->count[order]--;
+				__buddy_free_one(
+					cache->blocks[order][cache->count[order]],
+					order);
+			}
+		}
+		spin_unlock(&gswap_pool.lock);
+	}
+}
+
+static void gswap_buddy_destroy(void)
+{
+	int i;
+
+	gswap_pcpu_drain_all();
+	free_percpu(gswap_pcpu_alloc);
+	gswap_pcpu_alloc = NULL;
+
+	for (i = 0; i < GSWAP_NR_ORDERS; i++) {
+		kvfree(gswap_pool.free[i]);
+		gswap_pool.free[i] = NULL;
+	}
+}
+
+/*
  * Initialize the pool from a single contiguous mapping.
  * Used by the direct-BAR path and single-buffer DRM allocations.
  */
 static int gswap_pool_init(struct iosys_map *map, unsigned long size,
 			   unsigned long usable_size)
 {
-	unsigned long nr_slots;
-	unsigned long bitmap_size;
+	unsigned long nr_blocks;
+	int ret;
 
-	if (!size || size < GSWAP_SLOT_SIZE) {
+	if (!size || size < GSWAP_MIN_ALLOC_SIZE) {
 		pr_err("VRAM region too small: %lu bytes\n", size);
 		return -EINVAL;
 	}
 
-	nr_slots = size / GSWAP_SLOT_SIZE;
-	bitmap_size = BITS_TO_LONGS(nr_slots) * sizeof(unsigned long);
-
-	gswap_pool.bitmap = kvzalloc(bitmap_size, GFP_KERNEL);
-	if (!gswap_pool.bitmap)
-		return -ENOMEM;
+	nr_blocks = size >> GSWAP_MIN_ALLOC_SHIFT;
 
 	gswap_pool.maps[0] = *map;
 	gswap_pool.nr_maps = 1;
 	gswap_pool.buf_size = size;
 	gswap_pool.total_size = size;
 	gswap_pool.usable_size = usable_size;
-	gswap_pool.nr_slots = nr_slots;
+	gswap_pool.nr_blocks = nr_blocks;
 	spin_lock_init(&gswap_pool.lock);
-	atomic_long_set(&gswap_pool.used_slots, 0);
+	atomic_long_set(&gswap_pool.used_bytes, 0);
 
-	pr_info("VRAM pool initialized: %lu MB (%lu slots of %d bytes)\n",
-		size >> 20, nr_slots, GSWAP_SLOT_SIZE);
+	ret = gswap_buddy_init(nr_blocks);
+	if (ret)
+		return ret;
+
+	gswap_pcpu_alloc = alloc_percpu(struct gswap_pcpu_cache);
+	if (!gswap_pcpu_alloc) {
+		gswap_buddy_destroy();
+		return -ENOMEM;
+	}
+	{
+		int cpu;
+
+		for_each_possible_cpu(cpu)
+			local_lock_init(&per_cpu_ptr(gswap_pcpu_alloc, cpu)->lock);
+	}
+
+	pr_info("VRAM pool initialized: %lu MB (%lu blocks, %lu-%lu byte allocs)\n",
+		size >> 20, nr_blocks,
+		GSWAP_MIN_ALLOC_SIZE, GSWAP_MIN_ALLOC_SIZE << (GSWAP_NR_ORDERS - 1));
 	pr_info("  usable: %lu MB (%lu%% of total)\n",
 		usable_size >> 20, usable_size * 100 / size);
 
@@ -1509,27 +1828,23 @@ static int gswap_pool_init(struct iosys_map *map, unsigned long size,
 
 /*
  * Initialize the pool from multiple equal-sized mappings.
- * Each map covers buf_size bytes; the bitmap spans all of them.
+ * Each map covers buf_size bytes; the buddy spans all of them.
  */
 static int gswap_pool_init_multi(struct iosys_map *maps, unsigned int nr_maps,
 				 unsigned long buf_size,
 				 unsigned long total_size,
 				 unsigned long usable_size)
 {
-	unsigned long nr_slots, bitmap_size;
+	unsigned long nr_blocks;
 	unsigned int i;
+	int ret;
 
-	if (!total_size || total_size < GSWAP_SLOT_SIZE) {
+	if (!total_size || total_size < GSWAP_MIN_ALLOC_SIZE) {
 		pr_err("VRAM region too small: %lu bytes\n", total_size);
 		return -EINVAL;
 	}
 
-	nr_slots = total_size / GSWAP_SLOT_SIZE;
-	bitmap_size = BITS_TO_LONGS(nr_slots) * sizeof(unsigned long);
-
-	gswap_pool.bitmap = kvzalloc(bitmap_size, GFP_KERNEL);
-	if (!gswap_pool.bitmap)
-		return -ENOMEM;
+	nr_blocks = total_size >> GSWAP_MIN_ALLOC_SHIFT;
 
 	for (i = 0; i < nr_maps; i++)
 		gswap_pool.maps[i] = maps[i];
@@ -1537,12 +1852,30 @@ static int gswap_pool_init_multi(struct iosys_map *maps, unsigned int nr_maps,
 	gswap_pool.buf_size = buf_size;
 	gswap_pool.total_size = total_size;
 	gswap_pool.usable_size = usable_size;
-	gswap_pool.nr_slots = nr_slots;
+	gswap_pool.nr_blocks = nr_blocks;
 	spin_lock_init(&gswap_pool.lock);
-	atomic_long_set(&gswap_pool.used_slots, 0);
+	atomic_long_set(&gswap_pool.used_bytes, 0);
 
-	pr_info("VRAM pool initialized: %lu MB (%lu slots of %d bytes, %u buffers)\n",
-		total_size >> 20, nr_slots, GSWAP_SLOT_SIZE, nr_maps);
+	ret = gswap_buddy_init(nr_blocks);
+	if (ret)
+		return ret;
+
+	gswap_pcpu_alloc = alloc_percpu(struct gswap_pcpu_cache);
+	if (!gswap_pcpu_alloc) {
+		gswap_buddy_destroy();
+		return -ENOMEM;
+	}
+	{
+		int cpu;
+
+		for_each_possible_cpu(cpu)
+			local_lock_init(&per_cpu_ptr(gswap_pcpu_alloc, cpu)->lock);
+	}
+
+	pr_info("VRAM pool initialized: %lu MB (%lu blocks, %lu-%lu byte allocs, %u buffers)\n",
+		total_size >> 20, nr_blocks,
+		GSWAP_MIN_ALLOC_SIZE, GSWAP_MIN_ALLOC_SIZE << (GSWAP_NR_ORDERS - 1),
+		nr_maps);
 	pr_info("  usable: %lu MB (%lu%% of total)\n",
 		usable_size >> 20, usable_size * 100 / total_size);
 
@@ -1572,8 +1905,7 @@ static void gswap_pool_destroy(void)
 	for (i = 0; i < gswap_pool.nr_maps; i++)
 		iosys_map_clear(&gswap_pool.maps[i]);
 	gswap_pool.nr_maps = 0;
-	kvfree(gswap_pool.bitmap);
-	gswap_pool.bitmap = NULL;
+	gswap_buddy_destroy();
 }
 
 /*********************************
@@ -1828,8 +2160,8 @@ static int gswap_drm_alloc_vram(struct pci_dev *pdev)
 	 * multiple dumb buffers when needed.
 	 */
 	buf_size = min(alloc_size, GSWAP_DRM_MAX_BUF);
-	/* Align down to slot granularity */
-	buf_size = rounddown(buf_size, GSWAP_SLOT_SIZE);
+	/* Align down to minimum allocation granularity */
+	buf_size = rounddown(buf_size, GSWAP_MIN_ALLOC_SIZE);
 
 	remaining = alloc_size;
 	while (remaining && nr_bufs < GSWAP_MAX_BUFFERS) {
@@ -1981,8 +2313,9 @@ static void gswap_drm_setup_work_fn(struct work_struct *work)
 
 	gswap_has_pool = true;
 
-	pr_info("initialized with compressor=%s slot_size=%d (DRM, deferred)\n",
-		gswap_compressor, GSWAP_SLOT_SIZE);
+	pr_info("initialized with compressor=%s buddy_alloc=%lu-%lu bytes (DRM, deferred)\n",
+		gswap_compressor,
+		GSWAP_MIN_ALLOC_SIZE, GSWAP_MIN_ALLOC_SIZE << (GSWAP_NR_ORDERS - 1));
 }
 
 /*
@@ -2048,7 +2381,7 @@ DEFINE_DEBUGFS_ATTRIBUTE(gswap_pool_total_fops,
 
 static int debugfs_get_pool_used(void *data, u64 *val)
 {
-	*val = atomic_long_read(&gswap_pool.used_slots) * GSWAP_SLOT_SIZE;
+	*val = atomic_long_read(&gswap_pool.used_bytes);
 	return 0;
 }
 DEFINE_DEBUGFS_ATTRIBUTE(gswap_pool_used_fops,
@@ -2314,8 +2647,10 @@ static int __init gswap_init(void)
 
 	if (pool_ready) {
 		gswap_has_pool = true;
-		pr_info("initialized with compressor=%s slot_size=%d\n",
-			gswap_compressor, GSWAP_SLOT_SIZE);
+		pr_info("initialized with compressor=%s buddy_alloc=%lu-%lu bytes\n",
+			gswap_compressor,
+			GSWAP_MIN_ALLOC_SIZE,
+			GSWAP_MIN_ALLOC_SIZE << (GSWAP_NR_ORDERS - 1));
 	} else {
 		pr_info("no VRAM pool yet, gswap inactive\n");
 	}
