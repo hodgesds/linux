@@ -166,6 +166,22 @@ config SCHED_CORE
 	  which is the likely usage by Linux distributions, there should
 	  be no measurable impact on performance.
 
+config SCHED_CLASS_MINLAT
+	bool "Minlat Scheduling Class for minimum latency"
+	depends on SMP
+	default n
+	help
+	  This option enables a new scheduling class (SCHED_MINLAT) optimized
+	  for extreme low-latency workloads. It sits between the RT and fair
+	  scheduling classes in priority.
+
+	  Minlat uses pure priority-based FIFO scheduling with 8 priority
+	  levels (0-7, 0 = highest). Tasks run until they voluntarily yield,
+	  block, or are preempted by a higher-priority task. The scheduler
+	  is CPU-sticky, strongly preferring to keep tasks on their last CPU.
+
+	  If unsure, say N.
+
 config SCHED_CLASS_EXT
 	bool "Extensible Scheduling Class"
 	depends on BPF_SYSCALL && BPF_JIT && DEBUG_INFO_BTF

@@ -4427,6 +4427,20 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 	init_scx_entity(&p->scx);
 #endif
 
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	RB_CLEAR_NODE(&p->minlat.run_node);
+	p->minlat.vruntime = 0;
+	p->minlat.min_vruntime = 0;
+	p->minlat.minlat_prio = 0;
+	p->minlat.on_rq = 0;
+	p->minlat.tgid_ctx = NULL;
+	p->minlat.prev_llc = -1;
+	p->minlat.last_sleep_duration = 0;
+	p->minlat.total_sleep_ns = 0;
+	p->minlat.total_run_ns = 0;
+	p->minlat.interactive = 0;
+#endif
+
 #ifdef CONFIG_PREEMPT_NOTIFIERS
 	INIT_HLIST_HEAD(&p->preempt_notifiers);
 #endif
@@ -4645,7 +4659,8 @@ int sched_fork(u64 clone_flags, struct task_struct *p)
 	 * Revert to default priority/policy on fork if requested.
 	 */
 	if (unlikely(p->sched_reset_on_fork)) {
-		if (task_has_dl_policy(p) || task_has_rt_policy(p)) {
+		if (task_has_dl_policy(p) || task_has_rt_policy(p) ||
+		    minlat_policy(p->policy)) {
 			p->policy = SCHED_NORMAL;
 			p->static_prio = NICE_TO_PRIO(0);
 			p->rt_priority = 0;
@@ -4675,9 +4690,15 @@ int sched_fork(u64 clone_flags, struct task_struct *p)
 	} else if (task_should_scx(p->policy)) {
 		p->sched_class = &ext_sched_class;
 #endif
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	} else {
+		p->sched_class = &minlat_sched_class;
+	}
+#else
 	} else {
 		p->sched_class = &fair_sched_class;
 	}
+#endif
 
 	init_entity_runnable_average(&p->se);
 
@@ -7253,6 +7274,15 @@ const struct sched_class *__setscheduler_class(int policy, int prio)
 	if (dl_prio(prio))
 		return &dl_sched_class;
 
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	/*
+	 * minlat_policy check must come before rt_prio because minlat
+	 * tasks use RT-range priority values but belong to minlat class.
+	 */
+	if (minlat_policy(policy))
+		return &minlat_sched_class;
+#endif
+
 	if (rt_prio(prio))
 		return &rt_sched_class;
 
@@ -7261,7 +7291,12 @@ const struct sched_class *__setscheduler_class(int policy, int prio)
 		return &ext_sched_class;
 #endif
 
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	/* minlat takes over all fair tasks when enabled */
+	return &minlat_sched_class;
+#else
 	return &fair_sched_class;
+#endif
 }
 
 #ifdef CONFIG_RT_MUTEXES
@@ -8603,6 +8638,10 @@ void __init sched_init(void)
 	BUG_ON(!sched_class_above(&dl_sched_class, &rt_sched_class));
 	BUG_ON(!sched_class_above(&rt_sched_class, &fair_sched_class));
 	BUG_ON(!sched_class_above(&fair_sched_class, &idle_sched_class));
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	BUG_ON(!sched_class_above(&rt_sched_class, &minlat_sched_class));
+	BUG_ON(!sched_class_above(&minlat_sched_class, &fair_sched_class));
+#endif
 #ifdef CONFIG_SCHED_CLASS_EXT
 	BUG_ON(!sched_class_above(&fair_sched_class, &ext_sched_class));
 	BUG_ON(!sched_class_above(&ext_sched_class, &idle_sched_class));
@@ -8669,6 +8708,9 @@ void __init sched_init(void)
 		init_cfs_rq(&rq->cfs);
 		init_rt_rq(&rq->rt);
 		init_dl_rq(&rq->dl);
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+		init_minlat_rq(&rq->minlat);
+#endif
 #ifdef CONFIG_FAIR_GROUP_SCHED
 		INIT_LIST_HEAD(&rq->leaf_cfs_rq_list);
 		rq->tmp_alone_branch = &rq->leaf_cfs_rq_list;
@@ -8784,6 +8826,9 @@ void __init sched_init(void)
 
 	balance_push_set(smp_processor_id(), false);
 	init_sched_fair_class();
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	init_sched_minlat_class();
+#endif
 	init_sched_ext_class();
 
 	psi_init();
