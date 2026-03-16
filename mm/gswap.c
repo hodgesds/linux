@@ -294,6 +294,449 @@ static bool gswap_device_matches(struct pci_dev *pdev)
 }
 
 /*********************************
+* VRAM buddy allocator
+**********************************/
+
+/*
+ * Compute the buddy order needed for a given compressed size.
+ * Returns the smallest order whose block size >= @size.
+ */
+static unsigned int gswap_size_to_order(unsigned int size)
+{
+	if (size <= GSWAP_MIN_ALLOC_SIZE)
+		return 0;
+	return order_base_2(size) - GSWAP_MIN_ALLOC_SHIFT;
+}
+
+/*
+ * Per-CPU block cache to avoid global lock contention on the buddy
+ * allocator hot path.  Each CPU keeps a small stash of pre-split
+ * block offsets at each order.  Allocations drain the local cache
+ * under a local_lock (RT-safe); on miss, a batch is refilled
+ * from the global buddy under the pool lock.  Frees return blocks
+ * to the local cache; overflow flushes half the cache back.
+ */
+#define GSWAP_PCPU_BATCH	16	/* blocks per order per CPU */
+
+struct gswap_pcpu_cache {
+	local_lock_t	lock;
+	unsigned long	blocks[GSWAP_NR_ORDERS][GSWAP_PCPU_BATCH];
+	unsigned int	count[GSWAP_NR_ORDERS];
+};
+
+static struct gswap_pcpu_cache __percpu *gswap_pcpu_alloc;
+
+/*
+ * Allocate a single block at @order from the global buddy.
+ * Caller must hold gswap_pool.lock.
+ * Returns block index or -1 on failure.
+ */
+static long __buddy_alloc_one(unsigned int order)
+{
+	unsigned int cur;
+	unsigned long block_idx;
+	unsigned long nr_at_order;
+
+	for (cur = order; cur < GSWAP_NR_ORDERS; cur++) {
+		unsigned long hint;
+
+		if (!gswap_pool.nr_free[cur])
+			continue;
+
+		nr_at_order = gswap_pool.nr_blocks >> cur;
+		hint = gswap_pool.hint[cur];
+		if (hint >= nr_at_order)
+			hint = 0;
+
+		block_idx = find_next_bit(gswap_pool.free[cur], nr_at_order,
+					  hint);
+		if (block_idx < nr_at_order)
+			goto found;
+
+		if (hint) {
+			block_idx = find_first_bit(gswap_pool.free[cur],
+						   hint);
+			if (block_idx < hint)
+				goto found;
+		}
+	}
+
+	return -1;
+
+found:
+	clear_bit(block_idx, gswap_pool.free[cur]);
+	gswap_pool.nr_free[cur]--;
+	gswap_pool.hint[cur] = block_idx + 1;
+
+	while (cur > order) {
+		cur--;
+		set_bit(block_idx * 2 + 1, gswap_pool.free[cur]);
+		gswap_pool.nr_free[cur]++;
+		block_idx *= 2;
+	}
+
+	return (long)block_idx;
+}
+
+/*
+ * Return a single block at @order to the global buddy with merging.
+ * Caller must hold gswap_pool.lock.
+ */
+static void __buddy_free_one(unsigned long block_idx, unsigned int order)
+{
+	unsigned long buddy_idx;
+
+	while (order < GSWAP_NR_ORDERS - 1) {
+		buddy_idx = block_idx ^ 1;
+
+		if (buddy_idx >= (gswap_pool.nr_blocks >> order) ||
+		    !test_bit(buddy_idx, gswap_pool.free[order]))
+			break;
+
+		clear_bit(buddy_idx, gswap_pool.free[order]);
+		gswap_pool.nr_free[order]--;
+		block_idx >>= 1;
+		order++;
+	}
+
+	set_bit(block_idx, gswap_pool.free[order]);
+	gswap_pool.nr_free[order]++;
+
+	if (block_idx < gswap_pool.hint[order])
+		gswap_pool.hint[order] = block_idx;
+}
+
+/*
+ * Refill the per-CPU cache for @order from the global buddy.
+ * Called with per-CPU local_lock held, takes pool lock internally.
+ */
+static void gswap_pcpu_refill(struct gswap_pcpu_cache *cache,
+			       unsigned int order)
+{
+	int i;
+
+	spin_lock(&gswap_pool.lock);
+	for (i = 0; i < GSWAP_PCPU_BATCH / 2; i++) {
+		long idx = __buddy_alloc_one(order);
+
+		if (idx < 0)
+			break;
+		cache->blocks[order][cache->count[order]++] = idx;
+	}
+	spin_unlock(&gswap_pool.lock);
+}
+
+/*
+ * Flush half the per-CPU cache for @order back to the global buddy.
+ * Called with per-CPU local_lock held, takes pool lock internally.
+ */
+static void gswap_pcpu_flush(struct gswap_pcpu_cache *cache,
+			      unsigned int order)
+{
+	unsigned int nr_flush = cache->count[order] / 2;
+	unsigned int i;
+
+	spin_lock(&gswap_pool.lock);
+	for (i = 0; i < nr_flush; i++) {
+		cache->count[order]--;
+		__buddy_free_one(cache->blocks[order][cache->count[order]],
+				 order);
+	}
+	spin_unlock(&gswap_pool.lock);
+}
+
+/*
+ * Allocate a VRAM region of the given order.
+ * Returns the byte offset in VRAM, or -ENOMEM on failure.
+ */
+static long gswap_buddy_alloc(unsigned int order)
+{
+	struct gswap_pcpu_cache *cache;
+	long block_idx;
+
+	local_lock(&gswap_pcpu_alloc->lock);
+	cache = this_cpu_ptr(gswap_pcpu_alloc);
+
+	if (likely(cache->count[order])) {
+		block_idx = cache->blocks[order][--cache->count[order]];
+		local_unlock(&gswap_pcpu_alloc->lock);
+		atomic_long_add(GSWAP_MIN_ALLOC_SIZE << order,
+				&gswap_pool.used_bytes);
+		return block_idx << (GSWAP_MIN_ALLOC_SHIFT + order);
+	}
+
+	/* Cache miss — refill from global buddy */
+	gswap_pcpu_refill(cache, order);
+
+	if (likely(cache->count[order])) {
+		block_idx = cache->blocks[order][--cache->count[order]];
+		local_unlock(&gswap_pcpu_alloc->lock);
+		atomic_long_add(GSWAP_MIN_ALLOC_SIZE << order,
+				&gswap_pool.used_bytes);
+		return block_idx << (GSWAP_MIN_ALLOC_SHIFT + order);
+	}
+
+	local_unlock(&gswap_pcpu_alloc->lock);
+	return -ENOMEM;
+}
+
+/*
+ * Free a VRAM region, returning it to the per-CPU cache.
+ * Overflows are flushed back to the global buddy with merging.
+ */
+static void gswap_buddy_free(unsigned long offset, unsigned int order)
+{
+	struct gswap_pcpu_cache *cache;
+	unsigned long block_idx = offset >> (GSWAP_MIN_ALLOC_SHIFT + order);
+
+	local_lock(&gswap_pcpu_alloc->lock);
+	cache = this_cpu_ptr(gswap_pcpu_alloc);
+
+	if (likely(cache->count[order] < GSWAP_PCPU_BATCH)) {
+		cache->blocks[order][cache->count[order]++] = block_idx;
+		local_unlock(&gswap_pcpu_alloc->lock);
+		return;
+	}
+
+	/* Cache full — flush half, then add */
+	gswap_pcpu_flush(cache, order);
+	cache->blocks[order][cache->count[order]++] = block_idx;
+	local_unlock(&gswap_pcpu_alloc->lock);
+}
+
+/*
+ * Convenience wrappers that derive the order from compressed size.
+ */
+static long gswap_alloc_vram(unsigned int comp_len)
+{
+	unsigned int order = gswap_size_to_order(comp_len);
+
+	if (order >= GSWAP_NR_ORDERS)
+		return -ENOMEM;
+	return gswap_buddy_alloc(order);
+}
+
+static void gswap_free_vram(unsigned long offset, unsigned int comp_len)
+{
+	unsigned int order = gswap_size_to_order(comp_len);
+
+	gswap_buddy_free(offset, order);
+	atomic_long_sub(GSWAP_MIN_ALLOC_SIZE << order, &gswap_pool.used_bytes);
+}
+
+/*
+ * Translate a byte offset into a buffer index and offset within
+ * that buffer.
+ */
+static void gswap_vram_location(unsigned long offset,
+				unsigned int *buf_idx,
+				unsigned long *buf_offset)
+{
+	*buf_idx    = offset / gswap_pool.buf_size;
+	*buf_offset = offset % gswap_pool.buf_size;
+}
+
+/*
+ * Check pool utilization and return:
+ *   0 = below high watermark, store may proceed
+ *   1 = above high watermark (90%), store proceeds but writeback triggered
+ *   2 = at hard limit (100%), store rejected
+ */
+static int gswap_check_limits(void)
+{
+	unsigned long used = atomic_long_read(&gswap_pool.used_bytes);
+	unsigned long max = gswap_pool.usable_size;
+
+	if (used >= max) {
+		atomic_long_inc(&gswap_pool_limit_hit);
+		WRITE_ONCE(gswap_pool_reached_full, true);
+		return 2;
+	}
+
+	if (READ_ONCE(gswap_pool_reached_full) && used <= max * 4 / 5)
+		WRITE_ONCE(gswap_pool_reached_full, false);
+
+	if (used >= max * 9 / 10)
+		return 1;
+
+	return 0;
+}
+
+/*********************************
+* VRAM I/O helpers
+**********************************/
+
+static void gswap_write_to_vram(unsigned long vram_off,
+				const void *src, unsigned int len)
+{
+	unsigned int buf_idx;
+	unsigned long buf_off;
+
+	gswap_vram_location(vram_off, &buf_idx, &buf_off);
+	iosys_map_memcpy_to(&gswap_pool.maps[buf_idx], buf_off, src, len);
+	/* Ensure write-combining buffers are flushed */
+	wmb();
+}
+
+static void gswap_read_from_vram(unsigned long vram_off,
+				 void *dst, unsigned int len)
+{
+	unsigned int buf_idx;
+	unsigned long buf_off;
+
+	gswap_vram_location(vram_off, &buf_idx, &buf_off);
+
+#ifdef CONFIG_DRM
+	{
+		struct iosys_map src, dst_map = IOSYS_MAP_INIT_VADDR(dst);
+
+		src = gswap_pool.maps[buf_idx];
+		iosys_map_incr(&src, buf_off);
+		/*
+		 * Round up to 16 bytes for MOVNTDQA fast path in
+		 * drm_memcpy_from_wc.  Callers' buffers are always
+		 * large enough for the padding.
+		 */
+		drm_memcpy_from_wc(&dst_map, &src, ALIGN(len, 16));
+	}
+#else
+	iosys_map_memcpy_from(dst, &gswap_pool.maps[buf_idx], buf_off, len);
+#endif
+}
+
+/*********************************
+* compression context management
+**********************************/
+
+static int gswap_cpu_comp_prepare(unsigned int cpu)
+{
+	struct gswap_crypto_ctx *ctx = per_cpu_ptr(gswap_comp_ctx, cpu);
+	struct crypto_acomp *acomp;
+	struct acomp_req *req;
+	u8 *buffer;
+
+	buffer = kmalloc_node(PAGE_SIZE, GFP_KERNEL, cpu_to_node(cpu));
+	if (!buffer)
+		return -ENOMEM;
+
+	acomp = crypto_alloc_acomp_node(gswap_compressor, 0, 0,
+					cpu_to_node(cpu));
+	if (IS_ERR(acomp)) {
+		pr_err("could not alloc crypto acomp %s: %pe\n",
+		       gswap_compressor, acomp);
+		kfree(buffer);
+		return PTR_ERR(acomp);
+	}
+
+	req = acomp_request_alloc(acomp);
+	if (!req) {
+		pr_err("could not alloc crypto acomp_request %s\n",
+		       gswap_compressor);
+		crypto_free_acomp(acomp);
+		kfree(buffer);
+		return -ENOMEM;
+	}
+
+	if (!ctx->ra.buf) {
+		ctx->ra.buf = kmalloc_node(GSWAP_RA_BUF_SIZE,
+					   GFP_KERNEL, cpu_to_node(cpu));
+		if (!ctx->ra.buf) {
+			acomp_request_free(req);
+			crypto_free_acomp(acomp);
+			kfree(buffer);
+			return -ENOMEM;
+		}
+		ctx->ra.count = 0;
+		ctx->ra.last_offset = (pgoff_t)-1;
+		ctx->ra.window = min_t(unsigned int,
+				       gswap_ra_size, GSWAP_RA_SIZE);
+		ctx->ra.hits = 0;
+		ctx->ra.accesses = 0;
+	}
+
+	mutex_lock(&ctx->mutex);
+	crypto_init_wait(&ctx->wait);
+	acomp_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+				   crypto_req_done, &ctx->wait);
+	ctx->buffer = buffer;
+	ctx->acomp = acomp;
+	ctx->req = req;
+	mutex_unlock(&ctx->mutex);
+
+	return 0;
+}
+
+static int gswap_cpu_comp_destroy(unsigned int cpu)
+{
+	struct gswap_crypto_ctx *ctx = per_cpu_ptr(gswap_comp_ctx, cpu);
+	struct acomp_req *req;
+	struct crypto_acomp *acomp;
+	u8 *buffer;
+
+	/* Drain per-CPU allocator cache back to global buddy */
+	if (gswap_pcpu_alloc) {
+		struct gswap_pcpu_cache *cache = per_cpu_ptr(gswap_pcpu_alloc,
+							     cpu);
+		int order;
+
+		spin_lock(&gswap_pool.lock);
+		for (order = 0; order < GSWAP_NR_ORDERS; order++) {
+			while (cache->count[order]) {
+				cache->count[order]--;
+				__buddy_free_one(
+					cache->blocks[order][cache->count[order]],
+					order);
+			}
+		}
+		spin_unlock(&gswap_pool.lock);
+	}
+
+	mutex_lock(&ctx->mutex);
+	req = ctx->req;
+	acomp = ctx->acomp;
+	buffer = ctx->buffer;
+	ctx->req = NULL;
+	ctx->acomp = NULL;
+	ctx->buffer = NULL;
+	mutex_unlock(&ctx->mutex);
+
+	if (req)
+		acomp_request_free(req);
+	if (acomp)
+		crypto_free_acomp(acomp);
+	kfree(buffer);
+	kfree(ctx->ra.buf);
+	ctx->ra.buf = NULL;
+	ctx->ra.count = 0;
+	ctx->ra.window = 0;
+	return 0;
+}
+
+static struct gswap_crypto_ctx *gswap_comp_ctx_get(void)
+{
+	struct gswap_crypto_ctx *ctx;
+
+	/*
+	 * Retry loop handles the case where we get migrated to a CPU whose
+	 * context was torn down by cpu_comp_dead(). The hotplug callback
+	 * ensures a newly onlined CPU will always have a context prepared,
+	 * so this loop will terminate.
+	 */
+	for (;;) {
+		ctx = raw_cpu_ptr(gswap_comp_ctx);
+		mutex_lock(&ctx->mutex);
+		if (likely(ctx->req))
+			return ctx;
+		mutex_unlock(&ctx->mutex);
+	}
+}
+
+static void gswap_comp_ctx_put(struct gswap_crypto_ctx *ctx)
+{
+	mutex_unlock(&ctx->mutex);
+}
+
+/*********************************
 
 * entry management
 **********************************/
