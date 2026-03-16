@@ -748,6 +748,40 @@ struct sched_dl_entity {
 #endif
 };
 
+#ifdef CONFIG_SCHED_CLASS_MICROD
+#define MICROD_MAX_LLCS		64	/* max tracked LLC domains */
+
+struct microd_tgid_ctx {
+	refcount_t			refcount;
+	int				preferred_node;	/* NUMA node affinity */
+	int				preferred_llc;	/* preferred LLC id */
+	cpumask_var_t			llc_cpus;	/* CPUs in preferred LLC */
+	atomic_t			nr_tasks;	/* tasks in this group */
+	atomic_t			nr_on_llc;	/* tasks on preferred LLC */
+	raw_spinlock_t			lock;
+};
+
+struct sched_microd_entity {
+	struct rb_node			run_node;
+	u64				vruntime;
+	u64				min_vruntime;	/* snapshot for migration */
+	unsigned int			microd_prio;	/* 0-7, 0 = highest */
+	unsigned int			on_rq;
+	struct load_weight		load;
+	struct microd_tgid_ctx		*tgid_ctx;	/* per-tgid placement */
+	int				prev_llc;	/* LLC we last ran on */
+
+	/* migration stickiness: timestamp of last migration */
+	u64				last_migrate_ts;
+
+	/* SMT-aware interactivity tracking */
+	u64				last_sleep_duration;
+	u64				total_sleep_ns;
+	u64				total_run_ns;
+	unsigned int			interactive : 1; /* short-burst task */
+};
+#endif
+
 #ifdef CONFIG_UCLAMP_TASK
 /* Number of utilization clamp buckets (shorter alias) */
 #define UCLAMP_BUCKETS CONFIG_UCLAMP_BUCKETS_COUNT
@@ -874,6 +908,9 @@ struct task_struct {
 	struct sched_dl_entity		*dl_server;
 #ifdef CONFIG_SCHED_CLASS_EXT
 	struct sched_ext_entity		scx;
+#endif
+#ifdef CONFIG_SCHED_CLASS_MICROD
+	struct sched_microd_entity	microd;
 #endif
 	const struct sched_class	*sched_class;
 

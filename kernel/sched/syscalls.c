@@ -24,6 +24,8 @@ static inline int __normal_prio(int policy, int rt_prio, int nice)
 		prio = MAX_DL_PRIO - 1;
 	else if (rt_policy(policy))
 		prio = MAX_RT_PRIO - 1 - rt_prio;
+	else if (microd_policy(policy))
+		prio = MAX_RT_PRIO - 1 - rt_prio;
 	else
 		prio = NICE_TO_PRIO(nice);
 
@@ -252,9 +254,13 @@ static void __setscheduler_params(struct task_struct *p,
 		__setparam_dl(p, attr);
 	else if (fair_policy(policy))
 		__setparam_fair(p, attr);
+#ifdef CONFIG_SCHED_CLASS_MICROD
+	else if (microd_policy(policy))
+		p->microd.microd_prio = attr->sched_priority;
+#endif
 
-	/* rt-policy tasks do not have a timerslack */
-	if (rt_or_dl_task_policy(p)) {
+	/* rt-policy and microd tasks do not have a timerslack */
+	if (rt_or_dl_task_policy(p) || microd_policy(p->policy)) {
 		p->timer_slack_ns = 0;
 	} else if (p->timer_slack_ns == 0) {
 		/* when switching back to non-rt policy, restore timerslack */
@@ -464,6 +470,9 @@ static int user_check_sched_setscheduler(struct task_struct *p,
 	if (dl_policy(policy))
 		goto req_priv;
 
+	if (microd_policy(policy))
+		goto req_priv;
+
 	/*
 	 * Treat SCHED_IDLE as nice 20. Only allow a switch to
 	 * SCHED_NORMAL if the RLIMIT_NICE would normally permit it.
@@ -528,8 +537,11 @@ recheck:
 	 */
 	if (attr->sched_priority > MAX_RT_PRIO-1)
 		return -EINVAL;
+	if (microd_policy(policy) && attr->sched_priority >= MICROD_MAX_PRIO)
+		return -EINVAL;
 	if ((dl_policy(policy) && !__checkparam_dl(attr)) ||
-	    (rt_policy(policy) != (attr->sched_priority != 0)))
+	    (!microd_policy(policy) &&
+	     rt_policy(policy) != (attr->sched_priority != 0)))
 		return -EINVAL;
 
 	if (user) {
@@ -917,6 +929,10 @@ static void get_params(struct task_struct *p, struct sched_attr *attr)
 		__getparam_dl(p, attr);
 	} else if (task_has_rt_policy(p)) {
 		attr->sched_priority = p->rt_priority;
+#ifdef CONFIG_SCHED_CLASS_MICROD
+	} else if (microd_policy(p->policy)) {
+		attr->sched_priority = p->microd.microd_prio;
+#endif
 	} else {
 		attr->sched_nice = task_nice(p);
 		attr->sched_runtime = p->se.slice;

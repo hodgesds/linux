@@ -632,6 +632,28 @@ static __init int sched_init_debug(void)
 	debugfs_ext_server_init();
 #endif
 
+#ifdef CONFIG_SCHED_CLASS_MICROD
+	{
+		struct dentry *d_microd;
+
+		d_microd = debugfs_create_dir("microd", debugfs_sched);
+		debugfs_create_u32("latency_ns", 0644, d_microd,
+				   &microd_latency_ns);
+		debugfs_create_u32("min_granularity_ns", 0644, d_microd,
+				   &microd_min_granularity_ns);
+		debugfs_create_u32("cache_hot_ns", 0644, d_microd,
+				   &microd_cache_hot_ns);
+		debugfs_create_u32("numa_imbalance_min", 0644, d_microd,
+				   &microd_numa_imbalance_min);
+		debugfs_create_u32("migration_cooldown_ns", 0644, d_microd,
+				   &microd_migration_cooldown_ns);
+		debugfs_create_u32("numa_saturated_pct", 0644, d_microd,
+				   &microd_numa_saturated_pct);
+		debugfs_create_u32("wake_affine", 0644, d_microd,
+				   &microd_wake_affine);
+	}
+#endif
+
 	return 0;
 }
 late_initcall(sched_init_debug);

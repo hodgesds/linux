@@ -215,10 +215,20 @@ static inline int dl_policy(int policy)
 	return policy == SCHED_DEADLINE;
 }
 
+#define MICROD_MAX_PRIO 8
+
+static inline int microd_policy(int policy)
+{
+	if (!IS_ENABLED(CONFIG_SCHED_CLASS_MICROD))
+		return false;
+	return policy == SCHED_MICROD;
+}
+
 static inline bool valid_policy(int policy)
 {
 	return idle_policy(policy) || fair_policy(policy) ||
-		rt_policy(policy) || dl_policy(policy);
+		rt_policy(policy) || dl_policy(policy) ||
+		microd_policy(policy);
 }
 
 static inline int task_has_idle_policy(struct task_struct *p)
@@ -918,6 +928,17 @@ struct dl_rq {
 	u64			bw_ratio;
 };
 
+#ifdef CONFIG_SCHED_CLASS_MICROD
+
+struct microd_rq {
+	struct rb_root_cached	tasks_timeline;
+	unsigned int		nr_running;
+	u64			min_vruntime;
+	unsigned long		load_weight;
+};
+
+#endif /* CONFIG_SCHED_CLASS_MICROD */
+
 #ifdef CONFIG_FAIR_GROUP_SCHED
 
 /* An entity is a task if it doesn't "own" a runqueue */
@@ -1176,6 +1197,9 @@ struct rq {
 #ifdef CONFIG_SCHED_CLASS_EXT
 	struct scx_rq		scx;
 	struct sched_dl_entity	ext_server;
+#endif
+#ifdef CONFIG_SCHED_CLASS_MICROD
+	struct microd_rq	microd;
 #endif
 
 	struct sched_dl_entity	fair_server;
@@ -2718,6 +2742,12 @@ extern const struct sched_class rt_sched_class;
 extern const struct sched_class fair_sched_class;
 extern const struct sched_class idle_sched_class;
 
+#ifdef CONFIG_SCHED_CLASS_MICROD
+extern const struct sched_class microd_sched_class;
+extern void init_microd_rq(struct microd_rq *microd_rq);
+extern void init_sched_microd_class(void);
+#endif
+
 /*
  * Iterate only active classes. SCX can take over all fair tasks or be
  * completely disabled. If the former, skip fair. If the latter, skip SCX.
@@ -2778,6 +2808,27 @@ static inline bool sched_fair_runnable(struct rq *rq)
 {
 	return rq->cfs.nr_queued > 0;
 }
+
+#ifdef CONFIG_SCHED_CLASS_MICROD
+static inline bool sched_microd_runnable(struct rq *rq)
+{
+	return rq->microd.nr_running > 0;
+}
+
+/* debugfs-tunable load balancer parameters (defined in microd.c) */
+extern unsigned int microd_latency_ns;
+extern unsigned int microd_min_granularity_ns;
+extern unsigned int microd_cache_hot_ns;
+extern unsigned int microd_numa_imbalance_min;
+extern unsigned int microd_migration_cooldown_ns;
+extern unsigned int microd_numa_saturated_pct;
+extern unsigned int microd_wake_affine;
+#else
+static inline bool sched_microd_runnable(struct rq *rq)
+{
+	return false;
+}
+#endif
 
 extern struct task_struct *pick_next_task_fair(struct rq *rq, struct task_struct *prev,
 					       struct rq_flags *rf);

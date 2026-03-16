@@ -57,6 +57,10 @@
 #include "cputime.c"
 #include "deadline.c"
 
+#ifdef CONFIG_SCHED_CLASS_MICROD
+# include "microd.c"
+#endif
+
 #ifdef CONFIG_SCHED_CLASS_EXT
 # include "ext_internal.h"
 # include "ext.c"
