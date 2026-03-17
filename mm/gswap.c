@@ -737,7 +737,6 @@ static void gswap_comp_ctx_put(struct gswap_crypto_ctx *ctx)
 }
 
 /*********************************
-
 * entry management
 **********************************/
 
@@ -755,7 +754,6 @@ static void gswap_entry_free(struct gswap_entry *entry)
 }
 
 /*********************************
-
 * writeback (VRAM -> disk swap)
 **********************************/
 
@@ -1075,7 +1073,6 @@ static void gswap_drain_pool(void)
 }
 
 /*********************************
-/*********************************
 * main API
 **********************************/
 
@@ -1235,11 +1232,123 @@ check_old:
 	return false;
 }
 
+/*********************************
+* readahead cache
+**********************************/
+
+/**
+ * gswap_ra_fill() - prefetch compressed data for upcoming offsets
+ * @ra: per-CPU readahead cache
+ * @type: swap type
+ * @offset: current page offset (fills offset+1 .. offset+window)
+ *
+ * Reads compressed data from VRAM for the next several swap offsets
+ * into the readahead buffer. Only entries present in the xarray are
+ * cached; gaps are skipped.
+ */
+static void gswap_ra_fill(struct gswap_ra_cache *ra, int type, pgoff_t offset)
+{
+	unsigned int window = min_t(unsigned int, ra->window, GSWAP_RA_SIZE);
+	unsigned int i;
+	u32 buf_off = 0;
+
+	ra->count = 0;
+
+	if (!window)
+		return;
+
+	for (i = 0; i < window; i++) {
+		pgoff_t ra_offset = offset + 1 + i;
+		unsigned int tree_idx = ra_offset >> GSWAP_ADDRESS_SPACE_SHIFT;
+		struct xarray *tree;
+		struct gswap_entry *gentry;
+		unsigned long vram_off;
+		u32 length;
+
+		if (tree_idx >= nr_gswap_trees[type])
+			break;
+
+		tree = &gswap_trees[type][tree_idx];
+
+		/*
+		 * Hold xa_lock while reading entry fields to prevent
+		 * concurrent gswap_invalidate/writeback from freeing
+		 * the entry between xa_load and field access.
+		 */
+		xa_lock(tree);
+		gentry = xa_load(tree, ra_offset);
+		if (!gentry) {
+			xa_unlock(tree);
+			continue;
+		}
+		vram_off = gentry->vram_offset;
+		length = gentry->length;
+		xa_unlock(tree);
+
+		if (buf_off + ALIGN(length, 16) > GSWAP_RA_BUF_SIZE)
+			break;
+
+		gswap_read_from_vram(vram_off,
+				     ra->buf + buf_off, length);
+
+		ra->entries[ra->count].offset = ra_offset;
+		ra->entries[ra->count].swp_type = type;
+		ra->entries[ra->count].gentry = gentry;
+		ra->entries[ra->count].length = length;
+		ra->entries[ra->count].buf_offset = buf_off;
+
+		buf_off += length;
+		ra->count++;
+	}
+}
+
+/**
+ * gswap_ra_lookup() - check if a page's compressed data is in the RA cache
+ * @ra: per-CPU readahead cache
+ * @type: swap type
+ * @offset: swap offset to look up
+ * @dst: destination buffer for compressed data
+ * @lenp: output — compressed data length
+ *
+ * Validates the cached pointer against the current xarray state to
+ * handle races with writeback.
+ *
+ * Return: true if cache hit (data copied to dst), false on miss.
+ */
+static bool gswap_ra_lookup(struct gswap_ra_cache *ra, int type,
+			     pgoff_t offset, void *dst, u32 *lenp)
+{
+	int i;
+
+	for (i = 0; i < ra->count; i++) {
+		struct gswap_ra_entry *rae = &ra->entries[i];
+		struct xarray *tree;
+
+		if (rae->swp_type != type || rae->offset != offset)
+			continue;
+
+		/* Validate: entry must still be in xarray (writeback race) */
+		tree = &gswap_trees[type][offset >> GSWAP_ADDRESS_SPACE_SHIFT];
+		if (xa_load(tree, offset) != rae->gentry)
+			return false;
+
+		memcpy(dst, ra->buf + rae->buf_offset, rae->length);
+		*lenp = rae->length;
+		return true;
+	}
+
+	return false;
+}
+
 /**
  * gswap_load_page() - decompress a single page from VRAM into the folio
  * @folio: target folio
  * @page_index: page index within the folio
  * @entry: gswap entry containing VRAM location and compressed length
+ *
+ * Uses the per-CPU readahead cache to avoid redundant VRAM reads for
+ * sequential access patterns. On a cache miss, reads from VRAM and
+ * prefetches the next several entries.
  *
  * Return: 0 on success, -EIO on decompression failure.
  */
@@ -1250,15 +1359,63 @@ static int gswap_load_page(struct folio *folio, long page_index,
 	struct scatterlist input, output;
 	int ret;
 	unsigned int dlen;
+	u32 cached_len;
+	int type = swp_type(entry->swpentry);
+	pgoff_t offset = swp_offset(entry->swpentry);
 
 	ctx = gswap_comp_ctx_get();
-	gswap_read_from_vram(entry->vram_offset, ctx->buffer, entry->length);
 
-	sg_init_one(&input, ctx->buffer, entry->length);
+	if (gswap_ra_size &&
+	    gswap_ra_lookup(&ctx->ra, type, offset, ctx->buffer, &cached_len)) {
+		atomic_long_inc(&gswap_ra_hits);
+		ctx->ra.hits++;
+	} else {
+		atomic_long_inc(&gswap_ra_misses);
+		gswap_read_from_vram(entry->vram_offset, ctx->buffer,
+				     entry->length);
+		cached_len = entry->length;
+
+		/*
+		 * Only fill readahead when the access looks sequential --
+		 * random loads would waste PCIe bandwidth reading entries
+		 * that are never consumed.
+		 */
+		if (gswap_ra_size &&
+		    offset == ctx->ra.last_offset + 1)
+			gswap_ra_fill(&ctx->ra, type, offset);
+		else if (gswap_ra_size)
+			atomic_long_inc(&gswap_ra_skips);
+	}
+
+	ctx->ra.last_offset = offset;
+
+	/*
+	 * Adaptive window: every 64 accesses, adjust the window based
+	 * on hit rate.  Shrink toward 1 when hits are rare, grow back
+	 * toward gswap_ra_size when readahead is effective.
+	 */
+	if (gswap_ra_size && ++ctx->ra.accesses >= 64) {
+		unsigned int max_win = min_t(unsigned int,
+					     gswap_ra_size, GSWAP_RA_SIZE);
+
+		if (ctx->ra.hits >= 48)
+			ctx->ra.window = max_win;
+		else if (ctx->ra.hits >= 32)
+			ctx->ra.window = max(max_win / 2, 1U);
+		else if (ctx->ra.hits >= 16)
+			ctx->ra.window = max(max_win / 4, 1U);
+		else
+			ctx->ra.window = 1;
+
+		ctx->ra.hits = 0;
+		ctx->ra.accesses = 0;
+	}
+
+	sg_init_one(&input, ctx->buffer, cached_len);
 	sg_init_table(&output, 1);
 	sg_set_page(&output, folio_page(folio, page_index), PAGE_SIZE, 0);
 	acomp_request_set_params(ctx->req, &input, &output,
-				 entry->length, PAGE_SIZE);
+				 cached_len, PAGE_SIZE);
 
 	ret = crypto_wait_req(crypto_acomp_decompress(ctx->req), &ctx->wait);
 	dlen = ctx->req->dlen;
@@ -1268,8 +1425,8 @@ static int gswap_load_page(struct folio *folio, long page_index,
 		atomic_long_inc(&gswap_decompress_fail);
 		pr_alert_ratelimited(
 			"Decompression error from gswap (%d:%lu %s %u->%u)\n",
-			swp_type(entry->swpentry), swp_offset(entry->swpentry),
-			gswap_compressor, entry->length, dlen);
+			type, offset,
+			gswap_compressor, cached_len, dlen);
 		return -EIO;
 	}
 
@@ -1519,7 +1676,6 @@ void gswap_swapoff(int type)
 }
 
 /*********************************
-
 * VRAM pool setup
 **********************************/
 
@@ -1753,7 +1909,6 @@ static void gswap_pool_destroy(void)
 }
 
 /*********************************
-
 * GPU/VRAM discovery
 **********************************/
 
@@ -1849,6 +2004,7 @@ static int gswap_find_gpu_vram(resource_size_t *base, unsigned long *size,
 static int gswap_debugfs_init(void);
 static void gswap_debugfs_exit(void);
 
+/*********************************
 * DRM client VRAM allocation
 *
 * When CONFIG_DRM is enabled, gswap allocates VRAM through the GPU
@@ -2201,7 +2357,6 @@ static int gswap_pci_notifier_fn(struct notifier_block *nb,
 #endif /* CONFIG_DRM */
 
 /*********************************
-
 * debugfs
 **********************************/
 
@@ -2315,9 +2470,6 @@ static void gswap_debugfs_exit(void) {}
 #endif
 
 /*********************************
-
-static void gswap_debugfs_exit(void) {}
-
 * module init and exit
 **********************************/
 
