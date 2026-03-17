@@ -1520,12 +1520,543 @@ void gswap_swapoff(int type)
 
 /*********************************
 
-static int __init gswap_init(void)
+* VRAM pool setup
+**********************************/
+
+/*
+ * Set up buddy free bitmaps for @nr_blocks min-size blocks.
+ * Marks all space as free, starting from the highest order.
+ */
+static int gswap_buddy_init(unsigned long nr_blocks)
 {
-	gswap_entry_cache = KMEM_CACHE(gswap_entry, 0);
-	if (!gswap_entry_cache)
+	unsigned long bitmap_bits;
+	unsigned long remaining, block_offset;
+	int i, order;
+
+	for (i = 0; i < GSWAP_NR_ORDERS; i++) {
+		bitmap_bits = nr_blocks >> i;
+		if (!bitmap_bits)
+			bitmap_bits = 1;
+		gswap_pool.free[i] = kvzalloc(
+			BITS_TO_LONGS(bitmap_bits) * sizeof(unsigned long),
+			GFP_KERNEL);
+		if (!gswap_pool.free[i])
+			goto err;
+	}
+
+	/*
+	 * Mark all blocks as free.  Process from highest to lowest
+	 * order so that the pool starts fully coalesced.  Works because
+	 * the space is contiguous starting at offset 0.
+	 */
+	remaining = nr_blocks;
+	block_offset = 0;
+	for (order = GSWAP_NR_ORDERS - 1; order > 0; order--) {
+		unsigned long order_blocks = 1UL << order;
+
+		while (remaining >= order_blocks) {
+			set_bit(block_offset >> order,
+				gswap_pool.free[order]);
+			gswap_pool.nr_free[order]++;
+			block_offset += order_blocks;
+			remaining -= order_blocks;
+		}
+	}
+	while (remaining > 0) {
+		set_bit(block_offset, gswap_pool.free[0]);
+		gswap_pool.nr_free[0]++;
+		block_offset++;
+		remaining--;
+	}
+
+	return 0;
+
+err:
+	for (i--; i >= 0; i--)
+		kvfree(gswap_pool.free[i]);
+	return -ENOMEM;
+}
+
+/*
+ * Drain all per-CPU caches back to the global buddy.
+ * Called during pool teardown with no concurrent allocators.
+ */
+static void gswap_pcpu_drain_all(void)
+{
+	int cpu, order;
+
+	if (!gswap_pcpu_alloc)
+		return;
+
+	for_each_possible_cpu(cpu) {
+		struct gswap_pcpu_cache *cache = per_cpu_ptr(gswap_pcpu_alloc,
+							     cpu);
+
+		spin_lock(&gswap_pool.lock);
+		for (order = 0; order < GSWAP_NR_ORDERS; order++) {
+			while (cache->count[order]) {
+				cache->count[order]--;
+				__buddy_free_one(
+					cache->blocks[order][cache->count[order]],
+					order);
+			}
+		}
+		spin_unlock(&gswap_pool.lock);
+	}
+}
+
+static void gswap_buddy_destroy(void)
+{
+	int i;
+
+	gswap_pcpu_drain_all();
+	free_percpu(gswap_pcpu_alloc);
+	gswap_pcpu_alloc = NULL;
+
+	for (i = 0; i < GSWAP_NR_ORDERS; i++) {
+		kvfree(gswap_pool.free[i]);
+		gswap_pool.free[i] = NULL;
+	}
+}
+
+/*
+ * Initialize the pool from a single contiguous mapping.
+ * Used by the direct-BAR path and single-buffer DRM allocations.
+ */
+static int gswap_pool_init(struct iosys_map *map, unsigned long size,
+			   unsigned long usable_size)
+{
+	unsigned long nr_blocks;
+	int ret;
+
+	if (!size || size < GSWAP_MIN_ALLOC_SIZE) {
+		pr_err("VRAM region too small: %lu bytes\n", size);
+		return -EINVAL;
+	}
+
+	nr_blocks = size >> GSWAP_MIN_ALLOC_SHIFT;
+
+	gswap_pool.maps[0] = *map;
+	gswap_pool.nr_maps = 1;
+	gswap_pool.buf_size = size;
+	gswap_pool.total_size = size;
+	gswap_pool.usable_size = usable_size;
+	gswap_pool.nr_blocks = nr_blocks;
+	spin_lock_init(&gswap_pool.lock);
+	atomic_long_set(&gswap_pool.used_bytes, 0);
+
+	ret = gswap_buddy_init(nr_blocks);
+	if (ret)
+		return ret;
+
+	gswap_pcpu_alloc = alloc_percpu(struct gswap_pcpu_cache);
+	if (!gswap_pcpu_alloc) {
+		gswap_buddy_destroy();
 		return -ENOMEM;
-	gswap_init_done = true;
+	}
+	{
+		int cpu;
+
+		for_each_possible_cpu(cpu)
+			local_lock_init(&per_cpu_ptr(gswap_pcpu_alloc, cpu)->lock);
+	}
+
+	pr_info("VRAM pool initialized: %lu MB (%lu blocks, %lu-%lu byte allocs)\n",
+		size >> 20, nr_blocks,
+		GSWAP_MIN_ALLOC_SIZE, GSWAP_MIN_ALLOC_SIZE << (GSWAP_NR_ORDERS - 1));
+	pr_info("  usable: %lu MB (%lu%% of total)\n",
+		usable_size >> 20, usable_size * 100 / size);
+
 	return 0;
 }
+
+/*
+ * Initialize the pool from multiple equal-sized mappings.
+ * Each map covers buf_size bytes; the buddy spans all of them.
+ */
+static int gswap_pool_init_multi(struct iosys_map *maps, unsigned int nr_maps,
+				 unsigned long buf_size,
+				 unsigned long total_size,
+				 unsigned long usable_size)
+{
+	unsigned long nr_blocks;
+	unsigned int i;
+	int ret;
+
+	if (!total_size || total_size < GSWAP_MIN_ALLOC_SIZE) {
+		pr_err("VRAM region too small: %lu bytes\n", total_size);
+		return -EINVAL;
+	}
+
+	nr_blocks = total_size >> GSWAP_MIN_ALLOC_SHIFT;
+
+	for (i = 0; i < nr_maps; i++)
+		gswap_pool.maps[i] = maps[i];
+	gswap_pool.nr_maps = nr_maps;
+	gswap_pool.buf_size = buf_size;
+	gswap_pool.total_size = total_size;
+	gswap_pool.usable_size = usable_size;
+	gswap_pool.nr_blocks = nr_blocks;
+	spin_lock_init(&gswap_pool.lock);
+	atomic_long_set(&gswap_pool.used_bytes, 0);
+
+	ret = gswap_buddy_init(nr_blocks);
+	if (ret)
+		return ret;
+
+	gswap_pcpu_alloc = alloc_percpu(struct gswap_pcpu_cache);
+	if (!gswap_pcpu_alloc) {
+		gswap_buddy_destroy();
+		return -ENOMEM;
+	}
+	{
+		int cpu;
+
+		for_each_possible_cpu(cpu)
+			local_lock_init(&per_cpu_ptr(gswap_pcpu_alloc, cpu)->lock);
+	}
+
+	pr_info("VRAM pool initialized: %lu MB (%lu blocks, %lu-%lu byte allocs, %u buffers)\n",
+		total_size >> 20, nr_blocks,
+		GSWAP_MIN_ALLOC_SIZE, GSWAP_MIN_ALLOC_SIZE << (GSWAP_NR_ORDERS - 1),
+		nr_maps);
+	pr_info("  usable: %lu MB (%lu%% of total)\n",
+		usable_size >> 20, usable_size * 100 / total_size);
+
+	return 0;
+}
+
+static void gswap_pool_destroy(void)
+{
+	unsigned int i;
+
+#ifdef CONFIG_DRM
+	if (gswap_drm_nr_bufs) {
+		for (i = 0; i < gswap_drm_nr_bufs; i++) {
+			drm_gem_vunmap(gswap_drm_gems[i],
+				       &gswap_pool.maps[i]);
+			drm_gem_object_put(gswap_drm_gems[i]);
+			gswap_drm_gems[i] = NULL;
+		}
+		gswap_drm_nr_bufs = 0;
+		drm_client_release(&gswap_drm_client);
+	} else
+#endif
+	if (gswap_pool.maps[0].is_iomem && gswap_pool.maps[0].vaddr_iomem) {
+		/* Direct BAR path: we own the ioremap */
+		iounmap(gswap_pool.maps[0].vaddr_iomem);
+	}
+	for (i = 0; i < gswap_pool.nr_maps; i++)
+		iosys_map_clear(&gswap_pool.maps[i]);
+	gswap_pool.nr_maps = 0;
+	gswap_buddy_destroy();
+}
+
+/*********************************
+
+* GPU/VRAM discovery
+**********************************/
+
+/*
+ * Scan PCI devices for GPUs with a usable VRAM BAR.
+ * We look for VGA-compatible controllers (class 0x0300) or
+ * 3D controllers (class 0x0302) and select the largest
+ * prefetchable BAR. A warning is emitted if the BAR is < 256MB,
+ * which may indicate ReBAR is not enabled.
+ *
+ * If gswap.device= is set, only that PCI slot is considered.
+ * Returns a reference to the best PCI device via *pdev_out
+ * (caller must pci_dev_put() when done).
+ */
+static int gswap_find_gpu_vram(resource_size_t *base, unsigned long *size,
+			       struct pci_dev **pdev_out)
+{
+	struct pci_dev *pdev = NULL, *best_pdev = NULL;
+	resource_size_t best_base = 0;
+	unsigned long best_size = 0;
+	int bar;
+
+	while ((pdev = pci_get_class(PCI_CLASS_DISPLAY_VGA << 8, pdev)) != NULL) {
+		if (!gswap_device_matches(pdev))
+			continue;
+		for (bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
+			unsigned long flags = pci_resource_flags(pdev, bar);
+			resource_size_t bar_start = pci_resource_start(pdev, bar);
+			unsigned long bar_size = pci_resource_len(pdev, bar);
+
+			if (!(flags & IORESOURCE_MEM))
+				continue;
+			if (flags & IORESOURCE_IO)
+				continue;
+			/* Look for the largest prefetchable BAR (VRAM) */
+			if (!(flags & IORESOURCE_PREFETCH))
+				continue;
+			if (bar_size > best_size) {
+				best_base = bar_start;
+				best_size = bar_size;
+				if (best_pdev)
+					pci_dev_put(best_pdev);
+				best_pdev = pci_dev_get(pdev);
+			}
+		}
+	}
+
+	/* Also check 3D controllers (e.g. NVIDIA compute GPUs) */
+	pdev = NULL;
+	while ((pdev = pci_get_class(PCI_CLASS_DISPLAY_3D << 8, pdev)) != NULL) {
+		if (!gswap_device_matches(pdev))
+			continue;
+		for (bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
+			unsigned long flags = pci_resource_flags(pdev, bar);
+			resource_size_t bar_start = pci_resource_start(pdev, bar);
+			unsigned long bar_size = pci_resource_len(pdev, bar);
+
+			if (!(flags & IORESOURCE_MEM))
+				continue;
+			if (flags & IORESOURCE_IO)
+				continue;
+			if (!(flags & IORESOURCE_PREFETCH))
+				continue;
+			if (bar_size > best_size) {
+				best_base = bar_start;
+				best_size = bar_size;
+				if (best_pdev)
+					pci_dev_put(best_pdev);
+				best_pdev = pci_dev_get(pdev);
+			}
+		}
+	}
+
+	if (!best_size) {
+		pr_info("no GPU with usable VRAM BAR found\n");
+		return -ENODEV;
+	}
+
+	*base = best_base;
+	*size = best_size;
+	*pdev_out = best_pdev;
+
+	pr_info("found GPU VRAM BAR: base=%pa size=%lu MB on %s\n",
+		&best_base, best_size >> 20, dev_name(&best_pdev->dev));
+
+	if (best_size < (256UL << 20))
+		pr_warn("VRAM BAR < 256MB, ReBAR may not be enabled\n");
+
+	return 0;
+}
+
+/* Forward declarations for DRM client callbacks */
+static int gswap_debugfs_init(void);
+static void gswap_debugfs_exit(void);
+
+/*********************************
+
+/* Forward declarations for DRM client callbacks */
+static int gswap_debugfs_init(void);
+static void gswap_debugfs_exit(void);
+
+static int gswap_debugfs_init(void) { return 0; }
+static void gswap_debugfs_exit(void) {}
+
+* module init and exit
+**********************************/
+
+/*
+ * Try to ioremap a VRAM region directly and initialize the pool.
+ * Used for user-specified VRAM addresses and (with CONFIG_DRM disabled)
+ * for auto-detected PCI BARs.
+ */
+static int gswap_pool_init_bar(resource_size_t phys_base, unsigned long size)
+{
+	struct iosys_map map;
+	void __iomem *vaddr;
+	int ret;
+
+	vaddr = ioremap_wc(phys_base, size);
+	if (!vaddr) {
+		pr_err("failed to ioremap VRAM at %pa size %lu\n",
+		       &phys_base, size);
+		return -ENOMEM;
+	}
+
+	iosys_map_set_vaddr_iomem(&map, vaddr);
+	ret = gswap_pool_init(&map, size,
+			      size * gswap_max_pool_percent / 100);
+	if (ret) {
+		iounmap(vaddr);
+		return ret;
+	}
+
+	return 0;
+}
+
+static int __init gswap_init(void)
+{
+	bool pool_ready = false;
+	int ret, cpu;
+
+	pr_info("initializing gswap\n");
+
+	/* Create entry cache */
+	gswap_entry_cache = KMEM_CACHE(gswap_entry, 0);
+	if (!gswap_entry_cache) {
+		pr_err("entry cache creation failed\n");
+		return -ENOMEM;
+	}
+
+	/* Set up per-CPU compression contexts */
+	gswap_comp_ctx = alloc_percpu(struct gswap_crypto_ctx);
+	if (!gswap_comp_ctx) {
+		pr_err("percpu alloc failed\n");
+		ret = -ENOMEM;
+		goto fail_cache;
+	}
+
+	for_each_possible_cpu(cpu)
+		mutex_init(&per_cpu_ptr(gswap_comp_ctx, cpu)->mutex);
+
+	/*
+	 * Register CPU hotplug callbacks to prepare/destroy compression
+	 * contexts as CPUs come online/go offline. This also prepares
+	 * contexts for all currently online CPUs via the startup callback.
+	 */
+	ret = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN,
+				"mm/gswap:online",
+				gswap_cpu_comp_prepare,
+				gswap_cpu_comp_destroy);
+	if (ret < 0) {
+		pr_err("CPU hotplug registration failed: %d\n", ret);
+		goto fail_percpu;
+	}
+	gswap_hp_state = ret;
+
+	/* Writeback workqueue */
+	gswap_writeback_wq = alloc_workqueue("gswap-writeback",
+					     WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
+	if (!gswap_writeback_wq) {
+		ret = -ENOMEM;
+		goto fail_hp;
+	}
+	INIT_DELAYED_WORK(&gswap_writeback_work, gswap_writeback_worker);
+
+	/* Active reference for safe teardown */
+	init_completion(&gswap_active_ref_done);
+	ret = percpu_ref_init(&gswap_active_ref,
+			      gswap_active_ref_release,
+			      0, GFP_KERNEL);
+	if (ret) {
+		pr_err("percpu_ref_init failed: %d\n", ret);
+		goto fail_wq;
+	}
+
+	if (gswap_debugfs_init())
+		pr_warn("debugfs initialization failed\n");
+
+	/*
+	 * VRAM pool setup. Three methods are tried in order:
+	 *
+	 * 1. DRM client (CONFIG_DRM): Allocates VRAM through the GPU
+	 *    driver's memory manager, ensuring safe coexistence. A PCI
+	 *    bus notifier handles the case where the GPU driver loads
+	 *    after gswap.
+	 *
+	 * 2. User-specified VRAM: Manual vram_base/vram_size params.
+	 *    User is responsible for avoiding GPU driver conflicts.
+	 *
+	 * 3. Direct BAR scan (!CONFIG_DRM only): Auto-detects the GPU
+	 *    VRAM BAR and maps it directly. WARNING: this does not
+	 *    coordinate with the GPU driver and may cause data
+	 *    corruption if both write to the same VRAM regions.
+	 */
+
+#ifdef CONFIG_DRM
+	/* Method 1: DRM client -- safe coexistence with GPU driver */
+	{
+		resource_size_t bar_base;
+		unsigned long bar_size;
+		struct pci_dev *pdev = NULL;
+
+		INIT_WORK(&gswap_drm_work, gswap_drm_setup_work_fn);
+
+		ret = gswap_find_gpu_vram(&bar_base, &bar_size, &pdev);
+		if (ret == 0 && pdev) {
+			gswap_gpu_pdev = pdev;
+			ret = gswap_drm_alloc_vram(pdev);
+			if (ret == 0) {
+				pool_ready = true;
+			} else {
+				/*
+				 * GPU found but DRM not ready yet
+				 * (driver may load later as module).
+				 * Register bus notifier for deferred
+				 * setup.
+				 */
+				gswap_pci_nb.notifier_call =
+					gswap_pci_notifier_fn;
+				bus_register_notifier(&pci_bus_type,
+						      &gswap_pci_nb);
+				pr_info("GPU found, waiting for DRM driver\n");
+			}
+			pci_dev_put(pdev);
+		}
+	}
+#endif
+
+	/* Method 2: User-specified VRAM address */
+	if (!pool_ready && gswap_vram_base && gswap_vram_size) {
+		ret = gswap_pool_init_bar(gswap_vram_base, gswap_vram_size);
+		if (ret == 0) {
+			pool_ready = true;
+			pr_info("using user-specified VRAM: base=0x%lx size=%lu MB\n",
+				gswap_vram_base, gswap_vram_size >> 20);
+		}
+	}
+
+#ifndef CONFIG_DRM
+	/* Method 3: Direct BAR scan (no GPU driver coordination!) */
+	if (!pool_ready) {
+		resource_size_t vram_base;
+		unsigned long vram_size;
+		struct pci_dev *pdev = NULL;
+
+		ret = gswap_find_gpu_vram(&vram_base, &vram_size, &pdev);
+		if (ret == 0) {
+			pr_warn("using direct BAR mapping without GPU driver coordination\n");
+			pr_warn("enable CONFIG_DRM for safe coexistence\n");
+			ret = gswap_pool_init_bar(vram_base, vram_size);
+			if (ret == 0)
+				pool_ready = true;
+			pci_dev_put(pdev);
+		}
+	}
+#endif
+
+	gswap_init_done = true;
+
+	if (pool_ready) {
+		gswap_has_pool = true;
+		pr_info("initialized with compressor=%s buddy_alloc=%lu-%lu bytes\n",
+			gswap_compressor,
+			GSWAP_MIN_ALLOC_SIZE,
+			GSWAP_MIN_ALLOC_SIZE << (GSWAP_NR_ORDERS - 1));
+	} else {
+		pr_info("no VRAM pool yet, gswap inactive\n");
+	}
+
+	return 0;
+
+fail_wq:
+	destroy_workqueue(gswap_writeback_wq);
+	gswap_writeback_wq = NULL;
+fail_hp:
+	cpuhp_remove_state(gswap_hp_state);
+fail_percpu:
+	free_percpu(gswap_comp_ctx);
+	gswap_comp_ctx = NULL;
+fail_cache:
+	kmem_cache_destroy(gswap_entry_cache);
+	gswap_entry_cache = NULL;
+	return ret;
+}
+
 late_initcall(gswap_init);
