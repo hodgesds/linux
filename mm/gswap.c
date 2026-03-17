@@ -1076,14 +1076,449 @@ static void gswap_drain_pool(void)
 
 /*********************************
 /*********************************
-* main API (stubs, wired up by subsequent patches)
+* main API
 **********************************/
 
-bool gswap_store(struct folio *folio) { return false; }
-int gswap_load(struct folio *folio) { return -ENOENT; }
-void gswap_invalidate(swp_entry_t swp) {}
-int gswap_swapon(int type, unsigned long nr_pages, unsigned long flags) { return 0; }
-void gswap_swapoff(int type) {}
+static bool gswap_store_page(struct page *page)
+{
+	swp_entry_t page_swpentry = page_swap_entry(page);
+	struct gswap_crypto_ctx *ctx;
+	struct gswap_entry *entry, *old;
+	struct scatterlist input, output;
+	unsigned int dlen = PAGE_SIZE;
+	long slot;
+	int comp_ret;
+
+	entry = gswap_entry_cache_alloc(GFP_KERNEL, page_to_nid(page));
+	if (!entry) {
+		atomic_long_inc(&gswap_reject_kmemcache_fail);
+		return false;
+	}
+
+	/* Compress the page */
+	ctx = gswap_comp_ctx_get();
+
+	sg_init_table(&input, 1);
+	sg_set_page(&input, page, PAGE_SIZE, 0);
+	sg_init_one(&output, ctx->buffer, PAGE_SIZE);
+	acomp_request_set_params(ctx->req, &input, &output, PAGE_SIZE, dlen);
+
+	comp_ret = crypto_wait_req(crypto_acomp_compress(ctx->req), &ctx->wait);
+	dlen = ctx->req->dlen;
+
+	if (comp_ret || !dlen) {
+		atomic_long_inc(&gswap_reject_compress_fail);
+		goto fail_unlock;
+	}
+
+	/* Reject pages that don't compress below page size */
+	if (dlen >= PAGE_SIZE) {
+		atomic_long_inc(&gswap_reject_compress_poor);
+		goto fail_unlock;
+	}
+
+	/* Allocate VRAM space for the compressed data */
+	slot = gswap_alloc_vram(dlen);
+	if (slot < 0) {
+		atomic_long_inc(&gswap_reject_alloc_fail);
+		goto fail_unlock;
+	}
+
+	/* Write compressed data to VRAM */
+	gswap_write_to_vram(slot, ctx->buffer, dlen);
+
+	gswap_comp_ctx_put(ctx);
+
+	/* Set up the entry */
+	entry->swpentry = page_swpentry;
+	entry->vram_offset = slot;
+	entry->length = dlen;
+	INIT_LIST_HEAD(&entry->lru);
+
+	/* Insert into xarray */
+	old = xa_store(swap_gswap_tree(page_swpentry),
+		       swp_offset(page_swpentry),
+		       entry, GFP_KERNEL);
+	if (xa_is_err(old)) {
+		atomic_long_inc(&gswap_reject_alloc_fail);
+		gswap_free_vram(slot, dlen);
+		gswap_entry_cache_free(entry);
+		return false;
+	}
+	if (old)
+		gswap_entry_free(old);
+
+	/* Add to LRU */
+	spin_lock(&gswap_lru_lock);
+	list_add(&entry->lru, &gswap_lru_list);
+	spin_unlock(&gswap_lru_lock);
+
+	atomic_long_inc(&gswap_stored_pages);
+	atomic_long_inc(&gswap_stores);
+
+	return true;
+
+fail_unlock:
+	gswap_comp_ctx_put(ctx);
+	gswap_entry_cache_free(entry);
+	return false;
+}
+
+bool gswap_store(struct folio *folio)
+{
+	long nr_pages = folio_nr_pages(folio);
+	swp_entry_t swp = folio->swap;
+	long index;
+	int limit;
+
+	VM_WARN_ON_ONCE(!folio_test_locked(folio));
+	VM_WARN_ON_ONCE(!folio_test_swapcache(folio));
+
+	if (!gswap_enabled || !gswap_has_pool)
+		goto check_old;
+
+	if (!gswap_trees[swp_type(swp)])
+		goto check_old;
+
+	if (!percpu_ref_tryget(&gswap_active_ref))
+		goto check_old;
+
+	if (iosys_map_is_null(&gswap_pool.maps[0])) {
+		percpu_ref_put(&gswap_active_ref);
+		goto check_old;
+	}
+
+	limit = gswap_check_limits();
+	if (limit == 2) {
+		percpu_ref_put(&gswap_active_ref);
+		goto check_old;
+	}
+
+	for (index = 0; index < nr_pages; ++index) {
+		struct page *page = folio_page(folio, index);
+
+		if (!gswap_store_page(page)) {
+			percpu_ref_put(&gswap_active_ref);
+			goto check_old;
+		}
+	}
+
+	/* Above high watermark -- start draining to make room */
+	if (limit == 1 && gswap_writeback_wq)
+		mod_delayed_work(gswap_writeback_wq, &gswap_writeback_work, 0);
+
+	percpu_ref_put(&gswap_active_ref);
+	return true;
+
+check_old:
+	/*
+	 * If store fails, invalidate any stale entries at these offsets
+	 * to prevent stale data being returned on future loads.
+	 */
+	if (gswap_has_pool && gswap_trees[swp_type(swp)]) {
+		unsigned int type = swp_type(swp);
+		pgoff_t offset = swp_offset(swp);
+		struct gswap_entry *entry;
+		struct xarray *tree;
+
+		for (index = 0; index < nr_pages; ++index) {
+			tree = swap_gswap_tree(swp_entry(type, offset + index));
+			entry = xa_erase(tree, offset + index);
+			if (entry)
+				gswap_entry_free(entry);
+		}
+	}
+
+	if (READ_ONCE(gswap_pool_reached_full) && gswap_writeback_wq)
+		mod_delayed_work(gswap_writeback_wq, &gswap_writeback_work, 0);
+
+	return false;
+}
+
+/**
+ * gswap_load_page() - decompress a single page from VRAM into the folio
+ * @folio: target folio
+ * @page_index: page index within the folio
+ * @entry: gswap entry containing VRAM location and compressed length
+ *
+ * Return: 0 on success, -EIO on decompression failure.
+ */
+static int gswap_load_page(struct folio *folio, long page_index,
+			    struct gswap_entry *entry)
+{
+	struct gswap_crypto_ctx *ctx;
+	struct scatterlist input, output;
+	int ret;
+	unsigned int dlen;
+
+	ctx = gswap_comp_ctx_get();
+	gswap_read_from_vram(entry->vram_offset, ctx->buffer, entry->length);
+
+	sg_init_one(&input, ctx->buffer, entry->length);
+	sg_init_table(&output, 1);
+	sg_set_page(&output, folio_page(folio, page_index), PAGE_SIZE, 0);
+	acomp_request_set_params(ctx->req, &input, &output,
+				 entry->length, PAGE_SIZE);
+
+	ret = crypto_wait_req(crypto_acomp_decompress(ctx->req), &ctx->wait);
+	dlen = ctx->req->dlen;
+	gswap_comp_ctx_put(ctx);
+
+	if (ret || dlen != PAGE_SIZE) {
+		atomic_long_inc(&gswap_decompress_fail);
+		pr_alert_ratelimited(
+			"Decompression error from gswap (%d:%lu %s %u->%u)\n",
+			swp_type(entry->swpentry), swp_offset(entry->swpentry),
+			gswap_compressor, entry->length, dlen);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+/**
+ * gswap_read_swap_page() - read a single page from the swap device
+ * @folio: target folio
+ * @page_index: page index within the folio to read into
+ * @swp: swap entry identifying the page on the swap device
+ *
+ * Reads a single page from the underlying swap block device.  Used to
+ * fill in pages that the writeback worker already persisted to disk
+ * when loading a large folio with partial gswap presence.
+ *
+ * Return: 0 on success, negative error on failure.
+ */
+static int gswap_read_swap_page(struct folio *folio, long page_index,
+				swp_entry_t swp)
+{
+	struct swap_info_struct *sis;
+	struct bio_vec bv;
+	struct bio bio;
+	int ret;
+
+	sis = get_swap_device(swp);
+	if (!sis)
+		return -ENODEV;
+
+	if (sis->flags & SWP_FS_OPS) {
+		put_swap_device(sis);
+		return -EOPNOTSUPP;
+	}
+
+	bio_init(&bio, sis->bdev, &bv, 1, REQ_OP_READ);
+	bio.bi_iter.bi_sector = swap_entry_sector(swp);
+	__bio_add_page(&bio, folio_page(folio, page_index), PAGE_SIZE, 0);
+	ret = submit_bio_wait(&bio);
+	bio_uninit(&bio);
+	put_swap_device(sis);
+
+	return ret;
+}
+
+/**
+ * gswap_load() - load a folio from gswap VRAM cache
+ * @folio: folio to load
+ *
+ * For large folios, each page is stored independently by gswap_store().
+ * The writeback worker can evict individual pages to disk, creating a
+ * partial set.  This function handles partial presence: pages still in
+ * gswap are decompressed from VRAM, while pages already written back
+ * are read directly from the swap device via bio.
+ *
+ * Only swapcache folios are handled.  The folio lock prevents
+ * concurrent writeback from modifying entries between the presence
+ * scan and the erase: writeback's swap_cache_alloc_folio() would
+ * find this folio already in the cache and bail out with -EEXIST.
+ * Non-swapcache loads (SWP_SYNCHRONOUS_IO) are rejected because
+ * the writeback worker could concurrently free entries while we
+ * read them.
+ *
+ * Return: 0 on success (folio unlocked, marked uptodate),
+ *         -EIO on decompression/IO failure (folio unlocked, NOT uptodate),
+ *         -ENOENT if not found in gswap (folio remains locked).
+ */
+int gswap_load(struct folio *folio)
+{
+	swp_entry_t swp = folio->swap;
+	pgoff_t offset = swp_offset(swp);
+	long nr_pages = folio_nr_pages(folio);
+	struct xarray *tree;
+	struct gswap_entry *entry;
+	long index;
+	long nr_present = 0;
+
+	VM_WARN_ON_ONCE(!folio_test_locked(folio));
+
+	if (!gswap_has_pool)
+		return -ENOENT;
+
+	/*
+	 * Only handle swapcache loads.  For non-swapcache faults
+	 * (SWP_SYNCHRONOUS_IO), the folio is not in the swap cache,
+	 * so the writeback worker can concurrently xa_cmpxchg and
+	 * free entries while we read them — use-after-free.
+	 * Swapcache loads are safe because swap cache occupancy
+	 * blocks the writeback worker's swap_cache_alloc_folio().
+	 */
+	if (!folio_test_swapcache(folio))
+		return -ENOENT;
+
+	if (!percpu_ref_tryget(&gswap_active_ref))
+		return -ENOENT;
+
+	if (!gswap_trees[swp_type(swp)]) {
+		percpu_ref_put(&gswap_active_ref);
+		return -ENOENT;
+	}
+
+	/*
+	 * Phase 1: Count pages present in gswap.
+	 *
+	 * If none are present, return -ENOENT so the caller reads the
+	 * entire folio from disk normally.  If some are present, we
+	 * proceed to phase 2 where gswap pages are decompressed and
+	 * missing pages are read from the swap device.
+	 */
+	for (index = 0; index < nr_pages; index++) {
+		tree = swap_gswap_tree(swp_entry(swp_type(swp),
+						  offset + index));
+		if (xa_load(tree, offset + index))
+			nr_present++;
+	}
+
+	if (nr_present == 0) {
+		percpu_ref_put(&gswap_active_ref);
+		return -ENOENT;
+	}
+
+	/*
+	 * Phase 2: Load each page.
+	 *
+	 * Pages present in gswap are decompressed from VRAM.  Pages
+	 * evicted by the writeback worker (missing from gswap) have
+	 * already been persisted to the swap device, so we read them
+	 * back via a synchronous bio.
+	 *
+	 * Use xa_load (not xa_erase) during decompression so that
+	 * entries remain in the xarray.  If any page fails to load,
+	 * the entries are still valid and the folio can be retried
+	 * without data loss.  Entries are erased and freed only after
+	 * all pages are successfully loaded.
+	 */
+	for (index = 0; index < nr_pages; index++) {
+		swp_entry_t page_swp = swp_entry(swp_type(swp),
+						  offset + index);
+
+		tree = swap_gswap_tree(page_swp);
+		entry = xa_load(tree, offset + index);
+
+		if (entry) {
+			if (gswap_load_page(folio, index, entry)) {
+				percpu_ref_put(&gswap_active_ref);
+				folio_unlock(folio);
+				return -EIO;
+			}
+		} else {
+			/*
+			 * Page written back to disk -- read it via bio.
+			 * This path is only reachable for large folios
+			 * with partial gswap presence.
+			 */
+			if (gswap_read_swap_page(folio, index, page_swp)) {
+				percpu_ref_put(&gswap_active_ref);
+				folio_unlock(folio);
+				return -EIO;
+			}
+		}
+	}
+
+	/*
+	 * All pages loaded successfully.  Erase entries and free
+	 * VRAM slots to transfer data ownership to the folio.
+	 */
+	for (index = 0; index < nr_pages; index++) {
+		tree = swap_gswap_tree(swp_entry(swp_type(swp),
+						  offset + index));
+		entry = xa_erase(tree, offset + index);
+		if (entry)
+			gswap_entry_free(entry);
+	}
+
+	folio_mark_uptodate(folio);
+	atomic_long_inc(&gswap_loads);
+	folio_mark_dirty(folio);
+
+	percpu_ref_put(&gswap_active_ref);
+	folio_unlock(folio);
+	return 0;
+}
+
+void gswap_invalidate(swp_entry_t swp)
+{
+	pgoff_t offset = swp_offset(swp);
+	struct xarray *tree;
+	struct gswap_entry *entry;
+
+	if (!gswap_init_done || !gswap_trees[swp_type(swp)])
+		return;
+
+	tree = swap_gswap_tree(swp);
+	if (xa_empty(tree))
+		return;
+
+	entry = xa_erase(tree, offset);
+	if (entry)
+		gswap_entry_free(entry);
+}
+
+int gswap_swapon(int type, unsigned long nr_pages, unsigned long flags)
+{
+	struct xarray *trees, *tree;
+	unsigned int nr, i;
+
+	if (!gswap_has_pool)
+		return 0;
+
+	/*
+	 * gswap_read_swap_page() uses bio directly and cannot read
+	 * from filesystem-backed swap.  Skip registration so partial
+	 * writeback on swapfiles doesn't cause permanent load failures.
+	 */
+	if (flags & SWP_FS_OPS)
+		return 0;
+
+	nr = DIV_ROUND_UP(nr_pages, GSWAP_ADDRESS_SPACE_PAGES);
+	trees = kvcalloc(nr, sizeof(*tree), GFP_KERNEL);
+	if (!trees) {
+		pr_err("alloc failed, gswap disabled for swap type %d\n", type);
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < nr; i++)
+		xa_init(trees + i);
+
+	nr_gswap_trees[type] = nr;
+	gswap_trees[type] = trees;
+	return 0;
+}
+
+void gswap_swapoff(int type)
+{
+	struct xarray *trees = gswap_trees[type];
+	unsigned int i;
+
+	if (!trees)
+		return;
+
+	for (i = 0; i < nr_gswap_trees[type]; i++)
+		WARN_ON_ONCE(!xa_empty(trees + i));
+
+	kvfree(trees);
+	nr_gswap_trees[type] = 0;
+	gswap_trees[type] = NULL;
+}
+
+/*********************************
 
 static int __init gswap_init(void)
 {
