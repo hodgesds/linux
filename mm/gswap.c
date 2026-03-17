@@ -1849,13 +1849,473 @@ static int gswap_find_gpu_vram(resource_size_t *base, unsigned long *size,
 static int gswap_debugfs_init(void);
 static void gswap_debugfs_exit(void);
 
+* DRM client VRAM allocation
+*
+* When CONFIG_DRM is enabled, gswap allocates VRAM through the GPU
+* driver's memory manager (via DRM client dumb buffers) instead of
+* directly mapping the PCI BAR. This ensures gswap's VRAM region is
+* reserved by the GPU driver's allocator (TTM) and won't be used for
+* rendering, preventing data corruption from overlapping VRAM usage.
+**********************************/
+
+#ifdef CONFIG_DRM
+
+/* Dumb buffer dimensions for VRAM allocation */
+#define GSWAP_DRM_WIDTH		4096
+#define GSWAP_DRM_BPP		8	/* bits per pixel */
+#define GSWAP_DRM_STRIDE	(GSWAP_DRM_WIDTH * (GSWAP_DRM_BPP / 8))
+
+/*
+ * Maximum size per dumb buffer.  drm_mode_create_dumb() checks
+ * height * stride <= U32_MAX, so cap each buffer accordingly.
+ */
+#define GSWAP_DRM_MAX_BUF	((unsigned long)(U32_MAX / GSWAP_DRM_STRIDE) * GSWAP_DRM_STRIDE)
+
+static void gswap_drm_unregister(struct drm_client_dev *client)
+{
+	/*
+	 * GPU driver is unloading -- disable gswap, drain the pool,
+	 * and release VRAM back to the GPU driver.
+	 */
+	gswap_enabled = false;
+
+	/*
+	 * Unregister the PCI bus notifier first so a concurrent GPU
+	 * driver bind cannot schedule gswap_drm_work and re-enable
+	 * gswap_has_pool on dead infrastructure (percpu_ref exited,
+	 * workqueue destroyed).
+	 */
+	bus_unregister_notifier(&pci_bus_type, &gswap_pci_nb);
+	cancel_work_sync(&gswap_drm_work);
+
+	if (!gswap_has_pool)
+		return;
+
+	gswap_has_pool = false;
+
+	percpu_ref_kill(&gswap_active_ref);
+	wait_for_completion(&gswap_active_ref_done);
+	percpu_ref_exit(&gswap_active_ref);
+
+	/*
+	 * Drain all stored pages back to disk before releasing VRAM.
+	 * gswap_store() returns true to swap_writeout() which skips
+	 * disk I/O, so the only copy of page data lives in VRAM.
+	 * Without a full drain, those pages would be silently lost.
+	 */
+	gswap_drain_pool();
+
+	if (gswap_writeback_wq) {
+		cancel_delayed_work_sync(&gswap_writeback_work);
+		destroy_workqueue(gswap_writeback_wq);
+		gswap_writeback_wq = NULL;
+	}
+
+	/*
+	 * Don't call gswap_swapoff() here -- the normal swapoff syscall
+	 * path handles xarray cleanup, and calling it from both paths
+	 * without serialization would race on gswap_trees[].  The
+	 * xarrays were drained above so entries are empty; swapoff
+	 * will free the xarray memory when the swap device is removed.
+	 */
+
+	gswap_debugfs_exit();
+	gswap_pool_destroy();
+
+	pr_info("GPU driver unloaded, VRAM released\n");
+}
+
+static const struct drm_client_funcs gswap_drm_funcs = {
+	.owner		= THIS_MODULE,
+	.unregister	= gswap_drm_unregister,
+};
+
+/*
+ * Find the DRM device associated with a PCI GPU device by scanning
+ * the global drm_minors_xa xarray for a primary minor whose parent
+ * device matches the PCI device.
+ */
+static struct drm_device *gswap_find_drm_for_pci(struct pci_dev *pdev)
+{
+	unsigned long index;
+	struct drm_minor *minor;
+
+	xa_for_each(&drm_minors_xa, index, minor) {
+		if (minor->type == DRM_MINOR_PRIMARY &&
+		    minor->dev->dev &&
+		    minor->dev->dev == &pdev->dev)
+			return minor->dev;
+	}
+
+	return NULL;
+}
+
+static int gswap_drm_alloc_vram(struct pci_dev *pdev)
+{
+	struct drm_device *drm;
+	struct drm_gem_object *gems[GSWAP_MAX_BUFFERS];
+	struct iosys_map maps[GSWAP_MAX_BUFFERS];
+	unsigned long bar_size, alloc_size, buf_size, remaining;
+	unsigned int nr_bufs = 0;
+	int ret;
+
+	drm = gswap_find_drm_for_pci(pdev);
+	if (!drm)
+		return -ENODEV;
+
+	ret = drm_client_init(drm, &gswap_drm_client, "gswap",
+			      &gswap_drm_funcs);
+	if (ret) {
+		pr_err("DRM client init failed: %d\n", ret);
+		return ret;
+	}
+
+	/*
+	 * Allocate a portion of VRAM through the DRM dumb buffer interface.
+	 * The GPU driver's memory manager (TTM) reserves this region,
+	 * preventing the GPU from using it for rendering.
+	 *
+	 * Find the largest prefetchable BAR (VRAM) rather than assuming
+	 * BAR 0 -- this correctly picks up the full BAR size when ReBAR
+	 * is enabled.
+	 */
+	bar_size = 0;
+	for (int i = 0; i < PCI_STD_NUM_BARS; i++) {
+		unsigned long flags = pci_resource_flags(pdev, i);
+		unsigned long len = pci_resource_len(pdev, i);
+
+		if ((flags & IORESOURCE_MEM) && (flags & IORESOURCE_PREFETCH) &&
+		    !(flags & IORESOURCE_IO) && len > bar_size)
+			bar_size = len;
+	}
+	if (!bar_size) {
+		pr_err("no prefetchable VRAM BAR found on %s\n",
+		       dev_name(&pdev->dev));
+		ret = -ENODEV;
+		goto fail_client;
+	}
+	alloc_size = bar_size * gswap_max_pool_percent / 100;
+	if (alloc_size < (4UL << 20))
+		alloc_size = 4UL << 20;
+
+	/*
+	 * drm_mode_create_dumb() uses u32 arithmetic (height * stride),
+	 * limiting each buffer to ~4 GB.  Split the allocation across
+	 * multiple dumb buffers when needed.
+	 */
+	buf_size = min(alloc_size, GSWAP_DRM_MAX_BUF);
+	/* Align down to minimum allocation granularity */
+	buf_size = rounddown(buf_size, GSWAP_MIN_ALLOC_SIZE);
+
+	remaining = alloc_size;
+	while (remaining && nr_bufs < GSWAP_MAX_BUFFERS) {
+		struct drm_mode_create_dumb dumb_args = {};
+		struct drm_gem_object *obj;
+		unsigned long chunk = min(remaining, buf_size);
+		u32 height;
+
+		height = chunk / GSWAP_DRM_STRIDE;
+		if (!height)
+			break;
+		chunk = (unsigned long)height * GSWAP_DRM_STRIDE;
+
+		dumb_args.width = GSWAP_DRM_WIDTH;
+		dumb_args.height = height;
+		dumb_args.bpp = GSWAP_DRM_BPP;
+		ret = drm_mode_create_dumb(drm, &dumb_args,
+					   gswap_drm_client.file);
+		if (ret) {
+			pr_err("DRM dumb buffer %u creation failed: %d\n",
+			       nr_bufs, ret);
+			if (!nr_bufs)
+				goto fail_client;
+			break;
+		}
+
+		obj = drm_gem_object_lookup(gswap_drm_client.file,
+					    dumb_args.handle);
+		drm_mode_destroy_dumb(drm, dumb_args.handle,
+				      gswap_drm_client.file);
+		if (!obj) {
+			pr_err("DRM buffer %u GEM lookup failed\n", nr_bufs);
+			if (!nr_bufs) {
+				ret = -ENOENT;
+				goto fail_client;
+			}
+			break;
+		}
+
+		ret = drm_gem_vmap(obj, &maps[nr_bufs]);
+		if (ret) {
+			pr_err("DRM buffer %u vmap failed: %d\n", nr_bufs, ret);
+			drm_gem_object_put(obj);
+			if (!nr_bufs)
+				goto fail_client;
+			break;
+		}
+
+		gems[nr_bufs] = obj;
+		nr_bufs++;
+		remaining -= chunk;
+	}
+
+	alloc_size -= remaining;
+
+	if (nr_bufs == 1) {
+		gswap_drm_gems[0] = gems[0];
+		gswap_drm_nr_bufs = 1;
+		ret = gswap_pool_init(&maps[0], alloc_size, alloc_size);
+	} else {
+		unsigned int i;
+
+		for (i = 0; i < nr_bufs; i++)
+			gswap_drm_gems[i] = gems[i];
+		gswap_drm_nr_bufs = nr_bufs;
+		ret = gswap_pool_init_multi(maps, nr_bufs, buf_size,
+					    alloc_size, alloc_size);
+	}
+	if (ret)
+		goto fail_bufs;
+
+	drm_client_register(&gswap_drm_client);
+
+	pr_info("VRAM allocated via DRM client: %lu MB from %s (BAR: %lu MB, %u buffers)\n",
+		alloc_size >> 20, dev_name(drm->dev), bar_size >> 20, nr_bufs);
+
+	if (bar_size < (256UL << 20))
+		pr_warn("VRAM BAR < 256MB, ReBAR may not be enabled\n");
+
+	if (bar_size <= (256UL << 20) &&
+	    !strstr(saved_command_line, "pci=realloc"))
+		pr_warn("VRAM BAR only %lu MB, try pci=realloc"
+			" if ReBAR is enabled in BIOS\n",
+			bar_size >> 20);
+
+	return 0;
+
+fail_bufs:
+	while (nr_bufs--) {
+		drm_gem_vunmap(gems[nr_bufs], &maps[nr_bufs]);
+		drm_gem_object_put(gems[nr_bufs]);
+	}
+	gswap_drm_nr_bufs = 0;
+fail_client:
+	drm_client_release(&gswap_drm_client);
+	return ret;
+}
+
+/*
+ * Deferred VRAM setup: called from a work item when the GPU driver
+ * binds after gswap_init has already run.
+ */
+static void gswap_drm_setup_work_fn(struct work_struct *work)
+{
+	int ret;
+
+	if (!gswap_gpu_pdev)
+		return;
+
+	/* Already DRM-backed -- nothing to do */
+	if (gswap_has_pool && gswap_drm_nr_bufs)
+		return;
+
+	/*
+	 * Transition from direct BAR to DRM: stop stores, drain all
+	 * pages to disk, destroy the old pool, then allocate via DRM.
+	 */
+	if (gswap_has_pool) {
+		pr_info("transitioning VRAM pool from direct BAR to DRM\n");
+		gswap_has_pool = false;
+
+		percpu_ref_kill(&gswap_active_ref);
+		wait_for_completion(&gswap_active_ref_done);
+
+		gswap_drain_pool();
+		if (gswap_writeback_wq)
+			cancel_delayed_work_sync(&gswap_writeback_work);
+		gswap_pool_destroy();
+
+		/* Reinitialize percpu_ref for the new pool */
+		percpu_ref_exit(&gswap_active_ref);
+		init_completion(&gswap_active_ref_done);
+		ret = percpu_ref_init(&gswap_active_ref,
+				      gswap_active_ref_release,
+				      0, GFP_KERNEL);
+		if (ret) {
+			pr_err("percpu_ref reinit failed: %d, gswap disabled\n",
+			       ret);
+			return;
+		}
+	}
+
+	ret = gswap_drm_alloc_vram(gswap_gpu_pdev);
+	if (ret) {
+		pr_err("DRM VRAM allocation failed: %d, gswap disabled\n",
+		       ret);
+		return;
+	}
+
+	gswap_has_pool = true;
+
+	pr_info("initialized with compressor=%s buddy_alloc=%lu-%lu bytes (DRM, deferred)\n",
+		gswap_compressor,
+		GSWAP_MIN_ALLOC_SIZE, GSWAP_MIN_ALLOC_SIZE << (GSWAP_NR_ORDERS - 1));
+}
+
+/*
+ * PCI bus notifier: watch for GPU PCI devices getting a driver bound.
+ * When a VGA or 3D controller gets a driver, try DRM-based VRAM
+ * allocation. This handles the case where the GPU driver loads as a
+ * module after gswap's late_initcall.
+ */
+static int gswap_pci_notifier_fn(struct notifier_block *nb,
+				 unsigned long action, void *data)
+{
+	struct device *dev = data;
+	struct pci_dev *pdev;
+
+	if (action != BUS_NOTIFY_BOUND_DRIVER)
+		return NOTIFY_DONE;
+
+	if (!dev_is_pci(dev))
+		return NOTIFY_DONE;
+
+	pdev = to_pci_dev(dev);
+	if ((pdev->class >> 8) != PCI_CLASS_DISPLAY_VGA &&
+	    (pdev->class >> 8) != PCI_CLASS_DISPLAY_3D)
+		return NOTIFY_DONE;
+
+	if (!gswap_device_matches(pdev))
+		return NOTIFY_DONE;
+
+	/* Already DRM-backed -- nothing to do */
+	if (gswap_has_pool && gswap_drm_nr_bufs)
+		return NOTIFY_DONE;
+
+	gswap_gpu_pdev = pdev;
+	schedule_work(&gswap_drm_work);
+
+	return NOTIFY_OK;
+}
+
+#endif /* CONFIG_DRM */
+
 /*********************************
 
-/* Forward declarations for DRM client callbacks */
-static int gswap_debugfs_init(void);
-static void gswap_debugfs_exit(void);
+* debugfs
+**********************************/
 
+#ifdef CONFIG_DEBUG_FS
+static struct dentry *gswap_debugfs_root;
+
+static int debugfs_get_stored_pages(void *data, u64 *val)
+{
+	*val = atomic_long_read(&gswap_stored_pages);
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(gswap_stored_pages_fops,
+			 debugfs_get_stored_pages, NULL, "%llu\n");
+
+static int debugfs_get_pool_total_size(void *data, u64 *val)
+{
+	*val = gswap_pool.total_size;
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(gswap_pool_total_fops,
+			 debugfs_get_pool_total_size, NULL, "%llu\n");
+
+static int debugfs_get_pool_used(void *data, u64 *val)
+{
+	*val = atomic_long_read(&gswap_pool.used_bytes);
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(gswap_pool_used_fops,
+			 debugfs_get_pool_used, NULL, "%llu\n");
+
+#define GSWAP_DEBUGFS_COUNTER(name)					\
+static int debugfs_get_##name(void *data, u64 *val)			\
+{									\
+	*val = atomic_long_read(&gswap_##name);				\
+	return 0;							\
+}									\
+DEFINE_DEBUGFS_ATTRIBUTE(gswap_##name##_fops,				\
+			 debugfs_get_##name, NULL, "%llu\n")
+
+GSWAP_DEBUGFS_COUNTER(stores);
+GSWAP_DEBUGFS_COUNTER(loads);
+GSWAP_DEBUGFS_COUNTER(reject_compress_fail);
+GSWAP_DEBUGFS_COUNTER(reject_compress_poor);
+GSWAP_DEBUGFS_COUNTER(reject_alloc_fail);
+GSWAP_DEBUGFS_COUNTER(reject_kmemcache_fail);
+GSWAP_DEBUGFS_COUNTER(decompress_fail);
+GSWAP_DEBUGFS_COUNTER(pool_limit_hit);
+GSWAP_DEBUGFS_COUNTER(written_back_pages);
+GSWAP_DEBUGFS_COUNTER(ra_hits);
+GSWAP_DEBUGFS_COUNTER(ra_misses);
+GSWAP_DEBUGFS_COUNTER(ra_skips);
+
+static int gswap_debugfs_init(void)
+{
+	if (!debugfs_initialized())
+		return -ENODEV;
+
+	gswap_debugfs_root = debugfs_create_dir("gswap", NULL);
+
+	debugfs_create_file("stored_pages", 0444,
+			    gswap_debugfs_root, NULL, &gswap_stored_pages_fops);
+	debugfs_create_file("pool_total_size", 0444,
+			    gswap_debugfs_root, NULL, &gswap_pool_total_fops);
+	debugfs_create_file("pool_used_size", 0444,
+			    gswap_debugfs_root, NULL, &gswap_pool_used_fops);
+	debugfs_create_file("stores", 0444,
+			    gswap_debugfs_root, NULL, &gswap_stores_fops);
+	debugfs_create_file("loads", 0444,
+			    gswap_debugfs_root, NULL, &gswap_loads_fops);
+	debugfs_create_file("reject_compress_fail", 0444,
+			    gswap_debugfs_root, NULL,
+			    &gswap_reject_compress_fail_fops);
+	debugfs_create_file("reject_compress_poor", 0444,
+			    gswap_debugfs_root, NULL,
+			    &gswap_reject_compress_poor_fops);
+	debugfs_create_file("reject_alloc_fail", 0444,
+			    gswap_debugfs_root, NULL,
+			    &gswap_reject_alloc_fail_fops);
+	debugfs_create_file("reject_kmemcache_fail", 0444,
+			    gswap_debugfs_root, NULL,
+			    &gswap_reject_kmemcache_fail_fops);
+	debugfs_create_file("decompress_fail", 0444,
+			    gswap_debugfs_root, NULL,
+			    &gswap_decompress_fail_fops);
+	debugfs_create_file("pool_limit_hit", 0444,
+			    gswap_debugfs_root, NULL,
+			    &gswap_pool_limit_hit_fops);
+	debugfs_create_file("written_back_pages", 0444,
+			    gswap_debugfs_root, NULL,
+			    &gswap_written_back_pages_fops);
+	debugfs_create_file("ra_hits", 0444,
+			    gswap_debugfs_root, NULL,
+			    &gswap_ra_hits_fops);
+	debugfs_create_file("ra_misses", 0444,
+			    gswap_debugfs_root, NULL,
+			    &gswap_ra_misses_fops);
+	debugfs_create_file("ra_skips", 0444,
+			    gswap_debugfs_root, NULL,
+			    &gswap_ra_skips_fops);
+
+	return 0;
+}
+
+static void gswap_debugfs_exit(void)
+{
+	debugfs_remove_recursive(gswap_debugfs_root);
+}
+#else
 static int gswap_debugfs_init(void) { return 0; }
+static void gswap_debugfs_exit(void) {}
+#endif
+
+/*********************************
+
 static void gswap_debugfs_exit(void) {}
 
 * module init and exit
