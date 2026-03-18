@@ -84,7 +84,23 @@ unsigned int minlat_wake_affine = 1;
  * Track how many CPUs have >1 minlat task (overloaded).
  * Used to fast-skip idle-pull when no CPU has tasks to donate.
  */
-static atomic_t minlat_overloaded_cpus = ATOMIC_INIT(0);
+/*
+ * Check if any online CPU has 2+ minlat tasks. Uses per-rq overloaded
+ * flags — cheap READ_ONCE reads, no atomics on the enqueue/dequeue path.
+ * Tolerates stale values: worst case is one missed or unnecessary pull.
+ */
+static bool sched_minlat_any_overloaded(struct rq *this_rq)
+{
+	int cpu;
+
+	for_each_online_cpu(cpu) {
+		if (cpu == this_rq->cpu)
+			continue;
+		if (READ_ONCE(cpu_rq(cpu)->minlat.overloaded))
+			return true;
+	}
+	return false;
+}
 
 /* ---- priority/weight tables ---- */
 
@@ -555,8 +571,8 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	minlat_rq->load_weight += scale_load_down(me->load.weight);
 	add_nr_running(rq, 1);
 
-	if (minlat_rq->nr_running == 2)
-		atomic_inc(&minlat_overloaded_cpus);
+	if (minlat_rq->nr_running >= 2)
+		WRITE_ONCE(minlat_rq->overloaded, true);
 }
 
 static bool
@@ -571,11 +587,10 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 			&me->run_node);
 
 	__dequeue_minlat_entity(minlat_rq, me);
-
-	if (minlat_rq->nr_running == 2)
-		atomic_dec(&minlat_overloaded_cpus);
-
 	minlat_rq->nr_running--;
+
+	if (minlat_rq->nr_running < 2)
+		WRITE_ONCE(minlat_rq->overloaded, false);
 	minlat_rq->load_weight -= scale_load_down(me->load.weight);
 	sub_nr_running(rq, 1);
 
@@ -679,7 +694,7 @@ pick_task_minlat(struct rq *rq, struct rq_flags *rf)
 	 * Skip the pull if no CPU is overloaded — avoids expensive
 	 * cross-CPU scanning when the system is balanced.
 	 */
-	if (rf && atomic_read(&minlat_overloaded_cpus) > 0) {
+	if (rf && sched_minlat_any_overloaded(rq)) {
 		rq_unpin_lock(rq, rf);
 		pull_minlat_task(rq);
 		rq_repin_lock(rq, rf);
@@ -698,16 +713,8 @@ put_prev_task_minlat(struct rq *rq, struct task_struct *p,
 {
 	struct sched_minlat_entity *me = &p->minlat;
 
-	/*
-	 * If the task was already dequeued (blocking), we already
-	 * accounted runtime and updated min_vruntime in dequeue.
-	 * Skip the full update — just do lightweight vruntime calc
-	 * so sum_exec_runtime stays accurate for procfs.
-	 */
-	if (!me->on_rq) {
-		update_curr_minlat_vruntime(rq);
+	if (!me->on_rq)
 		return;
-	}
 
 	update_curr_minlat(rq);
 }
@@ -754,7 +761,9 @@ static void minlat_record_sleep(struct task_struct *p, struct rq *rq)
 			    run_ns) / MINLAT_INTERACTIVITY_DECAY;
 
 	me->interactive = (me->total_run_ns < MINLAT_INTERACTIVE_THRESH_NS);
-	me->last_sleep_duration = rq_clock(rq);
+	/* Use exec_start as sleep-start timestamp — already set by
+	 * the last update_curr, avoids an extra rq_clock() read. */
+	me->last_sleep_duration = p->se.exec_start;
 }
 
 /*
@@ -1300,7 +1309,7 @@ balance_minlat(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 	if (rq->minlat.nr_running > 0)
 		return 1;
 
-	if (atomic_read(&minlat_overloaded_cpus) <= 0)
+	if (!sched_minlat_any_overloaded(rq))
 		return 0;
 
 	/*

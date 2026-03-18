@@ -5935,6 +5935,42 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 	if (scx_enabled())
 		goto restart;
 
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	/*
+	 * Minlat fast path: when only minlat+CFS tasks exist and prev is
+	 * at or below minlat class, pick directly from the minlat rb-tree.
+	 * This avoids prev_balance() and iterating stop/dl/rt pick_task
+	 * callbacks, saving ~3 indirect calls per schedule.
+	 */
+	if (!sched_class_above(prev->sched_class, &minlat_sched_class) &&
+	    rq->nr_running == rq->minlat.nr_running + rq->cfs.h_nr_queued) {
+		if (rq->minlat.nr_running) {
+			struct rb_node *left;
+
+			left = rb_first_cached(&rq->minlat.tasks_timeline);
+			if (likely(left)) {
+				struct sched_minlat_entity *me;
+
+				me = rb_entry(left, struct sched_minlat_entity,
+					      run_node);
+				p = container_of(me, struct task_struct, minlat);
+				put_prev_set_next_task(rq, prev, p);
+				return p;
+			}
+		}
+
+		/* No minlat tasks — fall through to CFS */
+		p = pick_next_task_fair(rq, prev, rf);
+		if (unlikely(p == RETRY_TASK))
+			goto restart;
+		if (!p) {
+			p = pick_task_idle(rq, rf);
+			put_prev_set_next_task(rq, prev, p);
+		}
+		return p;
+	}
+#endif
+
 	/*
 	 * Optimization: we know that if all tasks are in the fair class we can
 	 * call that function directly, but only if the @prev task wasn't of a
