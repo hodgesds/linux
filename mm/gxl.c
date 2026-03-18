@@ -133,6 +133,8 @@ static int __init gxl_init(void)
 
 	/* Calculate usable size and align to memory block size */
 	blk_size = memory_block_size_bytes();
+	if (gxl_max_pool_percent > 100)
+		gxl_max_pool_percent = 100;
 	usable_size = bar_size * gxl_max_pool_percent / 100;
 	aligned_start = ALIGN(bar_start, blk_size);
 	aligned_end = ALIGN_DOWN(bar_start + usable_size, blk_size);
@@ -150,10 +152,26 @@ static int __init gxl_init(void)
 	pr_info("using %lu MB of %lu MB VRAM (aligned to %lu MB blocks)\n",
 		gxl_size >> 20, bar_size >> 20, blk_size >> 20);
 
-	/* Determine NUMA node from PCI topology */
-	gxl_numa_node = dev_to_node(&pdev->dev);
-	if (gxl_numa_node < 0)
-		gxl_numa_node = 0;
+	/*
+	 * GPU VRAM needs its own NUMA node -- we cannot share with a
+	 * DRAM node because init_node_memory_type() would reclassify
+	 * all of that node's memory (including DRAM) as GPU VRAM tier.
+	 *
+	 * Find an offline-but-possible node that add_memory_driver_managed()
+	 * will bring online.
+	 */
+	gxl_numa_node = NUMA_NO_NODE;
+	for (rc = 0; rc < MAX_NUMNODES; rc++) {
+		if (node_possible(rc) && !node_online(rc)) {
+			gxl_numa_node = rc;
+			break;
+		}
+	}
+	if (gxl_numa_node == NUMA_NO_NODE) {
+		pr_err("no available NUMA node for GPU VRAM (all possible nodes are online)\n");
+		rc = -ENOSPC;
+		goto err_put_pdev;
+	}
 
 	/* Allocate memory type and register with tiering framework */
 	gxl_mtype = alloc_memory_type(GXL_ADISTANCE);
