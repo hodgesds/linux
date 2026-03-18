@@ -122,6 +122,26 @@ config ZSWAP_COMPRESSOR_DEFAULT
        default "zstd" if ZSWAP_COMPRESSOR_DEFAULT_ZSTD
        default ""
 
+config GXL
+	bool "GPU VRAM as CXL.mem-style memory tier (gxl)"
+	depends on PCI
+	depends on MEMORY_HOTPLUG
+	depends on NUMA
+	depends on MIGRATION
+	depends on 64BIT
+	help
+	  Expose GPU VRAM (via PCI resizable BAR) as a kernel-managed
+	  memory tier.  Pages are automatically demoted from DRAM to
+	  GPU VRAM under memory pressure and promoted back based on
+	  access patterns, using the same infrastructure as CXL Type 3
+	  memory devices.
+
+	  Requires the gxl.device= kernel parameter to specify the
+	  PCI slot of the GPU (e.g. gxl.device=0000:03:00.0) and
+	  pci=realloc for resizable BAR support.
+
+	  If unsure, say N.
+
 config ZSMALLOC
 	tristate
 
