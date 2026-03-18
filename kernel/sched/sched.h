@@ -932,6 +932,7 @@ struct dl_rq {
 
 struct minlat_rq {
 	struct rb_root_cached	tasks_timeline;
+	struct sched_minlat_entity *curr;
 	unsigned int		nr_running;
 	u64			min_vruntime;
 	unsigned long		load_weight;

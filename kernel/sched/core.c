@@ -5957,6 +5957,17 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 				put_prev_set_next_task(rq, prev, p);
 				return p;
 			}
+
+			/*
+			 * Tree empty but nr_running > 0: the only minlat
+			 * task is curr (out-of-tree). Re-pick it.
+			 */
+			if (rq->minlat.curr && rq->minlat.curr->on_rq) {
+				p = container_of(rq->minlat.curr,
+						 struct task_struct, minlat);
+				put_prev_set_next_task(rq, prev, p);
+				return p;
+			}
 		}
 
 		/* No minlat tasks — fall through to CFS */
