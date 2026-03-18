@@ -5957,6 +5957,17 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 				put_prev_set_next_task(rq, prev, p);
 				return p;
 			}
+
+			/*
+			 * Tree empty but nr_running > 0: the only microd
+			 * task is curr (out-of-tree). Re-pick it.
+			 */
+			if (rq->microd.curr && rq->microd.curr->on_rq) {
+				p = container_of(rq->microd.curr,
+						 struct task_struct, microd);
+				put_prev_set_next_task(rq, prev, p);
+				return p;
+			}
 		}
 
 		/* No microd tasks — fall through to CFS */

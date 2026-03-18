@@ -305,6 +305,7 @@ static void pull_microd_task(struct rq *this_rq);
 void init_microd_rq(struct microd_rq *microd_rq)
 {
 	microd_rq->tasks_timeline = RB_ROOT_CACHED;
+	microd_rq->curr = NULL;
 	microd_rq->nr_running = 0;
 	microd_rq->min_vruntime = 0;
 	microd_rq->load_weight = 0;
@@ -441,43 +442,18 @@ static void update_curr_microd_vruntime(struct rq *rq)
 
 static void update_curr_microd(struct rq *rq)
 {
-	struct task_struct *curr = rq->curr;
-	struct sched_microd_entity *me;
-	struct microd_rq *microd_rq;
+	struct microd_rq *microd_rq = &rq->microd;
 
 	update_curr_microd_vruntime(rq);
 
-	if (curr->sched_class != &microd_sched_class)
+	if (rq->curr->sched_class != &microd_sched_class)
 		return;
 
-	me = &curr->microd;
-	microd_rq = &rq->microd;
-
 	/*
-	 * Reposition in tree only when needed. Skip if:
-	 *  - Task is not in the tree (dequeued or single task)
-	 *  - Task is still the leftmost (no other task with lower vruntime)
-	 *
-	 * The common case (single runnable task) skips the tree op entirely.
-	 * With multiple tasks, we still skip when the current task hasn't
-	 * accumulated enough vruntime to move past the next task.
+	 * Current entity is out-of-tree (removed by set_next_task).
+	 * No tree repositioning needed — put_prev_task will re-insert
+	 * it at the correct position when it stops running.
 	 */
-	if (me->on_rq && !RB_EMPTY_NODE(&me->run_node)) {
-		struct rb_node *next = rb_next(&me->run_node);
-
-		if (next) {
-			struct sched_microd_entity *next_me =
-				rb_entry(next, struct sched_microd_entity, run_node);
-
-			if ((s64)(me->vruntime - next_me->vruntime) > 0) {
-				rb_erase_cached(&me->run_node,
-						&microd_rq->tasks_timeline);
-				RB_CLEAR_NODE(&me->run_node);
-				__enqueue_microd_entity(microd_rq, me);
-			}
-		}
-	}
-
 	update_min_vruntime(microd_rq);
 }
 
@@ -514,35 +490,14 @@ static void check_preempt_tick_microd(struct rq *rq, struct task_struct *curr)
 	ideal_runtime = microd_sched_slice(microd_rq, curr_me);
 
 	/*
-	 * Find the competitor entity. The running task may still be
-	 * the leftmost node if its vruntime update didn't trigger a
-	 * tree reposition. Use rb_next to skip it in that case.
+	 * Current entity is out of the tree — rb_first_cached always
+	 * returns the next competitor, no skip logic needed.
 	 */
 	next_node = rb_first_cached(&microd_rq->tasks_timeline);
 	if (!next_node)
 		return;
 	next_me = rb_entry(next_node, struct sched_microd_entity, run_node);
-	if (unlikely(next_me == curr_me)) {
-		next_node = rb_next(next_node);
-		if (!next_node)
-			return;
-		next_me = rb_entry(next_node, struct sched_microd_entity,
-				   run_node);
-	}
 
-	/*
-	 * Preempt only when curr's vruntime exceeds the competitor's
-	 * by at least ideal_runtime (weight-proportional). This avoids
-	 * the need for curr-out-of-tree: the vruntime comparison
-	 * naturally ensures proportional CPU sharing without removing
-	 * the running task from the tree.
-	 *
-	 * A nice-0 task (weight 1024) gets a large ideal_runtime and
-	 * must accumulate significant vruntime before yielding.
-	 * A nice-19 task (weight 15) gets MIN_GRANULARITY and is
-	 * preempted almost immediately when its vruntime exceeds
-	 * the competitor's.
-	 */
 	delta = (s64)(curr_me->vruntime - next_me->vruntime);
 	if (delta > (s64)ideal_runtime)
 		resched_curr(rq);
@@ -566,7 +521,13 @@ enqueue_task_microd(struct rq *rq, struct task_struct *p, int flags)
 		me->on_rq = 1;
 	}
 
-	__enqueue_microd_entity(microd_rq, me);
+	/*
+	 * Don't insert into the tree if this entity is the currently
+	 * running task (curr is kept out-of-tree while running).
+	 */
+	if (microd_rq->curr != me)
+		__enqueue_microd_entity(microd_rq, me);
+
 	microd_rq->nr_running++;
 	microd_rq->load_weight += scale_load_down(me->load.weight);
 	add_nr_running(rq, 1);
@@ -580,13 +541,22 @@ dequeue_task_microd(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct sched_microd_entity *me = &p->microd;
 	struct microd_rq *microd_rq = &rq->microd;
-	bool was_leftmost;
+	bool was_curr = (microd_rq->curr == me);
+	bool was_leftmost = false;
 
-	/* Check if this was leftmost before removing */
-	was_leftmost = (rb_first_cached(&microd_rq->tasks_timeline) ==
-			&me->run_node);
+	if (was_curr) {
+		/*
+		 * Currently running entity is already out of the tree
+		 * (removed by set_next_task). Just clear curr.
+		 */
+		microd_rq->curr = NULL;
+	} else {
+		/* Check if this was leftmost before removing */
+		was_leftmost = (rb_first_cached(&microd_rq->tasks_timeline) ==
+				&me->run_node);
+		__dequeue_microd_entity(microd_rq, me);
+	}
 
-	__dequeue_microd_entity(microd_rq, me);
 	microd_rq->nr_running--;
 
 	if (microd_rq->nr_running < 2)
@@ -617,24 +587,15 @@ static void yield_task_microd(struct rq *rq)
 	update_curr_microd(rq);
 
 	/*
-	 * Fast path: just set our vruntime past the next task's.
-	 * This avoids the expensive full latency*nr_running calculation
-	 * and puts us right behind the next task in the tree.
+	 * Current is out of the tree — rb_first_cached returns the
+	 * next competitor directly. Set our vruntime just past it
+	 * so we'll be re-inserted behind it by put_prev_task.
 	 */
 	next = rb_first_cached(&microd_rq->tasks_timeline);
 	if (next) {
 		next_me = rb_entry(next, struct sched_microd_entity, run_node);
-		if (next_me != me) {
-			me->vruntime = next_me->vruntime + 1;
-			return;
-		}
-		/* curr is leftmost — need to go past next */
-		next = rb_next(next);
-		if (next) {
-			next_me = rb_entry(next, struct sched_microd_entity, run_node);
-			me->vruntime = next_me->vruntime + 1;
-			return;
-		}
+		me->vruntime = next_me->vruntime + 1;
+		return;
 	}
 	/* Fallback: no other tasks, minor bump */
 	me->vruntime = microd_rq->min_vruntime +
@@ -678,11 +639,20 @@ wakeup_preempt_microd(struct rq *rq, struct task_struct *p, int flags)
 static struct task_struct *
 pick_task_microd(struct rq *rq, struct rq_flags *rf)
 {
+	struct microd_rq *microd_rq = &rq->microd;
 	struct sched_microd_entity *me;
 
-	me = __pick_first_microd_entity(&rq->microd);
+	me = __pick_first_microd_entity(microd_rq);
 	if (me)
 		return container_of(me, struct task_struct, microd);
+
+	/*
+	 * Tree is empty but curr exists out-of-tree — return it.
+	 * This happens when the only microd task is the currently
+	 * running one (removed from tree by set_next_task).
+	 */
+	if (microd_rq->curr && microd_rq->curr->on_rq)
+		return container_of(microd_rq->curr, struct task_struct, microd);
 
 	/*
 	 * No microd tasks on this CPU. Try idle-pull from a busy CPU.
@@ -712,16 +682,49 @@ put_prev_task_microd(struct rq *rq, struct task_struct *p,
 		     struct task_struct *next)
 {
 	struct sched_microd_entity *me = &p->microd;
+	struct microd_rq *microd_rq = &rq->microd;
 
-	if (!me->on_rq)
+	/*
+	 * Only re-insert if this entity is the current out-of-tree task.
+	 * If microd_rq->curr != me, the entity was already handled by
+	 * dequeue_task_microd (e.g., DEQUEUE_SAVE class-change path)
+	 * and may already be in the tree or will be re-enqueued separately.
+	 */
+	if (microd_rq->curr != me) {
+		/* Not curr — nothing to re-insert */
 		return;
+	}
 
-	update_curr_microd(rq);
+	if (!me->on_rq) {
+		microd_rq->curr = NULL;
+		return;
+	}
+
+	update_curr_microd_vruntime(rq);
+	update_min_vruntime(microd_rq);
+
+	/* Re-insert into the rb-tree at the correct position. */
+	__enqueue_microd_entity(microd_rq, me);
+	microd_rq->curr = NULL;
 }
 
 static void
 set_next_task_microd(struct rq *rq, struct task_struct *p, bool first)
 {
+	struct sched_microd_entity *me = &p->microd;
+	struct microd_rq *microd_rq = &rq->microd;
+
+	/*
+	 * Remove the entity from the rb-tree. It stays out-of-tree
+	 * while running, avoiding expensive conditional tree
+	 * repositioning in update_curr_microd(). put_prev_task will
+	 * re-insert it when it stops running.
+	 */
+	if (me->on_rq && !RB_EMPTY_NODE(&me->run_node))
+		__dequeue_microd_entity(microd_rq, me);
+
+	microd_rq->curr = me;
+
 	p->se.exec_start = rq_clock_task(rq);
 	p->se.prev_sum_exec_runtime = p->se.sum_exec_runtime;
 }
@@ -1383,8 +1386,11 @@ static void prio_changed_microd(struct rq *rq, struct task_struct *p,
 	microd_set_load_weight(p);
 	microd_rq->load_weight += scale_load_down(me->load.weight) - old_weight;
 
-	/* Requeue: dequeue from rb-tree and re-insert with updated weight */
-	if (p != rq->curr && !RB_EMPTY_NODE(&me->run_node)) {
+	/*
+	 * Requeue: dequeue from rb-tree and re-insert with updated weight.
+	 * Skip if this is the currently running task — it's out of tree.
+	 */
+	if (microd_rq->curr != me && !RB_EMPTY_NODE(&me->run_node)) {
 		__dequeue_microd_entity(microd_rq, me);
 		__enqueue_microd_entity(microd_rq, me);
 	}
