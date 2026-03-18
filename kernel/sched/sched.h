@@ -935,6 +935,7 @@ struct microd_rq {
 	unsigned int		nr_running;
 	u64			min_vruntime;
 	unsigned long		load_weight;
+	bool			overloaded;
 };
 
 #endif /* CONFIG_SCHED_CLASS_MICROD */

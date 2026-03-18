@@ -84,7 +84,23 @@ unsigned int microd_wake_affine = 1;
  * Track how many CPUs have >1 microd task (overloaded).
  * Used to fast-skip idle-pull when no CPU has tasks to donate.
  */
-static atomic_t microd_overloaded_cpus = ATOMIC_INIT(0);
+/*
+ * Check if any online CPU has 2+ microd tasks. Uses per-rq overloaded
+ * flags — cheap READ_ONCE reads, no atomics on the enqueue/dequeue path.
+ * Tolerates stale values: worst case is one missed or unnecessary pull.
+ */
+static bool sched_microd_any_overloaded(struct rq *this_rq)
+{
+	int cpu;
+
+	for_each_online_cpu(cpu) {
+		if (cpu == this_rq->cpu)
+			continue;
+		if (READ_ONCE(cpu_rq(cpu)->microd.overloaded))
+			return true;
+	}
+	return false;
+}
 
 /* ---- priority/weight tables ---- */
 
@@ -555,8 +571,8 @@ enqueue_task_microd(struct rq *rq, struct task_struct *p, int flags)
 	microd_rq->load_weight += scale_load_down(me->load.weight);
 	add_nr_running(rq, 1);
 
-	if (microd_rq->nr_running == 2)
-		atomic_inc(&microd_overloaded_cpus);
+	if (microd_rq->nr_running >= 2)
+		WRITE_ONCE(microd_rq->overloaded, true);
 }
 
 static bool
@@ -571,11 +587,10 @@ dequeue_task_microd(struct rq *rq, struct task_struct *p, int flags)
 			&me->run_node);
 
 	__dequeue_microd_entity(microd_rq, me);
-
-	if (microd_rq->nr_running == 2)
-		atomic_dec(&microd_overloaded_cpus);
-
 	microd_rq->nr_running--;
+
+	if (microd_rq->nr_running < 2)
+		WRITE_ONCE(microd_rq->overloaded, false);
 	microd_rq->load_weight -= scale_load_down(me->load.weight);
 	sub_nr_running(rq, 1);
 
@@ -679,7 +694,7 @@ pick_task_microd(struct rq *rq, struct rq_flags *rf)
 	 * Skip the pull if no CPU is overloaded — avoids expensive
 	 * cross-CPU scanning when the system is balanced.
 	 */
-	if (rf && atomic_read(&microd_overloaded_cpus) > 0) {
+	if (rf && sched_microd_any_overloaded(rq)) {
 		rq_unpin_lock(rq, rf);
 		pull_microd_task(rq);
 		rq_repin_lock(rq, rf);
@@ -698,16 +713,8 @@ put_prev_task_microd(struct rq *rq, struct task_struct *p,
 {
 	struct sched_microd_entity *me = &p->microd;
 
-	/*
-	 * If the task was already dequeued (blocking), we already
-	 * accounted runtime and updated min_vruntime in dequeue.
-	 * Skip the full update — just do lightweight vruntime calc
-	 * so sum_exec_runtime stays accurate for procfs.
-	 */
-	if (!me->on_rq) {
-		update_curr_microd_vruntime(rq);
+	if (!me->on_rq)
 		return;
-	}
 
 	update_curr_microd(rq);
 }
@@ -754,7 +761,9 @@ static void microd_record_sleep(struct task_struct *p, struct rq *rq)
 			    run_ns) / MICROD_INTERACTIVITY_DECAY;
 
 	me->interactive = (me->total_run_ns < MICROD_INTERACTIVE_THRESH_NS);
-	me->last_sleep_duration = rq_clock(rq);
+	/* Use exec_start as sleep-start timestamp — already set by
+	 * the last update_curr, avoids an extra rq_clock() read. */
+	me->last_sleep_duration = p->se.exec_start;
 }
 
 /*
@@ -1300,7 +1309,7 @@ balance_microd(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 	if (rq->microd.nr_running > 0)
 		return 1;
 
-	if (atomic_read(&microd_overloaded_cpus) <= 0)
+	if (!sched_microd_any_overloaded(rq))
 		return 0;
 
 	/*
