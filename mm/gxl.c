@@ -126,6 +126,17 @@ static int gxl_find_vram_bar(struct pci_dev *pdev, resource_size_t *bar_start,
  */
 static int gxl_online_movable_cb(struct memory_block *mem, void *arg)
 {
+	if (mem->state == MEM_ONLINE) {
+		/*
+		 * Block was auto-onlined by add_memory_driver_managed()
+		 * before we could set ZONE_MOVABLE.  Shrink operations
+		 * may fail if kernel allocations land here.
+		 */
+		pr_warn_once("blocks auto-onlined before ZONE_MOVABLE set; "
+			     "add memhp_default_state=online_movable to cmdline\n");
+		return 0;
+	}
+
 	if (mem->state != MEM_OFFLINE)
 		return 0;
 
@@ -219,6 +230,9 @@ static ssize_t size_mb_store(struct kobject *kobj,
 	rc = kstrtoul(buf, 0, &mb);
 	if (rc)
 		return rc;
+
+	if (mb > (gxl_max_size >> 20))
+		mb = gxl_max_size >> 20;
 
 	rc = gxl_do_resize(mb << 20);
 	if (rc)
