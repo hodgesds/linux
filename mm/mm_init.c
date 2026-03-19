@@ -1555,7 +1555,8 @@ void __ref free_area_init_core_hotplug(struct pglist_data *pgdat)
 
 	pgdat_init_internals(pgdat);
 
-	if (pgdat->per_cpu_nodestats == &boot_nodestats)
+	if (!pgdat->per_cpu_nodestats ||
+	    pgdat->per_cpu_nodestats == &boot_nodestats)
 		pgdat->per_cpu_nodestats = alloc_percpu(struct per_cpu_nodestat);
 
 	/*

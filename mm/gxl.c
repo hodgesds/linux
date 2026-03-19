@@ -365,6 +365,12 @@ static int __init gxl_init(void)
 					rc = -ENOMEM;
 					goto err_put_pdev;
 				}
+				/*
+				 * hotadd_init_pgdat() reads pgdat->node_id
+				 * for zone initialisation -- set it before
+				 * try_online_node() is called.
+				 */
+				node_data[rc]->node_id = rc;
 				node_set(rc, node_possible_map);
 				if (rc >= nr_node_ids)
 					nr_node_ids = rc + 1;
