@@ -12,7 +12,7 @@
  * memory tiering infrastructure.
  *
  * The registered VRAM size can be changed at runtime via:
- *   /sys/kernel/gxl/size_mb
+ *   /sys/kernel/mm/gxl/size_mb
  *
  * Pages are onlined to ZONE_MOVABLE so they can be migrated back
  * to DRAM when the VRAM region is shrunk (e.g., when the GPU driver
@@ -336,14 +336,29 @@ static int __init gxl_init(void)
 	 * DRAM node because init_node_memory_type() would reclassify
 	 * all of that node's memory (including DRAM) as GPU VRAM tier.
 	 *
-	 * Find an offline-but-possible node that the hotplug path
-	 * will bring online.
+	 * First try to find an offline-but-possible node.  If none
+	 * exists (common on single-socket systems without SRAT), claim
+	 * the first unused node ID and add it to the possible map so
+	 * the memory hotplug path will accept it.
 	 */
 	gxl_numa_node = NUMA_NO_NODE;
 	for (rc = 0; rc < MAX_NUMNODES; rc++) {
 		if (node_possible(rc) && !node_online(rc)) {
 			gxl_numa_node = rc;
 			break;
+		}
+	}
+	if (gxl_numa_node == NUMA_NO_NODE) {
+		for (rc = 0; rc < MAX_NUMNODES; rc++) {
+			if (!node_possible(rc)) {
+				node_set(rc, node_possible_map);
+				if (rc >= nr_node_ids)
+					nr_node_ids = rc + 1;
+				gxl_numa_node = rc;
+				pr_info("claimed NUMA node %d for GPU VRAM\n",
+					rc);
+				break;
+			}
 		}
 	}
 	if (gxl_numa_node == NUMA_NO_NODE) {
@@ -382,7 +397,7 @@ static int __init gxl_init(void)
 	gxl_res->flags = IORESOURCE_SYSTEM_RAM;
 
 	/* Create sysfs interface */
-	gxl_kobj = kobject_create_and_add("gxl", kernel_kobj);
+	gxl_kobj = kobject_create_and_add("gxl", mm_kobj);
 	if (!gxl_kobj) {
 		rc = -ENOMEM;
 		goto err_release_region;
@@ -397,7 +412,7 @@ static int __init gxl_init(void)
 
 	pr_info("ready: %lu MB GPU VRAM available on node %d (adist %ld)\n",
 		gxl_max_size >> 20, gxl_numa_node, GXL_ADISTANCE);
-	pr_info("write to /sys/kernel/gxl/size_mb to register VRAM\n");
+	pr_info("write to /sys/kernel/mm/gxl/size_mb to register VRAM\n");
 
 	return 0;
 
