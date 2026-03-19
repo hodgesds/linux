@@ -368,6 +368,20 @@ static int __init gxl_init(void)
 				node_set(rc, node_possible_map);
 				if (rc >= nr_node_ids)
 					nr_node_ids = rc + 1;
+				/*
+				 * node_demotion[] in memory-tiers.c was
+				 * allocated with the old nr_node_ids.
+				 * Grow it before the node can enter
+				 * N_MEMORY and be visited by
+				 * establish_demotion_targets().
+				 */
+				if (memory_tier_realloc_demotion()) {
+					node_clear(rc, node_possible_map);
+					kfree(node_data[rc]);
+					node_data[rc] = NULL;
+					rc = -ENOMEM;
+					goto err_put_pdev;
+				}
 				gxl_numa_node = rc;
 				pr_info("claimed NUMA node %d for GPU VRAM\n",
 					rc);

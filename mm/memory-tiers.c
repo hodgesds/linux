@@ -129,6 +129,38 @@ static int top_tier_adistance;
  *
  */
 static struct demotion_nodes *node_demotion __read_mostly;
+static unsigned int node_demotion_nr;	/* nr_node_ids at allocation time */
+
+/**
+ * memory_tier_realloc_demotion() - Resize node_demotion[] for new NUMA nodes
+ *
+ * When a NUMA node is dynamically added after memory_tier_init(), the
+ * node_demotion[] array may be too small.  Call this after increasing
+ * nr_node_ids to grow the array so that establish_demotion_targets()
+ * does not access past the end.
+ *
+ * Returns 0 on success or -ENOMEM.
+ */
+int memory_tier_realloc_demotion(void)
+{
+	struct demotion_nodes *new;
+
+	if (nr_node_ids <= node_demotion_nr)
+		return 0;
+
+	mutex_lock(&memory_tier_lock);
+	new = krealloc_array(node_demotion, nr_node_ids,
+			     sizeof(*node_demotion),
+			     GFP_KERNEL | __GFP_ZERO);
+	if (!new) {
+		mutex_unlock(&memory_tier_lock);
+		return -ENOMEM;
+	}
+	node_demotion = new;
+	node_demotion_nr = nr_node_ids;
+	mutex_unlock(&memory_tier_lock);
+	return 0;
+}
 #endif /* CONFIG_MIGRATION */
 
 static BLOCKING_NOTIFIER_HEAD(mt_adistance_algorithms);
@@ -914,6 +946,7 @@ static int __init memory_tier_init(void)
 #ifdef CONFIG_MIGRATION
 	node_demotion = kzalloc_objs(struct demotion_nodes, nr_node_ids);
 	WARN_ON(!node_demotion);
+	node_demotion_nr = nr_node_ids;
 #endif
 
 	mutex_lock(&memory_tier_lock);

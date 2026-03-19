@@ -56,6 +56,7 @@ void mt_put_memory_types(struct list_head *memory_types);
 int next_demotion_node(int node, const nodemask_t *allowed_mask);
 void node_get_allowed_targets(pg_data_t *pgdat, nodemask_t *targets);
 bool node_is_toptier(int node);
+int memory_tier_realloc_demotion(void);
 #else
 static inline int next_demotion_node(int node, const nodemask_t *allowed_mask)
 {
@@ -70,6 +71,11 @@ static inline void node_get_allowed_targets(pg_data_t *pgdat, nodemask_t *target
 static inline bool node_is_toptier(int node)
 {
 	return true;
+}
+
+static inline int memory_tier_realloc_demotion(void)
+{
+	return 0;
 }
 #endif
 
