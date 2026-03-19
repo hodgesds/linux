@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * gxl.c - GPU VRAM as CXL.mem-style memory tier
+ * gxl.c - GPU VRAM as CXL.mem-style memory tier (multi-GPU)
  *
  * gxl exposes GPU VRAM as a kernel-managed memory tier, allowing the
  * kernel to automatically demote cold pages from DRAM to GPU VRAM
@@ -11,8 +11,10 @@
  * registered as a NUMA memory node through the memory hotplug and
  * memory tiering infrastructure.
  *
- * The registered VRAM size can be changed at runtime via:
- *   /sys/kernel/mm/gxl/size_mb
+ * Multiple GPUs are supported (up to GXL_MAX_DEVICES).  Each GPU gets
+ * its own NUMA node but all share a single memory_dev_type at the same
+ * abstract distance.  Per-device resize is available via:
+ *   /sys/kernel/mm/gxl/<slot>/size_mb
  *
  * Pages are onlined to ZONE_MOVABLE so they can be migrated back
  * to DRAM when the VRAM region is shrunk (e.g., when the GPU driver
@@ -51,38 +53,65 @@
  */
 #define GXL_ADISTANCE	(MEMTIER_ADISTANCE_DRAM * 2)
 
+#define GXL_MAX_DEVICES	8
+
 /* Memory resource name for add_memory_driver_managed() */
 static const char *gxl_res_name = "System RAM (gxl)";
 
 /*
+ * Per-device state
+ */
+struct gxl_dev {
+	char			slot[64];	/* PCI slot string */
+	struct pci_dev		*pdev;
+	struct resource		*res;
+	int			mgid;
+	int			numa_node;
+	resource_size_t		phys_start;
+	unsigned long		max_size;
+	unsigned long		online_size;
+	bool			ready;
+	struct kobject		*kobj;		/* /sys/kernel/mm/gxl/<slot>/ */
+	struct mutex		lock;
+};
+
+static struct gxl_dev gxl_devs[GXL_MAX_DEVICES];
+static int gxl_nr_devs;
+
+/*
+ * Shared memory type -- all GPUs live at the same abstract distance.
+ */
+static struct memory_dev_type *gxl_mtype;
+
+/*
+ * Parent kobject: /sys/kernel/mm/gxl/
+ */
+static struct kobject *gxl_kobj;
+
+/*
  * Parameters
  */
-
-static char gxl_device[64];
-module_param_string(device, gxl_device, sizeof(gxl_device), 0444);
-MODULE_PARM_DESC(device, "PCI slot of GPU device (e.g. 0000:03:00.0)");
-
 static unsigned int gxl_max_pool_percent = 80;
-module_param_named(max_pool_percent, gxl_max_pool_percent, uint, 0444);
+module_param_named(max_pool_percent, gxl_max_pool_percent, uint, 0644);
 MODULE_PARM_DESC(max_pool_percent, "Percentage of VRAM to expose as system memory (default 80)");
 
 /*
- * State
+ * gxl.device=SLOT -- early_param, called once per GPU.
+ * Each invocation appends to gxl_devs[].
  */
+static int __init gxl_setup_device(char *arg)
+{
+	if (gxl_nr_devs >= GXL_MAX_DEVICES) {
+		pr_err("too many devices (max %d)\n", GXL_MAX_DEVICES);
+		return 0;
+	}
 
-static DEFINE_MUTEX(gxl_lock);
-
-static struct pci_dev *gxl_pdev;
-static struct resource *gxl_res;
-static struct memory_dev_type *gxl_mtype;
-static int gxl_mgid = -1;
-static int gxl_numa_node = NUMA_NO_NODE;
-
-static resource_size_t gxl_phys_start;	/* aligned start of usable VRAM */
-static unsigned long gxl_max_size;	/* max usable VRAM (aligned) */
-static unsigned long gxl_online_size;	/* currently registered size */
-
-static bool gxl_ready;			/* init completed successfully */
+	strscpy(gxl_devs[gxl_nr_devs].slot, arg,
+		sizeof(gxl_devs[gxl_nr_devs].slot));
+	gxl_nr_devs++;
+	return 0;
+}
+early_param("gxl.device", gxl_setup_device);
 
 /*
  * Early NUMA node reservation.
@@ -90,36 +119,50 @@ static bool gxl_ready;			/* init completed successfully */
  * Subsystems like workqueue size per-node arrays to nr_node_ids at boot.
  * If gxl needs to create a new NUMA node at late_initcall time, those
  * arrays are already too small.  To avoid this, the user passes
- * gxl.reserve_node on the kernel command line.  This runs during
- * parse_early_param() -- before NUMA init -- and adds an extra node
- * to numa_nodes_parsed so that setup_nr_node_ids() accounts for it.
+ * gxl.reserve_node[=N] on the kernel command line.  This runs during
+ * parse_early_param() -- before NUMA init -- and reserves N node IDs
+ * (default 1) by scanning numa_nodes_parsed from MAX_NUMNODES-1 downward,
+ * avoiding collision with real hardware topology.
  */
-static int gxl_reserved_node = NUMA_NO_NODE;
+static int gxl_reserved_nodes[GXL_MAX_DEVICES];
+static int gxl_nr_reserved;
 
 static int __init gxl_reserve_node(char *arg)
 {
-	int nid;
+	int count = 1;
+	int nid, i;
 
-	for (nid = 0; nid < MAX_NUMNODES; nid++) {
-		if (!node_isset(nid, numa_nodes_parsed)) {
-			node_set(nid, numa_nodes_parsed);
-			gxl_reserved_node = nid;
-			pr_info("reserved NUMA node %d for GPU VRAM\n", nid);
-			return 0;
+	if (arg && *arg)
+		count = simple_strtol(arg, NULL, 0);
+	if (count < 1)
+		count = 1;
+	if (count > GXL_MAX_DEVICES)
+		count = GXL_MAX_DEVICES;
+
+	for (i = 0; i < count; i++) {
+		for (nid = MAX_NUMNODES - 1; nid >= 0; nid--) {
+			if (!node_isset(nid, numa_nodes_parsed)) {
+				node_set(nid, numa_nodes_parsed);
+				gxl_reserved_nodes[gxl_nr_reserved++] = nid;
+				pr_info("reserved NUMA node %d for GPU VRAM\n",
+					nid);
+				break;
+			}
+		}
+		if (nid < 0) {
+			pr_err("no free NUMA node ID to reserve (%d of %d done)\n",
+			       i, count);
+			break;
 		}
 	}
 
-	pr_err("no free NUMA node ID to reserve\n");
 	return 0;
 }
 early_param("gxl.reserve_node", gxl_reserve_node);
 
-static struct kobject *gxl_kobj;
-
 /*
  * BAR detection
  */
-
 static int gxl_find_vram_bar(struct pci_dev *pdev, resource_size_t *bar_start,
 			     unsigned long *bar_size)
 {
@@ -159,11 +202,6 @@ static int gxl_find_vram_bar(struct pci_dev *pdev, resource_size_t *bar_start,
 static int gxl_online_movable_cb(struct memory_block *mem, void *arg)
 {
 	if (mem->state == MEM_ONLINE) {
-		/*
-		 * Block was auto-onlined by add_memory_driver_managed()
-		 * before we could set ZONE_MOVABLE.  Shrink operations
-		 * may fail if kernel allocations land here.
-		 */
 		pr_warn_once("blocks auto-onlined before ZONE_MOVABLE set; "
 			     "add memhp_default_state=online_movable to cmdline\n");
 		return 0;
@@ -177,96 +215,105 @@ static int gxl_online_movable_cb(struct memory_block *mem, void *arg)
 }
 
 /*
- * Dynamic resize
- *
- * Grow: add_memory_driver_managed() then online to ZONE_MOVABLE
- * Shrink: offline_and_remove_memory() migrates pages back to DRAM
+ * Dynamic resize -- operates on a single device.
  */
-static int gxl_do_resize(unsigned long new_size)
+static int gxl_do_resize(struct gxl_dev *gdev, unsigned long new_size)
 {
 	unsigned long blk_size = memory_block_size_bytes();
 	int rc = 0;
 
 	new_size = ALIGN_DOWN(new_size, blk_size);
-	if (new_size > gxl_max_size)
-		new_size = gxl_max_size;
+	if (new_size > gdev->max_size)
+		new_size = gdev->max_size;
 
-	mutex_lock(&gxl_lock);
+	mutex_lock(&gdev->lock);
 
-	if (new_size == gxl_online_size)
+	if (new_size == gdev->online_size)
 		goto out;
 
-	if (new_size < gxl_online_size) {
-		/* Shrink: offline and remove memory from the end */
-		unsigned long shrink = gxl_online_size - new_size;
+	if (new_size < gdev->online_size) {
+		unsigned long shrink = gdev->online_size - new_size;
 
-		rc = offline_and_remove_memory(gxl_phys_start + new_size,
+		rc = offline_and_remove_memory(gdev->phys_start + new_size,
 					       shrink);
 		if (rc) {
-			pr_warn("shrink failed: %d (pages may be pinned)\n",
-				rc);
+			pr_warn("%s: shrink failed: %d (pages may be pinned)\n",
+				gdev->slot, rc);
 			goto out;
 		}
-		gxl_online_size = new_size;
-		pr_info("shrunk to %lu MB\n", new_size >> 20);
+		gdev->online_size = new_size;
+		pr_info("%s: shrunk to %lu MB\n", gdev->slot, new_size >> 20);
 	} else {
-		/* Grow: add memory and online to ZONE_MOVABLE */
-		unsigned long grow_start = gxl_phys_start + gxl_online_size;
-		unsigned long grow = new_size - gxl_online_size;
+		unsigned long grow_start = gdev->phys_start + gdev->online_size;
+		unsigned long grow = new_size - gdev->online_size;
 
-		rc = add_memory_driver_managed(gxl_mgid, grow_start, grow,
+		rc = add_memory_driver_managed(gdev->mgid, grow_start, grow,
 					       gxl_res_name, MHP_NID_IS_MGID);
 		if (rc) {
-			pr_warn("grow failed: %d\n", rc);
+			pr_warn("%s: grow failed: %d\n", gdev->slot, rc);
 			goto out;
 		}
 
-		/*
-		 * Online the new blocks to ZONE_MOVABLE.
-		 * lock_device_hotplug is needed for device_online().
-		 */
 		lock_device_hotplug();
 		walk_memory_blocks(grow_start, grow, NULL,
 				   gxl_online_movable_cb);
 		unlock_device_hotplug();
 
-		gxl_online_size = new_size;
-		pr_info("grown to %lu MB\n", new_size >> 20);
+		gdev->online_size = new_size;
+		pr_info("%s: grown to %lu MB\n", gdev->slot, new_size >> 20);
 	}
 
 out:
-	mutex_unlock(&gxl_lock);
+	mutex_unlock(&gdev->lock);
 	return rc;
 }
 
 /*
- * sysfs interface: /sys/kernel/gxl/
+ * sysfs helpers -- map kobject back to gxl_dev.
  */
+static struct gxl_dev *gxl_kobj_to_dev(struct kobject *kobj)
+{
+	int i;
 
+	for (i = 0; i < gxl_nr_devs; i++) {
+		if (gxl_devs[i].kobj == kobj)
+			return &gxl_devs[i];
+	}
+	return NULL;
+}
+
+/*
+ * Per-device sysfs: /sys/kernel/mm/gxl/<slot>/
+ */
 static ssize_t size_mb_show(struct kobject *kobj,
 			    struct kobj_attribute *attr, char *buf)
 {
-	return sysfs_emit(buf, "%lu\n", gxl_online_size >> 20);
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+
+	if (!gdev)
+		return -ENODEV;
+	return sysfs_emit(buf, "%lu\n", gdev->online_size >> 20);
 }
 
 static ssize_t size_mb_store(struct kobject *kobj,
 			     struct kobj_attribute *attr,
 			     const char *buf, size_t count)
 {
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
 	unsigned long mb;
 	int rc;
 
-	if (!gxl_ready)
+	if (!gdev || !gdev->ready)
 		return -ENODEV;
 
 	rc = kstrtoul(buf, 0, &mb);
 	if (rc)
 		return rc;
 
-	if (mb > (gxl_max_size >> 20))
-		mb = gxl_max_size >> 20;
+	if (mb > (gdev->max_size >> 20))
+		mb = gdev->max_size >> 20;
 
-	rc = gxl_do_resize(mb << 20);
+	rc = gxl_do_resize(gdev, mb << 20);
 	if (rc)
 		return rc;
 
@@ -279,7 +326,11 @@ static struct kobj_attribute gxl_size_mb_attr =
 static ssize_t max_size_mb_show(struct kobject *kobj,
 				struct kobj_attribute *attr, char *buf)
 {
-	return sysfs_emit(buf, "%lu\n", gxl_max_size >> 20);
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+
+	if (!gdev)
+		return -ENODEV;
+	return sysfs_emit(buf, "%lu\n", gdev->max_size >> 20);
 }
 
 static struct kobj_attribute gxl_max_size_mb_attr =
@@ -288,28 +339,63 @@ static struct kobj_attribute gxl_max_size_mb_attr =
 static ssize_t numa_node_show(struct kobject *kobj,
 			      struct kobj_attribute *attr, char *buf)
 {
-	return sysfs_emit(buf, "%d\n", gxl_numa_node);
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+
+	if (!gdev)
+		return -ENODEV;
+	return sysfs_emit(buf, "%d\n", gdev->numa_node);
 }
 
 static struct kobj_attribute gxl_numa_node_attr =
 	__ATTR(numa_node, 0444, numa_node_show, NULL);
 
-static struct attribute *gxl_attrs[] = {
+static struct attribute *gxl_dev_attrs[] = {
 	&gxl_size_mb_attr.attr,
 	&gxl_max_size_mb_attr.attr,
 	&gxl_numa_node_attr.attr,
 	NULL,
 };
 
-static const struct attribute_group gxl_attr_group = {
-	.attrs = gxl_attrs,
+static const struct attribute_group gxl_dev_attr_group = {
+	.attrs = gxl_dev_attrs,
 };
 
 /*
- * Initialization
+ * Claim a NUMA node for a device.
+ * 1. Pop from gxl_reserved_nodes[] (reserved at early boot)
+ * 2. Fallback: scan for any offline-but-possible node
  */
+static int __init gxl_claim_node(void)
+{
+	int nid, i;
 
-static int __init gxl_init(void)
+	/* Try reserved pool first */
+	if (gxl_nr_reserved > 0) {
+		nid = gxl_reserved_nodes[--gxl_nr_reserved];
+		/*
+		 * The reserved node will typically be online already --
+		 * gxl_reserve_node() adds it to numa_nodes_parsed so that
+		 * NUMA init sizes per-node arrays to include it.  That is
+		 * expected.  Just verify it is a valid, memoryless node.
+		 */
+		if (node_possible(nid))
+			return nid;
+		pr_warn("reserved node %d is not possible, scanning\n", nid);
+	}
+
+	/* Fallback: any offline-but-possible node */
+	for (i = 0; i < nr_node_ids; i++) {
+		if (node_possible(i) && !node_online(i))
+			return i;
+	}
+
+	return NUMA_NO_NODE;
+}
+
+/*
+ * Initialize a single device.
+ */
+static int __init gxl_init_one(struct gxl_dev *gdev)
 {
 	unsigned int domain, bus, slot, func;
 	resource_size_t bar_start, aligned_start, aligned_end;
@@ -317,32 +403,32 @@ static int __init gxl_init(void)
 	struct pci_dev *pdev;
 	int rc;
 
-	if (!gxl_device[0])
-		return 0;
+	mutex_init(&gdev->lock);
+	gdev->mgid = -1;
+	gdev->numa_node = NUMA_NO_NODE;
 
-	if (sscanf(gxl_device, "%x:%x:%x.%x",
+	if (sscanf(gdev->slot, "%x:%x:%x.%x",
 		   &domain, &bus, &slot, &func) != 4) {
-		pr_err("invalid device format: %s (expected DDDD:BB:DD.F)\n",
-		       gxl_device);
+		pr_err("%s: invalid device format (expected DDDD:BB:DD.F)\n",
+		       gdev->slot);
 		return -EINVAL;
 	}
 
 	pdev = pci_get_domain_bus_and_slot(domain, bus, PCI_DEVFN(slot, func));
 	if (!pdev) {
-		pr_err("PCI device %s not found\n", gxl_device);
+		pr_err("%s: PCI device not found\n", gdev->slot);
 		return -ENODEV;
 	}
 
 	rc = gxl_find_vram_bar(pdev, &bar_start, &bar_size);
 	if (rc) {
-		pr_err("no prefetchable VRAM BAR found on %s\n", gxl_device);
+		pr_err("%s: no prefetchable VRAM BAR found\n", gdev->slot);
 		goto err_put_pdev;
 	}
 
-	pr_info("found VRAM BAR: base=%pa size=%lu MB on %s\n",
-		&bar_start, bar_size >> 20, gxl_device);
+	pr_info("%s: found VRAM BAR: base=%pa size=%lu MB\n",
+		gdev->slot, &bar_start, bar_size >> 20);
 
-	/* Calculate usable size and align to memory block size */
 	blk_size = memory_block_size_bytes();
 	if (gxl_max_pool_percent > 100)
 		gxl_max_pool_percent = 100;
@@ -351,126 +437,141 @@ static int __init gxl_init(void)
 	aligned_end = ALIGN_DOWN(bar_start + usable_size, blk_size);
 
 	if (aligned_start >= aligned_end) {
-		pr_err("VRAM region too small after alignment (%lu MB, block size %lu MB)\n",
-		       usable_size >> 20, blk_size >> 20);
+		pr_err("%s: VRAM region too small after alignment (%lu MB, block size %lu MB)\n",
+		       gdev->slot, usable_size >> 20, blk_size >> 20);
 		rc = -ENOSPC;
 		goto err_put_pdev;
 	}
 
-	gxl_phys_start = aligned_start;
-	gxl_max_size = aligned_end - aligned_start;
+	gdev->phys_start = aligned_start;
+	gdev->max_size = aligned_end - aligned_start;
 
-	pr_info("usable: %lu MB of %lu MB VRAM (aligned to %lu MB blocks)\n",
-		gxl_max_size >> 20, bar_size >> 20, blk_size >> 20);
+	pr_info("%s: usable: %lu MB of %lu MB VRAM (aligned to %lu MB blocks)\n",
+		gdev->slot, gdev->max_size >> 20, bar_size >> 20,
+		blk_size >> 20);
 
-	/*
-	 * GPU VRAM needs its own NUMA node -- we cannot share with a
-	 * DRAM node because init_node_memory_type() would reclassify
-	 * all of that node's memory (including DRAM) as GPU VRAM tier.
-	 *
-	 * Use the node reserved by the gxl.reserve_node early param,
-	 * or fall back to any offline-but-possible node (e.g. from
-	 * ACPI SRAT).  We cannot create new possible nodes here
-	 * because subsystems like workqueue have already sized
-	 * per-node arrays to nr_node_ids.
-	 */
-	gxl_numa_node = NUMA_NO_NODE;
-	if (gxl_reserved_node != NUMA_NO_NODE &&
-	    node_possible(gxl_reserved_node) && !node_online(gxl_reserved_node))
-		gxl_numa_node = gxl_reserved_node;
-
-	if (gxl_numa_node == NUMA_NO_NODE) {
-		for (rc = 0; rc < nr_node_ids; rc++) {
-			if (node_possible(rc) && !node_online(rc)) {
-				gxl_numa_node = rc;
-				break;
-			}
-		}
-	}
-	if (gxl_numa_node == NUMA_NO_NODE) {
-		pr_err("no offline-but-possible NUMA node available\n");
-		pr_err("add gxl.reserve_node to kernel command line\n");
+	/* Claim a NUMA node */
+	gdev->numa_node = gxl_claim_node();
+	if (gdev->numa_node == NUMA_NO_NODE) {
+		pr_err("%s: no offline-but-possible NUMA node available\n",
+		       gdev->slot);
+		pr_err("add gxl.reserve_node=N to kernel command line\n");
 		rc = -ENOSPC;
 		goto err_put_pdev;
 	}
 
-	/*
-	 * Bring the node online so pgdat zones and zonelists are
-	 * initialised.  hotadd_init_pgdat() sets up the empty zones
-	 * that add_memory_driver_managed() will later populate.
-	 */
-	rc = try_online_node(gxl_numa_node);
+	rc = try_online_node(gdev->numa_node);
 	if (rc < 0) {
-		pr_err("failed to online node %d: %d\n", gxl_numa_node, rc);
+		pr_err("%s: failed to online node %d: %d\n",
+		       gdev->slot, gdev->numa_node, rc);
 		goto err_put_pdev;
 	}
 
-	/* Allocate memory type and register with tiering framework */
-	gxl_mtype = alloc_memory_type(GXL_ADISTANCE);
-	if (IS_ERR(gxl_mtype)) {
-		rc = PTR_ERR(gxl_mtype);
-		pr_err("failed to allocate memory type: %d\n", rc);
-		goto err_put_pdev;
-	}
+	init_node_memory_type(gdev->numa_node, gxl_mtype);
 
-	init_node_memory_type(gxl_numa_node, gxl_mtype);
-
-	/* Register memory group for coherent hotplug tracking */
-	rc = memory_group_register_static(gxl_numa_node, PFN_UP(gxl_max_size));
+	rc = memory_group_register_static(gdev->numa_node,
+					  PFN_UP(gdev->max_size));
 	if (rc < 0) {
-		pr_err("failed to register memory group: %d\n", rc);
+		pr_err("%s: failed to register memory group: %d\n",
+		       gdev->slot, rc);
 		goto err_clear_type;
 	}
-	gxl_mgid = rc;
+	gdev->mgid = rc;
 
-	/* Reserve the full VRAM region for our use */
-	gxl_res = request_mem_region(gxl_phys_start, gxl_max_size,
-				     gxl_res_name);
-	if (!gxl_res) {
-		pr_err("could not reserve VRAM region %pa+%lu (in use by GPU driver?)\n",
-		       &gxl_phys_start, gxl_max_size);
+	gdev->res = request_mem_region(gdev->phys_start, gdev->max_size,
+				       gxl_res_name);
+	if (!gdev->res) {
+		pr_err("%s: could not reserve VRAM region %pa+%lu (in use by GPU driver?)\n",
+		       gdev->slot, &gdev->phys_start, gdev->max_size);
 		rc = -EBUSY;
 		goto err_unreg_group;
 	}
-	gxl_res->flags = IORESOURCE_SYSTEM_RAM;
+	gdev->res->flags = IORESOURCE_SYSTEM_RAM;
 
-	/* Create sysfs interface */
-	gxl_kobj = kobject_create_and_add("gxl", mm_kobj);
-	if (!gxl_kobj) {
+	/* Per-device sysfs kobject */
+	gdev->kobj = kobject_create_and_add(gdev->slot, gxl_kobj);
+	if (!gdev->kobj) {
 		rc = -ENOMEM;
 		goto err_release_region;
 	}
 
-	rc = sysfs_create_group(gxl_kobj, &gxl_attr_group);
+	rc = sysfs_create_group(gdev->kobj, &gxl_dev_attr_group);
 	if (rc)
 		goto err_put_kobj;
 
-	gxl_pdev = pdev;
-	gxl_ready = true;
+	gdev->pdev = pdev;
+	gdev->ready = true;
 
-	pr_info("ready: %lu MB GPU VRAM available on node %d (adist %ld)\n",
-		gxl_max_size >> 20, gxl_numa_node, GXL_ADISTANCE);
-	pr_info("write to /sys/kernel/mm/gxl/size_mb to register VRAM\n");
+	pr_info("%s: ready: %lu MB GPU VRAM on node %d (adist %ld)\n",
+		gdev->slot, gdev->max_size >> 20, gdev->numa_node,
+		(long)GXL_ADISTANCE);
+	pr_info("%s: write to /sys/kernel/mm/gxl/%s/size_mb to register VRAM\n",
+		gdev->slot, gdev->slot);
 
 	return 0;
 
 err_put_kobj:
-	kobject_put(gxl_kobj);
-	gxl_kobj = NULL;
+	kobject_put(gdev->kobj);
+	gdev->kobj = NULL;
 err_release_region:
-	remove_resource(gxl_res);
-	kfree(gxl_res);
-	gxl_res = NULL;
+	remove_resource(gdev->res);
+	kfree(gdev->res);
+	gdev->res = NULL;
 err_unreg_group:
-	memory_group_unregister(gxl_mgid);
-	gxl_mgid = -1;
+	memory_group_unregister(gdev->mgid);
+	gdev->mgid = -1;
 err_clear_type:
-	clear_node_memory_type(gxl_numa_node, gxl_mtype);
-	put_memory_type(gxl_mtype);
-	gxl_mtype = NULL;
+	clear_node_memory_type(gdev->numa_node, gxl_mtype);
 err_put_pdev:
 	pci_dev_put(pdev);
 	return rc;
+}
+
+/*
+ * Main initialization
+ */
+static int __init gxl_init(void)
+{
+	int i, rc, ok = 0;
+
+	if (!gxl_nr_devs)
+		return 0;
+
+	/* Shared memory type for all GPU devices */
+	gxl_mtype = alloc_memory_type(GXL_ADISTANCE);
+	if (IS_ERR(gxl_mtype)) {
+		rc = PTR_ERR(gxl_mtype);
+		pr_err("failed to allocate memory type: %d\n", rc);
+		gxl_mtype = NULL;
+		return rc;
+	}
+
+	/* Parent sysfs directory */
+	gxl_kobj = kobject_create_and_add("gxl", mm_kobj);
+	if (!gxl_kobj) {
+		put_memory_type(gxl_mtype);
+		gxl_mtype = NULL;
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < gxl_nr_devs; i++) {
+		rc = gxl_init_one(&gxl_devs[i]);
+		if (rc)
+			pr_err("%s: init failed: %d\n", gxl_devs[i].slot, rc);
+		else
+			ok++;
+	}
+
+	if (!ok) {
+		pr_err("no devices initialized successfully\n");
+		kobject_put(gxl_kobj);
+		gxl_kobj = NULL;
+		put_memory_type(gxl_mtype);
+		gxl_mtype = NULL;
+		return -ENODEV;
+	}
+
+	return 0;
 }
 
 late_initcall(gxl_init);
