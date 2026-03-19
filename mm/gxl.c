@@ -34,8 +34,10 @@
 #include <linux/memory.h>
 #include <linux/memory-tiers.h>
 #include <linux/memory_hotplug.h>
+#include <linux/mmzone.h>
 #include <linux/numa.h>
 #include <linux/node.h>
+#include <linux/slab.h>
 #include <linux/kobject.h>
 #include <linux/mutex.h>
 
@@ -351,6 +353,18 @@ static int __init gxl_init(void)
 	if (gxl_numa_node == NUMA_NO_NODE) {
 		for (rc = 0; rc < MAX_NUMNODES; rc++) {
 			if (!node_possible(rc)) {
+				/*
+				 * free_area_init() allocates NODE_DATA for
+				 * every possible node at early boot.  We
+				 * missed that window, so allocate pgdat now
+				 * before making the node visible.
+				 */
+				node_data[rc] = kzalloc(sizeof(pg_data_t),
+							GFP_KERNEL);
+				if (!node_data[rc]) {
+					rc = -ENOMEM;
+					goto err_put_pdev;
+				}
 				node_set(rc, node_possible_map);
 				if (rc >= nr_node_ids)
 					nr_node_ids = rc + 1;
@@ -364,6 +378,19 @@ static int __init gxl_init(void)
 	if (gxl_numa_node == NUMA_NO_NODE) {
 		pr_err("no available NUMA node for GPU VRAM\n");
 		rc = -ENOSPC;
+		goto err_put_pdev;
+	}
+
+	/*
+	 * Bring the node online so pgdat zones and zonelists are
+	 * initialised.  For nodes found in the first loop this is a
+	 * no-cost re-init; for nodes we just claimed it is mandatory
+	 * because hotadd_init_pgdat() sets up the empty zones that
+	 * add_memory_driver_managed() will later populate.
+	 */
+	rc = try_online_node(gxl_numa_node);
+	if (rc < 0) {
+		pr_err("failed to online node %d: %d\n", gxl_numa_node, rc);
 		goto err_put_pdev;
 	}
 
