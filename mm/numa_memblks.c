@@ -3,6 +3,7 @@
 #include <linux/array_size.h>
 #include <linux/sort.h>
 #include <linux/printk.h>
+#include <linux/kernel.h>
 #include <linux/memblock.h>
 #include <linux/numa.h>
 #include <linux/numa_memblks.h>
@@ -395,6 +396,48 @@ static void __init numa_clear_kernel_node_hotplug(void)
 	}
 }
 
+/*
+ * Reserve extra NUMA node IDs for subsystems that need synthetic nodes at
+ * runtime (e.g. for device memory).  The reserved nodes are added to
+ * node_possible_map after SRAT parsing, ensuring setup_nr_node_ids() sizes
+ * all per-node arrays large enough to accommodate them.
+ *
+ * Usage: numa_reserve_nodes=N on the kernel command line.
+ */
+int __initdata numa_extra_reserve_count;
+
+static int __init numa_reserve_nodes_setup(char *arg)
+{
+	int count;
+	int rc;
+
+	rc = kstrtoint(arg, 0, &count);
+	if (!rc)
+		numa_extra_reserve_count += count;
+	return rc;
+}
+early_param("numa_reserve_nodes", numa_reserve_nodes_setup);
+
+static void __init numa_reserve_extra_nodes(void)
+{
+	int i, nid;
+
+	for (i = 0; i < numa_extra_reserve_count; i++) {
+		for (nid = 0; nid < MAX_NUMNODES; nid++) {
+			if (!node_isset(nid, node_possible_map)) {
+				node_set(nid, node_possible_map);
+				pr_info("NUMA: reserved extra node %d\n", nid);
+				break;
+			}
+		}
+		if (nid >= MAX_NUMNODES) {
+			pr_warn("NUMA: could not reserve extra node (%d of %d done)\n",
+				i, numa_extra_reserve_count);
+			break;
+		}
+	}
+}
+
 static int __init numa_register_meminfo(struct numa_meminfo *mi)
 {
 	int i;
@@ -402,6 +445,7 @@ static int __init numa_register_meminfo(struct numa_meminfo *mi)
 	/* Account for nodes with cpus and no memory */
 	node_possible_map = numa_nodes_parsed;
 	numa_nodemask_from_meminfo(&node_possible_map, mi);
+	numa_reserve_extra_nodes();
 	if (WARN_ON(nodes_empty(node_possible_map)))
 		return -EINVAL;
 

@@ -25,6 +25,13 @@
  *   Access pattern  -> NUMA balancing -> pages promote GPU VRAM -> DRAM
  *   Shrink request  -> offline_and_remove_memory -> pages back to DRAM
  *
+ * Initialization:
+ *   Each gxl.device=SLOT on the command line automatically reserves a
+ *   NUMA node via numa_extra_reserve_count during early boot, ensuring
+ *   all per-node arrays (cpumasks, pgdat, workqueue node_nr_active) are
+ *   properly sized.  A PCI bus notifier defers per-device setup until
+ *   the GPU appears on the bus.
+ *
  * Copyright (C) 2026
  */
 
@@ -37,11 +44,11 @@
 #include <linux/memory-tiers.h>
 #include <linux/memory_hotplug.h>
 #include <linux/numa.h>
+#include <linux/numa_memblks.h>
 #include <linux/node.h>
 #include <linux/slab.h>
 #include <linux/kobject.h>
 #include <linux/mutex.h>
-#include <asm/numa.h>
 
 /*
  * Abstract distance for GPU VRAM over PCIe.
@@ -64,7 +71,7 @@ static const char *gxl_res_name = "System RAM (gxl)";
 struct gxl_dev {
 	char			slot[64];	/* PCI slot string */
 	struct pci_dev		*pdev;
-	struct resource		*res;
+	int			bar_idx;
 	int			mgid;
 	int			numa_node;
 	resource_size_t		phys_start;
@@ -89,6 +96,15 @@ static struct memory_dev_type *gxl_mtype;
 static struct kobject *gxl_kobj;
 
 /*
+ * PCI bus notifier for deferred device initialization.
+ * gxl_init_mutex serializes gxl_init_one() calls from the notifier
+ * and the gxl_init() scan loop so that gxl_claim_node() cannot hand
+ * the same NUMA node to two devices.
+ */
+static DEFINE_MUTEX(gxl_init_mutex);
+static struct notifier_block gxl_pci_nb;
+
+/*
  * Parameters
  */
 static unsigned int gxl_max_pool_percent = 80;
@@ -97,7 +113,7 @@ MODULE_PARM_DESC(max_pool_percent, "Percentage of VRAM to expose as system memor
 
 /*
  * gxl.device=SLOT -- early_param, called once per GPU.
- * Each invocation appends to gxl_devs[].
+ * Each invocation appends to gxl_devs[] and reserves a NUMA node.
  */
 static int __init gxl_setup_device(char *arg)
 {
@@ -109,66 +125,31 @@ static int __init gxl_setup_device(char *arg)
 	strscpy(gxl_devs[gxl_nr_devs].slot, arg,
 		sizeof(gxl_devs[gxl_nr_devs].slot));
 	gxl_nr_devs++;
+
+	/*
+	 * Reserve a NUMA node for this device.  This increments the
+	 * count used by numa_reserve_extra_nodes() during NUMA init
+	 * (in numa_register_meminfo()), which runs after all early_params.
+	 * The reserved nodes are added to node_possible_map before
+	 * setup_nr_node_ids(), ensuring all per-node arrays are properly
+	 * sized: node_to_cpumask_map, NODE_DATA, workqueue node_nr_active,
+	 * memory tier node_demotion, etc.
+	 */
+	numa_extra_reserve_count++;
+
 	return 0;
 }
 early_param("gxl.device", gxl_setup_device);
 
 /*
- * Early NUMA node reservation.
- *
- * Subsystems like workqueue size per-node arrays to nr_node_ids at boot.
- * If gxl needs to create a new NUMA node at late_initcall time, those
- * arrays are already too small.  To avoid this, the user passes
- * gxl.reserve_node[=N] on the kernel command line.  This runs during
- * parse_early_param() -- before NUMA init -- and reserves N node IDs
- * (default 1) by scanning numa_nodes_parsed from MAX_NUMNODES-1 downward,
- * avoiding collision with real hardware topology.
- */
-static int gxl_reserved_nodes[GXL_MAX_DEVICES];
-static int gxl_nr_reserved;
-
-static int __init gxl_reserve_node(char *arg)
-{
-	int count = 1;
-	int nid, i;
-
-	if (arg && *arg)
-		count = simple_strtol(arg, NULL, 0);
-	if (count < 1)
-		count = 1;
-	if (count > GXL_MAX_DEVICES)
-		count = GXL_MAX_DEVICES;
-
-	for (i = 0; i < count; i++) {
-		for (nid = MAX_NUMNODES - 1; nid >= 0; nid--) {
-			if (!node_isset(nid, numa_nodes_parsed)) {
-				node_set(nid, numa_nodes_parsed);
-				gxl_reserved_nodes[gxl_nr_reserved++] = nid;
-				pr_info("reserved NUMA node %d for GPU VRAM\n",
-					nid);
-				break;
-			}
-		}
-		if (nid < 0) {
-			pr_err("no free NUMA node ID to reserve (%d of %d done)\n",
-			       i, count);
-			break;
-		}
-	}
-
-	return 0;
-}
-early_param("gxl.reserve_node", gxl_reserve_node);
-
-/*
  * BAR detection
  */
 static int gxl_find_vram_bar(struct pci_dev *pdev, resource_size_t *bar_start,
-			     unsigned long *bar_size)
+			     unsigned long *bar_size, int *bar_idxp)
 {
 	resource_size_t best_start = 0;
 	unsigned long best_size = 0;
-	int bar;
+	int bar, best_bar = -1;
 
 	for (bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
 		unsigned long flags = pci_resource_flags(pdev, bar);
@@ -184,6 +165,7 @@ static int gxl_find_vram_bar(struct pci_dev *pdev, resource_size_t *bar_start,
 		if (size > best_size) {
 			best_start = start;
 			best_size = size;
+			best_bar = bar;
 		}
 	}
 
@@ -192,6 +174,7 @@ static int gxl_find_vram_bar(struct pci_dev *pdev, resource_size_t *bar_start,
 
 	*bar_start = best_start;
 	*bar_size = best_size;
+	*bar_idxp = best_bar;
 	return 0;
 }
 
@@ -249,7 +232,30 @@ static int gxl_do_resize(struct gxl_dev *gdev, unsigned long new_size)
 
 		rc = add_memory_driver_managed(gdev->mgid, grow_start, grow,
 					       gxl_res_name, MHP_NID_IS_MGID);
-		if (rc) {
+		if (rc == -EEXIST) {
+			/*
+			 * GPU driver's PCI BAR claim blocks the memory
+			 * resource.  Release it and retry -- the driver
+			 * keeps working through existing ioremap mappings.
+			 */
+			pr_info("%s: releasing GPU driver BAR claim\n",
+				gdev->slot);
+			pci_release_region(gdev->pdev, gdev->bar_idx);
+			rc = add_memory_driver_managed(gdev->mgid, grow_start,
+						       grow, gxl_res_name,
+						       MHP_NID_IS_MGID);
+			if (rc) {
+				pr_warn("%s: grow failed after BAR release: %d, restoring\n",
+					gdev->slot, rc);
+				/* Best-effort restore; nothing to do if it fails */
+				if (pci_request_region(gdev->pdev,
+						       gdev->bar_idx,
+						       dev_driver_string(&gdev->pdev->dev)))
+					pr_warn("%s: could not restore GPU BAR claim\n",
+						gdev->slot);
+				goto out;
+			}
+		} else if (rc) {
 			pr_warn("%s: grow failed: %d\n", gdev->slot, rc);
 			goto out;
 		}
@@ -362,28 +368,12 @@ static const struct attribute_group gxl_dev_attr_group = {
 
 /*
  * Claim a NUMA node for a device.
- * 1. Pop from gxl_reserved_nodes[] (reserved at early boot)
- * 2. Fallback: scan for any offline-but-possible node
+ * Scans for any offline-but-possible node reserved at early boot.
  */
-static int __init gxl_claim_node(void)
+static int gxl_claim_node(void)
 {
-	int nid, i;
+	int i;
 
-	/* Try reserved pool first */
-	if (gxl_nr_reserved > 0) {
-		nid = gxl_reserved_nodes[--gxl_nr_reserved];
-		/*
-		 * The reserved node will typically be online already --
-		 * gxl_reserve_node() adds it to numa_nodes_parsed so that
-		 * NUMA init sizes per-node arrays to include it.  That is
-		 * expected.  Just verify it is a valid, memoryless node.
-		 */
-		if (node_possible(nid))
-			return nid;
-		pr_warn("reserved node %d is not possible, scanning\n", nid);
-	}
-
-	/* Fallback: any offline-but-possible node */
 	for (i = 0; i < nr_node_ids; i++) {
 		if (node_possible(i) && !node_online(i))
 			return i;
@@ -393,34 +383,19 @@ static int __init gxl_claim_node(void)
 }
 
 /*
- * Initialize a single device.
+ * Initialize a single device given an already-referenced PCI device.
  */
-static int __init gxl_init_one(struct gxl_dev *gdev)
+static int gxl_init_one(struct gxl_dev *gdev, struct pci_dev *pdev)
 {
-	unsigned int domain, bus, slot, func;
 	resource_size_t bar_start, aligned_start, aligned_end;
 	unsigned long bar_size, usable_size, blk_size;
-	struct pci_dev *pdev;
 	int rc;
 
 	mutex_init(&gdev->lock);
 	gdev->mgid = -1;
 	gdev->numa_node = NUMA_NO_NODE;
 
-	if (sscanf(gdev->slot, "%x:%x:%x.%x",
-		   &domain, &bus, &slot, &func) != 4) {
-		pr_err("%s: invalid device format (expected DDDD:BB:DD.F)\n",
-		       gdev->slot);
-		return -EINVAL;
-	}
-
-	pdev = pci_get_domain_bus_and_slot(domain, bus, PCI_DEVFN(slot, func));
-	if (!pdev) {
-		pr_err("%s: PCI device not found\n", gdev->slot);
-		return -ENODEV;
-	}
-
-	rc = gxl_find_vram_bar(pdev, &bar_start, &bar_size);
+	rc = gxl_find_vram_bar(pdev, &bar_start, &bar_size, &gdev->bar_idx);
 	if (rc) {
 		pr_err("%s: no prefetchable VRAM BAR found\n", gdev->slot);
 		goto err_put_pdev;
@@ -455,7 +430,6 @@ static int __init gxl_init_one(struct gxl_dev *gdev)
 	if (gdev->numa_node == NUMA_NO_NODE) {
 		pr_err("%s: no offline-but-possible NUMA node available\n",
 		       gdev->slot);
-		pr_err("add gxl.reserve_node=N to kernel command line\n");
 		rc = -ENOSPC;
 		goto err_put_pdev;
 	}
@@ -478,21 +452,11 @@ static int __init gxl_init_one(struct gxl_dev *gdev)
 	}
 	gdev->mgid = rc;
 
-	gdev->res = request_mem_region(gdev->phys_start, gdev->max_size,
-				       gxl_res_name);
-	if (!gdev->res) {
-		pr_err("%s: could not reserve VRAM region %pa+%lu (in use by GPU driver?)\n",
-		       gdev->slot, &gdev->phys_start, gdev->max_size);
-		rc = -EBUSY;
-		goto err_unreg_group;
-	}
-	gdev->res->flags = IORESOURCE_SYSTEM_RAM;
-
 	/* Per-device sysfs kobject */
 	gdev->kobj = kobject_create_and_add(gdev->slot, gxl_kobj);
 	if (!gdev->kobj) {
 		rc = -ENOMEM;
-		goto err_release_region;
+		goto err_unreg_group;
 	}
 
 	rc = sysfs_create_group(gdev->kobj, &gxl_dev_attr_group);
@@ -513,18 +477,68 @@ static int __init gxl_init_one(struct gxl_dev *gdev)
 err_put_kobj:
 	kobject_put(gdev->kobj);
 	gdev->kobj = NULL;
-err_release_region:
-	remove_resource(gdev->res);
-	kfree(gdev->res);
-	gdev->res = NULL;
 err_unreg_group:
 	memory_group_unregister(gdev->mgid);
 	gdev->mgid = -1;
 err_clear_type:
 	clear_node_memory_type(gdev->numa_node, gxl_mtype);
+	/* fall through to take node offline */
+	/* Undo try_online_node -- node has no memory or CPUs at this point */
+	lock_device_hotplug();
+	try_offline_node(gdev->numa_node);
+	unlock_device_hotplug();
+	gdev->numa_node = NUMA_NO_NODE;
 err_put_pdev:
 	pci_dev_put(pdev);
 	return rc;
+}
+
+/*
+ * Look up a PCI device from the slot string in a gxl_dev.
+ * Returns a referenced pdev, or NULL if not found.
+ */
+static struct pci_dev *gxl_find_pdev(struct gxl_dev *gdev)
+{
+	unsigned int domain, bus, slot, func;
+
+	if (sscanf(gdev->slot, "%x:%x:%x.%x",
+		   &domain, &bus, &slot, &func) != 4) {
+		pr_err("%s: invalid device format (expected DDDD:BB:DD.F)\n",
+		       gdev->slot);
+		return NULL;
+	}
+
+	return pci_get_domain_bus_and_slot(domain, bus, PCI_DEVFN(slot, func));
+}
+
+/*
+ * PCI bus notifier -- attempt device init when a configured GPU appears.
+ */
+static int gxl_pci_bus_notify(struct notifier_block *nb,
+			      unsigned long action, void *data)
+{
+	struct pci_dev *pdev = to_pci_dev(data);
+	int i;
+
+	if (action != BUS_NOTIFY_ADD_DEVICE)
+		return NOTIFY_DONE;
+
+	mutex_lock(&gxl_init_mutex);
+	for (i = 0; i < gxl_nr_devs; i++) {
+		if (gxl_devs[i].ready)
+			continue;
+		if (strcmp(gxl_devs[i].slot, pci_name(pdev)) != 0)
+			continue;
+
+		pci_dev_get(pdev);
+		if (gxl_init_one(&gxl_devs[i], pdev))
+			pr_info("%s: deferred init failed, will not retry\n",
+				gxl_devs[i].slot);
+		break;
+	}
+	mutex_unlock(&gxl_init_mutex);
+
+	return NOTIFY_DONE;
 }
 
 /*
@@ -532,6 +546,7 @@ err_put_pdev:
  */
 static int __init gxl_init(void)
 {
+	struct pci_dev *pdev;
 	int i, rc, ok = 0;
 
 	if (!gxl_nr_devs)
@@ -554,22 +569,32 @@ static int __init gxl_init(void)
 		return -ENOMEM;
 	}
 
+	/*
+	 * Register notifier BEFORE scanning so that devices appearing
+	 * between the scan and registration are not missed.
+	 */
+	gxl_pci_nb.notifier_call = gxl_pci_bus_notify;
+	bus_register_notifier(&pci_bus_type, &gxl_pci_nb);
+
+	/* Try to initialize devices already present on the PCI bus */
+	mutex_lock(&gxl_init_mutex);
 	for (i = 0; i < gxl_nr_devs; i++) {
-		rc = gxl_init_one(&gxl_devs[i]);
+		if (gxl_devs[i].ready)
+			continue;
+		pdev = gxl_find_pdev(&gxl_devs[i]);
+		if (!pdev)
+			continue;
+
+		rc = gxl_init_one(&gxl_devs[i], pdev);
 		if (rc)
 			pr_err("%s: init failed: %d\n", gxl_devs[i].slot, rc);
 		else
 			ok++;
 	}
+	mutex_unlock(&gxl_init_mutex);
 
-	if (!ok) {
-		pr_err("no devices initialized successfully\n");
-		kobject_put(gxl_kobj);
-		gxl_kobj = NULL;
-		put_memory_type(gxl_mtype);
-		gxl_mtype = NULL;
-		return -ENODEV;
-	}
+	if (!ok)
+		pr_info("no devices found yet, waiting for PCI bus notifications\n");
 
 	return 0;
 }
