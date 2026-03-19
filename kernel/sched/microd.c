@@ -621,13 +621,26 @@ wakeup_preempt_microd(struct rq *rq, struct task_struct *p, int flags)
 	update_curr_microd_vruntime(rq);
 
 	/*
-	 * For sync wakeups (pipe, futex), the waker is about to
-	 * block — always preempt so the wakee runs immediately.
-	 * This avoids the MIN_GRANULARITY threshold check and
-	 * lets the wakee start sooner.
+	 * Sync wakeups (pipe, futex): the waker is about to block.
+	 *
+	 * Only preempt if the current task has been running for at
+	 * least CACHE_HOT_NS (~500µs). This lets batch producers
+	 * (like hackbench senders doing 100 pipe writes) complete
+	 * their burst before yielding to the reader, avoiding
+	 * per-message context switch overhead.
+	 *
+	 * For true ping-pong (one write then block), the waker will
+	 * block on its next read() and the scheduler naturally picks
+	 * the wakee — no forced preemption needed.
+	 *
+	 * Matches CFS's preempt_sync() which uses migration_cost as
+	 * the threshold and returns NONE (no preempt) when not met.
 	 */
 	if (flags & WF_SYNC) {
-		resched_curr(rq);
+		u64 delta = rq_clock_task(rq) - curr->se.exec_start;
+
+		if ((s64)delta >= (s64)microd_cache_hot_ns)
+			resched_curr(rq);
 		return;
 	}
 
@@ -959,6 +972,49 @@ select_task_rq_microd(struct task_struct *p, int prev_cpu, int flags)
 		microd_record_wakee(p);
 	if (cpu >= 0)
 		return cpu;
+
+	/*
+	 * Fork balancing: spread new tasks across the LLC.
+	 *
+	 * CFS uses SD_BALANCE_FORK → sched_balance_find_dst_cpu() to
+	 * find the idlest CPU within the LLC domain. We do the same:
+	 * scan the LLC for the least-loaded CPU, with a randomized
+	 * start to prevent thundering-herd pileup when many children
+	 * are forked from the same parent CPU.
+	 */
+	if (flags & WF_FORK) {
+		struct sched_domain *sd;
+		int best_llc_cpu = -1;
+		unsigned int best_llc_nr = UINT_MAX;
+
+		rcu_read_lock();
+		sd = rcu_dereference(per_cpu(sd_llc, prev_cpu));
+		if (sd) {
+			const struct cpumask *llc_span = sched_domain_span(sd);
+
+			for_each_cpu_wrap(cpu, llc_span, prev_cpu + 1) {
+				unsigned int nr;
+
+				if (!cpumask_test_cpu(cpu, allowed))
+					continue;
+				nr = cpu_rq(cpu)->microd.nr_running;
+				if (nr == 0) {
+					rcu_read_unlock();
+					return cpu;
+				}
+				if (nr < best_llc_nr) {
+					best_llc_nr = nr;
+					best_llc_cpu = cpu;
+				}
+			}
+		}
+		rcu_read_unlock();
+
+		if (best_llc_cpu >= 0)
+			return best_llc_cpu;
+
+		/* LLC had no valid CPUs — fall through to general path */
+	}
 
 	/* 1. prev_cpu if idle — fast path, no scanning */
 	if (cpu_active(prev_cpu) && cpumask_test_cpu(prev_cpu, allowed) &&
