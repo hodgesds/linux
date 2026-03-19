@@ -34,12 +34,12 @@
 #include <linux/memory.h>
 #include <linux/memory-tiers.h>
 #include <linux/memory_hotplug.h>
-#include <linux/mmzone.h>
 #include <linux/numa.h>
 #include <linux/node.h>
 #include <linux/slab.h>
 #include <linux/kobject.h>
 #include <linux/mutex.h>
+#include <asm/numa.h>
 
 /*
  * Abstract distance for GPU VRAM over PCIe.
@@ -83,6 +83,36 @@ static unsigned long gxl_max_size;	/* max usable VRAM (aligned) */
 static unsigned long gxl_online_size;	/* currently registered size */
 
 static bool gxl_ready;			/* init completed successfully */
+
+/*
+ * Early NUMA node reservation.
+ *
+ * Subsystems like workqueue size per-node arrays to nr_node_ids at boot.
+ * If gxl needs to create a new NUMA node at late_initcall time, those
+ * arrays are already too small.  To avoid this, the user passes
+ * gxl.reserve_node on the kernel command line.  This runs during
+ * parse_early_param() -- before NUMA init -- and adds an extra node
+ * to numa_nodes_parsed so that setup_nr_node_ids() accounts for it.
+ */
+static int gxl_reserved_node = NUMA_NO_NODE;
+
+static int __init gxl_reserve_node(char *arg)
+{
+	int nid;
+
+	for (nid = 0; nid < MAX_NUMNODES; nid++) {
+		if (!node_isset(nid, numa_nodes_parsed)) {
+			node_set(nid, numa_nodes_parsed);
+			gxl_reserved_node = nid;
+			pr_info("reserved NUMA node %d for GPU VRAM\n", nid);
+			return 0;
+		}
+	}
+
+	pr_err("no free NUMA node ID to reserve\n");
+	return 0;
+}
+early_param("gxl.reserve_node", gxl_reserve_node);
 
 static struct kobject *gxl_kobj;
 
@@ -338,75 +368,36 @@ static int __init gxl_init(void)
 	 * DRAM node because init_node_memory_type() would reclassify
 	 * all of that node's memory (including DRAM) as GPU VRAM tier.
 	 *
-	 * First try to find an offline-but-possible node.  If none
-	 * exists (common on single-socket systems without SRAT), claim
-	 * the first unused node ID and add it to the possible map so
-	 * the memory hotplug path will accept it.
+	 * Use the node reserved by the gxl.reserve_node early param,
+	 * or fall back to any offline-but-possible node (e.g. from
+	 * ACPI SRAT).  We cannot create new possible nodes here
+	 * because subsystems like workqueue have already sized
+	 * per-node arrays to nr_node_ids.
 	 */
 	gxl_numa_node = NUMA_NO_NODE;
-	for (rc = 0; rc < MAX_NUMNODES; rc++) {
-		if (node_possible(rc) && !node_online(rc)) {
-			gxl_numa_node = rc;
-			break;
-		}
-	}
+	if (gxl_reserved_node != NUMA_NO_NODE &&
+	    node_possible(gxl_reserved_node) && !node_online(gxl_reserved_node))
+		gxl_numa_node = gxl_reserved_node;
+
 	if (gxl_numa_node == NUMA_NO_NODE) {
-		for (rc = 0; rc < MAX_NUMNODES; rc++) {
-			if (!node_possible(rc)) {
-				/*
-				 * free_area_init() allocates NODE_DATA for
-				 * every possible node at early boot.  We
-				 * missed that window, so allocate pgdat now
-				 * before making the node visible.
-				 */
-				node_data[rc] = kzalloc(sizeof(pg_data_t),
-							GFP_KERNEL);
-				if (!node_data[rc]) {
-					rc = -ENOMEM;
-					goto err_put_pdev;
-				}
-				/*
-				 * hotadd_init_pgdat() reads pgdat->node_id
-				 * for zone initialisation -- set it before
-				 * try_online_node() is called.
-				 */
-				node_data[rc]->node_id = rc;
-				node_set(rc, node_possible_map);
-				if (rc >= nr_node_ids)
-					nr_node_ids = rc + 1;
-				/*
-				 * node_demotion[] in memory-tiers.c was
-				 * allocated with the old nr_node_ids.
-				 * Grow it before the node can enter
-				 * N_MEMORY and be visited by
-				 * establish_demotion_targets().
-				 */
-				if (memory_tier_realloc_demotion()) {
-					node_clear(rc, node_possible_map);
-					kfree(node_data[rc]);
-					node_data[rc] = NULL;
-					rc = -ENOMEM;
-					goto err_put_pdev;
-				}
+		for (rc = 0; rc < nr_node_ids; rc++) {
+			if (node_possible(rc) && !node_online(rc)) {
 				gxl_numa_node = rc;
-				pr_info("claimed NUMA node %d for GPU VRAM\n",
-					rc);
 				break;
 			}
 		}
 	}
 	if (gxl_numa_node == NUMA_NO_NODE) {
-		pr_err("no available NUMA node for GPU VRAM\n");
+		pr_err("no offline-but-possible NUMA node available\n");
+		pr_err("add gxl.reserve_node to kernel command line\n");
 		rc = -ENOSPC;
 		goto err_put_pdev;
 	}
 
 	/*
 	 * Bring the node online so pgdat zones and zonelists are
-	 * initialised.  For nodes found in the first loop this is a
-	 * no-cost re-init; for nodes we just claimed it is mandatory
-	 * because hotadd_init_pgdat() sets up the empty zones that
-	 * add_memory_driver_managed() will later populate.
+	 * initialised.  hotadd_init_pgdat() sets up the empty zones
+	 * that add_memory_driver_managed() will later populate.
 	 */
 	rc = try_online_node(gxl_numa_node);
 	if (rc < 0) {
