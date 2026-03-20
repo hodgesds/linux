@@ -321,15 +321,15 @@ static inline bool __minlat_less(struct rb_node *a, const struct rb_node *b)
 	return (s64)(ea->vruntime - eb->vruntime) < 0;
 }
 
-static void __enqueue_minlat_entity(struct minlat_rq *minlat_rq,
-				    struct sched_minlat_entity *me)
+static inline void __enqueue_minlat_entity(struct minlat_rq *minlat_rq,
+					   struct sched_minlat_entity *me)
 {
 	rb_add_cached(&me->run_node, &minlat_rq->tasks_timeline,
 		      __minlat_less);
 }
 
-static void __dequeue_minlat_entity(struct minlat_rq *minlat_rq,
-				    struct sched_minlat_entity *me)
+static inline void __dequeue_minlat_entity(struct minlat_rq *minlat_rq,
+					   struct sched_minlat_entity *me)
 {
 	if (RB_EMPTY_NODE(&me->run_node))
 		return;
@@ -551,7 +551,7 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	}
 }
 
-static bool
+bool
 dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct sched_minlat_entity *me = &p->minlat;
@@ -725,12 +725,6 @@ wakeup_preempt_minlat(struct rq *rq, struct task_struct *p, int flags)
 		return;
 	}
 
-	/*
-	 * Freshen current's vruntime for accurate comparison.
-	 * Lightweight: just accounting, no tree reposition.
-	 */
-	update_curr_minlat_vruntime(rq);
-
 	if (test_tsk_need_resched(curr))
 		return;
 
@@ -744,18 +738,13 @@ wakeup_preempt_minlat(struct rq *rq, struct task_struct *p, int flags)
 	/* Set the wakee as the preferred next task (NEXT_BUDDY) */
 	set_next_buddy_minlat(minlat_rq, &p->minlat);
 
-	delta = (s64)(curr->minlat.vruntime - p->minlat.vruntime);
-
 	/*
 	 * WF_SYNC: waker expects to sleep soon. The buddy is set above,
 	 * ensuring the wakee gets picked at the next scheduling decision.
 	 *
-	 * Use lazy reschedule unconditionally: the waker is about to
-	 * block so the context switch is free. In EEVDF, preempt_sync()
-	 * may not fire, but __pick_eevdf() almost always picks the
-	 * freshly-woken task via its deadline advantage. Since minlat
-	 * lacks deadlines, we compensate by always lazy-rescheduling
-	 * for sync wakeups — the buddy mechanism then handles the pick.
+	 * Skip update_curr — put_prev_task will freshen vruntime when
+	 * the waker actually blocks. This eliminates a redundant
+	 * rq_clock_task + vruntime update on the hot sync wakeup path.
 	 */
 	if (flags & WF_SYNC) {
 		resched_curr_lazy(rq);
@@ -763,11 +752,14 @@ wakeup_preempt_minlat(struct rq *rq, struct task_struct *p, int flags)
 	}
 
 	/*
+	 * Non-sync: freshen current's vruntime for accurate comparison.
+	 */
+	update_curr_minlat_vruntime(rq);
+
+	delta = (s64)(curr->minlat.vruntime - p->minlat.vruntime);
+
+	/*
 	 * Pick check: preempt if the wakee has a vruntime advantage.
-	 * Analogous to EEVDF's __pick_eevdf() == pse — would our
-	 * pick algorithm select the wakee? Since minlat picks the
-	 * lowest vruntime, this fires when the wakee would be chosen.
-	 *
 	 * No min_granularity guard here; that's enforced only at tick
 	 * time to prevent thrashing among competing running tasks.
 	 */
@@ -1112,10 +1104,14 @@ static int minlat_wake_affine_cpu(struct task_struct *p, int prev_cpu,
 	 * the warm cache on this_cpu.
 	 */
 	if (flags & WF_SYNC) {
-		unsigned int this_nr = cpu_rq(this_cpu)->minlat.nr_running;
-		unsigned int prev_nr = (this_cpu == prev_cpu) ?
-			UINT_MAX :
-			cpu_rq(prev_cpu)->minlat.nr_running;
+		unsigned int this_nr, prev_nr;
+
+		/*
+		 * Same CPU: the waker is about to sleep, freeing this
+		 * CPU for the wakee. Always affine — no point scanning.
+		 */
+		if (this_cpu == prev_cpu)
+			return this_cpu;
 
 		/*
 		 * After waker blocks, this_cpu has (this_nr - 1) tasks.
@@ -1123,6 +1119,8 @@ static int minlat_wake_affine_cpu(struct task_struct *p, int prev_cpu,
 		 * Matches CFS wake_affine_weight() which subtracts the
 		 * waker's load from this_cpu for sync wakeups.
 		 */
+		this_nr = cpu_rq(this_cpu)->minlat.nr_running;
+		prev_nr = cpu_rq(prev_cpu)->minlat.nr_running;
 		if (this_nr <= prev_nr + 1)
 			return this_cpu;
 	}

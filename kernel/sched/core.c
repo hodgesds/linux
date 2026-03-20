@@ -5938,38 +5938,83 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 #ifdef CONFIG_SCHED_CLASS_MINLAT
 	/*
 	 * Minlat fast path: when only minlat+CFS tasks exist and prev is
-	 * at or below minlat class, pick directly from the minlat rb-tree.
-	 * This avoids prev_balance() and iterating stop/dl/rt pick_task
-	 * callbacks, saving ~3 indirect calls per schedule.
+	 * at or below minlat class, pick directly without prev_balance()
+	 * or iterating stop/dl/rt pick_task callbacks.
+	 *
+	 * Priority order:
+	 *  1. Wakeup buddy (set by sync wakeup — O(1), no tree traversal)
+	 *  2. Leftmost in rb-tree (with inline delayed entity handling)
+	 *  3. Curr out-of-tree fallback
 	 */
 	if (!sched_class_above(prev->sched_class, &minlat_sched_class) &&
 	    rq->nr_running == rq->minlat.nr_running + rq->cfs.h_nr_queued) {
 		if (rq->minlat.nr_running) {
+			struct sched_minlat_entity *me;
 			struct rb_node *left;
+
+			/*
+			 * Buddy fast path: sync wakeups set a buddy via
+			 * wakeup_preempt. Pick it directly — the buddy
+			 * was just woken (ttwu_runnable cleared its
+			 * delayed flag), so it's always non-delayed.
+			 * Avoids tree traversal entirely for pipe/IPC.
+			 */
+			me = rq->minlat.next;
+			if (me && !RB_EMPTY_NODE(&me->run_node)) {
+				p = container_of(me, struct task_struct,
+						 minlat);
+				if (likely(!p->se.sched_delayed)) {
+					rq->minlat.next = NULL;
+					put_prev_set_next_task(rq, prev, p);
+					return p;
+				}
+			}
 
 			left = rb_first_cached(&rq->minlat.tasks_timeline);
 			if (likely(left)) {
-				struct sched_minlat_entity *me;
-
 				me = rb_entry(left, struct sched_minlat_entity,
 					      run_node);
 				p = container_of(me, struct task_struct, minlat);
 
-				/*
-				 * Delayed entity — use slow path which
-				 * handles force-dequeue properly.
-				 */
-				if (unlikely(p->se.sched_delayed))
-					goto restart;
+				if (unlikely(p->se.sched_delayed)) {
+					/*
+					 * Delayed entity at leftmost —
+					 * force-dequeue inline and retry.
+					 * Avoids the expensive restart path
+					 * (prev_balance + class iteration).
+					 *
+					 * PSI/uclamp already handled when
+					 * the task first slept — safe to
+					 * call the class method directly.
+					 */
+					dequeue_task_minlat(rq, p,
+						DEQUEUE_SLEEP | DEQUEUE_DELAYED);
 
-				put_prev_set_next_task(rq, prev, p);
-				return p;
+					left = rb_first_cached(
+						&rq->minlat.tasks_timeline);
+					if (left) {
+						me = rb_entry(left,
+						    struct sched_minlat_entity,
+						    run_node);
+						p = container_of(me,
+						    struct task_struct, minlat);
+						if (likely(!p->se.sched_delayed)) {
+							put_prev_set_next_task(
+								rq, prev, p);
+							return p;
+						}
+					}
+
+					/* Fall to curr check below */
+				} else {
+					put_prev_set_next_task(rq, prev, p);
+					return p;
+				}
 			}
 
 			/*
 			 * Tree empty but nr_running > 0: the only minlat
 			 * task is curr (out-of-tree). Re-pick it.
-			 * Skip if curr is delayed (sleeping).
 			 */
 			if (rq->minlat.curr && rq->minlat.curr->on_rq) {
 				p = container_of(rq->minlat.curr,
