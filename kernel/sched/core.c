@@ -5954,6 +5954,14 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 				me = rb_entry(left, struct sched_minlat_entity,
 					      run_node);
 				p = container_of(me, struct task_struct, minlat);
+
+				/*
+				 * Delayed entity — use slow path which
+				 * handles force-dequeue properly.
+				 */
+				if (unlikely(p->se.sched_delayed))
+					goto restart;
+
 				put_prev_set_next_task(rq, prev, p);
 				return p;
 			}
@@ -5961,10 +5969,13 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 			/*
 			 * Tree empty but nr_running > 0: the only minlat
 			 * task is curr (out-of-tree). Re-pick it.
+			 * Skip if curr is delayed (sleeping).
 			 */
 			if (rq->minlat.curr && rq->minlat.curr->on_rq) {
 				p = container_of(rq->minlat.curr,
 						 struct task_struct, minlat);
+				if (unlikely(p->se.sched_delayed))
+					goto restart;
 				put_prev_set_next_task(rq, prev, p);
 				return p;
 			}

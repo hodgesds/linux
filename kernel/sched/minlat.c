@@ -76,30 +76,28 @@ unsigned int minlat_numa_imbalance_min = 2;
 unsigned int minlat_migration_cooldown_ns = 4 * NSEC_PER_MSEC;
 unsigned int minlat_numa_saturated_pct = 75;
 unsigned int minlat_wake_affine = 1;
+/*
+ * Fork balancing imbalance thresholds (percentage).
+ * A remote LLC is preferred over local when its per-CPU load
+ * is lower by at least this percentage. Cross-NUMA requires
+ * a larger imbalance to justify the migration cost.
+ */
+unsigned int minlat_fork_imbalance_pct = 25;
+unsigned int minlat_fork_numa_imbalance_pct = 50;
 
 #define MINLAT_LATENCY_NS		minlat_latency_ns
 #define MINLAT_MIN_GRANULARITY_NS	minlat_min_granularity_ns
 
 /*
- * Track how many CPUs have >1 minlat task (overloaded).
- * Used to fast-skip idle-pull when no CPU has tasks to donate.
+ * Global count of overloaded CPUs (those with 2+ minlat tasks).
+ * O(1) check replaces O(N_CPUs) scan — critical for idle-pull
+ * fast-skip on large machines.
  */
-/*
- * Check if any online CPU has 2+ minlat tasks. Uses per-rq overloaded
- * flags — cheap READ_ONCE reads, no atomics on the enqueue/dequeue path.
- * Tolerates stale values: worst case is one missed or unnecessary pull.
- */
+static atomic_t minlat_nr_overloaded = ATOMIC_INIT(0);
+
 static bool sched_minlat_any_overloaded(struct rq *this_rq)
 {
-	int cpu;
-
-	for_each_online_cpu(cpu) {
-		if (cpu == this_rq->cpu)
-			continue;
-		if (READ_ONCE(cpu_rq(cpu)->minlat.overloaded))
-			return true;
-	}
-	return false;
+	return atomic_read(&minlat_nr_overloaded) > 0;
 }
 
 /* ---- priority/weight tables ---- */
@@ -306,6 +304,7 @@ void init_minlat_rq(struct minlat_rq *minlat_rq)
 {
 	minlat_rq->tasks_timeline = RB_ROOT_CACHED;
 	minlat_rq->curr = NULL;
+	minlat_rq->next = NULL;
 	minlat_rq->nr_running = 0;
 	minlat_rq->min_vruntime = 0;
 	minlat_rq->load_weight = 0;
@@ -509,6 +508,20 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	struct sched_minlat_entity *me = &p->minlat;
 	struct minlat_rq *minlat_rq = &rq->minlat;
 
+	/*
+	 * ENQUEUE_DELAYED: re-enable a delayed entity. The entity is
+	 * already in the rb-tree with correct vruntime — just clear
+	 * the delayed flag. No rb-tree operations needed.
+	 *
+	 * This is called from ttwu_runnable() when a task with
+	 * p->se.sched_delayed wakes up on the same CPU. O(1) wakeup!
+	 */
+	if (flags & ENQUEUE_DELAYED) {
+		WARN_ON_ONCE(!p->se.sched_delayed);
+		p->se.sched_delayed = 0;
+		return;
+	}
+
 	if (!me->on_rq) {
 		/*
 		 * First enqueue or wakeup from sleep — weight may need
@@ -532,8 +545,10 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	minlat_rq->load_weight += scale_load_down(me->load.weight);
 	add_nr_running(rq, 1);
 
-	if (minlat_rq->nr_running >= 2)
+	if (minlat_rq->nr_running >= 2 && !minlat_rq->overloaded) {
 		WRITE_ONCE(minlat_rq->overloaded, true);
+		atomic_inc(&minlat_nr_overloaded);
+	}
 }
 
 static bool
@@ -544,13 +559,55 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	bool was_curr = (minlat_rq->curr == me);
 	bool was_leftmost = false;
 
+	if (minlat_rq->next == me)
+		minlat_rq->next = NULL;
+
+	/*
+	 * Delayed dequeue: keep sleeping curr on the runqueue to avoid
+	 * the full dequeue+enqueue cycle for brief sleep/wake patterns
+	 * (pipes, futex, hackbench). Mirrors EEVDF's DELAY_DEQUEUE.
+	 *
+	 * When curr sleeps and there are other runnable tasks, mark it
+	 * delayed and return false. block_task() skips __block_task(),
+	 * leaving p->on_rq = TASK_ON_RQ_QUEUED. put_prev_task will
+	 * re-insert the entity into the tree. If the task wakes before
+	 * pick, ttwu_runnable() clears delayed via ENQUEUE_DELAYED — O(1).
+	 *
+	 * If still delayed at pick_task time, force-dequeue via
+	 * DEQUEUE_DELAYED. Skip delay for DEQUEUE_SPECIAL (TASK_DEAD).
+	 * Skip when nr_running == 1 (no other task to pick, force-dequeue
+	 * would fire immediately anyway).
+	 *
+	 * Only delay when the task ran briefly before sleeping — this
+	 * captures tight IPC loops (pipe, futex, message passing) while
+	 * avoiding latency regression for compute-then-sleep patterns
+	 * where migration to an idle CPU (via full ttwu) is beneficial.
+	 */
+	if ((flags & DEQUEUE_SLEEP) && was_curr &&
+	    !(flags & (DEQUEUE_DELAYED | DEQUEUE_SPECIAL)) &&
+	    me->on_rq && minlat_rq->nr_running > 1) {
+		u64 run_ns = p->se.sum_exec_runtime -
+			     p->se.prev_sum_exec_runtime;
+
+		/* Only delay for short-running tasks (IPC pattern) */
+		if (run_ns < max_t(u64, MINLAT_MIN_GRANULARITY_NS,
+				   sysctl_sched_base_slice)) {
+			p->se.sched_delayed = 1;
+			return false;
+		}
+	}
+
+	/* Clear delayed flag on force-dequeue */
+	if (flags & DEQUEUE_DELAYED)
+		p->se.sched_delayed = 0;
+
 	if (was_curr) {
 		/*
 		 * Currently running entity is already out of the tree
 		 * (removed by set_next_task). Just clear curr.
 		 */
 		minlat_rq->curr = NULL;
-	} else {
+	} else if (me->on_rq && !RB_EMPTY_NODE(&me->run_node)) {
 		/* Check if this was leftmost before removing */
 		was_leftmost = (rb_first_cached(&minlat_rq->tasks_timeline) ==
 				&me->run_node);
@@ -559,8 +616,10 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 
 	minlat_rq->nr_running--;
 
-	if (minlat_rq->nr_running < 2)
+	if (minlat_rq->nr_running < 2 && minlat_rq->overloaded) {
 		WRITE_ONCE(minlat_rq->overloaded, false);
+		atomic_dec(&minlat_nr_overloaded);
+	}
 	minlat_rq->load_weight -= scale_load_down(me->load.weight);
 	sub_nr_running(rq, 1);
 
@@ -572,6 +631,19 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	/* Only update min_vruntime if the leftmost node changed */
 	if (was_leftmost)
 		update_min_vruntime(minlat_rq);
+
+	/*
+	 * Fix-up what block_task() skipped for delayed dequeue.
+	 * Generic code (wait_task_inactive, etc.) calls dequeue_task()
+	 * with DEQUEUE_DELAYED but never calls __block_task() itself.
+	 * CFS handles this in dequeue_entities(); we must do the same.
+	 *
+	 * Must be last — p may not be valid after __block_task() since
+	 * ttwu() can migrate the task once p->on_rq is cleared.
+	 */
+	if ((flags & DEQUEUE_DELAYED) && (flags & DEQUEUE_SLEEP))
+		__block_task(rq, p);
+
 	return true;
 }
 
@@ -602,10 +674,50 @@ static void yield_task_minlat(struct rq *rq)
 		minlat_calc_delta(MINLAT_LATENCY_NS, me);
 }
 
+/*
+ * Set the wakeup buddy — mirrors CFS set_next_buddy().
+ *
+ * The buddy is a hint to pick_task_minlat() to prefer this entity
+ * at the next scheduling decision. Unlike CFS which walks cgroup
+ * hierarchy, minlat is flat so we just set the per-rq pointer.
+ *
+ * Keep an existing buddy if it has a lower vruntime (more claim to
+ * run). This mirrors CFS set_preempt_buddy() which keeps an existing
+ * buddy with an earlier deadline.
+ */
+static void set_next_buddy_minlat(struct minlat_rq *minlat_rq,
+				  struct sched_minlat_entity *me)
+{
+	if (minlat_rq->next &&
+	    (s64)(me->vruntime - minlat_rq->next->vruntime) > 0)
+		return;
+
+	minlat_rq->next = me;
+}
+
+/*
+ * Wakeup preemption — mirrors EEVDF's wakeup_preempt_fair() structure:
+ *
+ *  1. update_curr — freshen current's vruntime
+ *  2. Skip if already rescheduling
+ *  3. Skip WF_FORK (forked tasks unlikely to share data)
+ *  4. Set wakee as next buddy (like CFS NEXT_BUDDY)
+ *  5. WF_SYNC: preempt if wakee has vruntime advantage AND current
+ *     ran >= cache_hot threshold (mirrors preempt_sync()).
+ *     Also lazy-resched unconditionally since waker is about to block.
+ *  6. Pick check: preempt if wakee has lower vruntime than current
+ *     (analogous to __pick_eevdf() == pse)
+ *  7. Use resched_curr_lazy() like EEVDF
+ *
+ * No min_granularity on the wakeup path — that's for tick preemption
+ * only (task_tick). EEVDF similarly separates slice protection
+ * (RUN_TO_PARITY) from wakeup preemption.
+ */
 static void
 wakeup_preempt_minlat(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct task_struct *curr = rq->curr;
+	struct minlat_rq *minlat_rq = &rq->minlat;
 	s64 delta;
 
 	if (curr->sched_class != &minlat_sched_class) {
@@ -614,39 +726,68 @@ wakeup_preempt_minlat(struct rq *rq, struct task_struct *p, int flags)
 	}
 
 	/*
-	 * Lightweight vruntime update — just accounting, no tree
-	 * reposition. We need fresh vruntime for a correct preemption
-	 * comparison, but tree ordering can wait until put_prev_task.
+	 * Freshen current's vruntime for accurate comparison.
+	 * Lightweight: just accounting, no tree reposition.
 	 */
 	update_curr_minlat_vruntime(rq);
 
+	if (test_tsk_need_resched(curr))
+		return;
+
 	/*
-	 * Sync wakeups (pipe, futex): the waker is about to block.
+	 * Don't preempt for forked tasks — they are unlikely to
+	 * share data with the parent. Mirrors EEVDF WF_FORK skip.
+	 */
+	if (flags & WF_FORK)
+		return;
+
+	/* Set the wakee as the preferred next task (NEXT_BUDDY) */
+	set_next_buddy_minlat(minlat_rq, &p->minlat);
+
+	delta = (s64)(curr->minlat.vruntime - p->minlat.vruntime);
+
+	/*
+	 * WF_SYNC: waker expects to sleep soon. The buddy is set above,
+	 * ensuring the wakee gets picked at the next scheduling decision.
 	 *
-	 * Only preempt if the current task has been running for at
-	 * least CACHE_HOT_NS (~500µs). This lets batch producers
-	 * (like hackbench senders doing 100 pipe writes) complete
-	 * their burst before yielding to the reader, avoiding
-	 * per-message context switch overhead.
-	 *
-	 * For true ping-pong (one write then block), the waker will
-	 * block on its next read() and the scheduler naturally picks
-	 * the wakee — no forced preemption needed.
-	 *
-	 * Matches CFS's preempt_sync() which uses migration_cost as
-	 * the threshold and returns NONE (no preempt) when not met.
+	 * Use lazy reschedule unconditionally: the waker is about to
+	 * block so the context switch is free. In EEVDF, preempt_sync()
+	 * may not fire, but __pick_eevdf() almost always picks the
+	 * freshly-woken task via its deadline advantage. Since minlat
+	 * lacks deadlines, we compensate by always lazy-rescheduling
+	 * for sync wakeups — the buddy mechanism then handles the pick.
 	 */
 	if (flags & WF_SYNC) {
-		u64 delta = rq_clock_task(rq) - curr->se.exec_start;
-
-		if ((s64)delta >= (s64)minlat_cache_hot_ns)
-			resched_curr(rq);
+		resched_curr_lazy(rq);
 		return;
 	}
 
-	delta = (s64)(curr->minlat.vruntime - p->minlat.vruntime);
-	if (delta > (s64)MINLAT_MIN_GRANULARITY_NS)
-		resched_curr(rq);
+	/*
+	 * Pick check: preempt if the wakee has a vruntime advantage.
+	 * Analogous to EEVDF's __pick_eevdf() == pse — would our
+	 * pick algorithm select the wakee? Since minlat picks the
+	 * lowest vruntime, this fires when the wakee would be chosen.
+	 *
+	 * No min_granularity guard here; that's enforced only at tick
+	 * time to prevent thrashing among competing running tasks.
+	 */
+	if (delta > 0)
+		resched_curr_lazy(rq);
+}
+
+/*
+ * Check if an entity is eligible for buddy selection.
+ *
+ * The buddy's vruntime must not be too far ahead of min_vruntime
+ * to prevent unfairness. Mirrors EEVDF's entity_eligible() which
+ * checks vruntime <= avg_vruntime. Since minlat doesn't track
+ * avg_vruntime, we use min_vruntime + latency_target as the bound.
+ */
+static bool minlat_buddy_eligible(struct minlat_rq *minlat_rq,
+				  struct sched_minlat_entity *me)
+{
+	return (s64)(me->vruntime - minlat_rq->min_vruntime) <=
+	       (s64)MINLAT_LATENCY_NS;
 }
 
 static struct task_struct *
@@ -654,18 +795,62 @@ pick_task_minlat(struct rq *rq, struct rq_flags *rf)
 {
 	struct minlat_rq *minlat_rq = &rq->minlat;
 	struct sched_minlat_entity *me;
+	struct task_struct *p;
 
-	me = __pick_first_minlat_entity(minlat_rq);
-	if (me)
-		return container_of(me, struct task_struct, minlat);
+	/*
+	 * PICK_BUDDY: prefer the wakeup buddy if it's still queued,
+	 * eligible, and not delayed. Mirrors EEVDF's PICK_BUDDY.
+	 */
+	if (minlat_rq->next &&
+	    !RB_EMPTY_NODE(&minlat_rq->next->run_node) &&
+	    minlat_buddy_eligible(minlat_rq, minlat_rq->next)) {
+		p = container_of(minlat_rq->next, struct task_struct, minlat);
+		if (!p->se.sched_delayed) {
+			me = minlat_rq->next;
+			minlat_rq->next = NULL;
+			return container_of(me, struct task_struct, minlat);
+		}
+	}
+	minlat_rq->next = NULL;
+
+	/*
+	 * Pick leftmost entity. If it's a delayed sleeper (kept in
+	 * the tree to avoid rb-churn), force-dequeue it and try the
+	 * next one. Mirrors EEVDF's pick_next_entity() which calls
+	 * dequeue_entities(DEQUEUE_SLEEP | DEQUEUE_DELAYED) for
+	 * delayed entities.
+	 */
+	while ((me = __pick_first_minlat_entity(minlat_rq))) {
+		p = container_of(me, struct task_struct, minlat);
+		if (!p->se.sched_delayed)
+			return p;
+
+		/*
+		 * dequeue_task_minlat with DEQUEUE_DELAYED handles
+		 * __block_task() internally, matching CFS behavior.
+		 */
+		dequeue_task_minlat(rq, p, DEQUEUE_SLEEP | DEQUEUE_DELAYED);
+	}
 
 	/*
 	 * Tree is empty but curr exists out-of-tree — return it.
 	 * This happens when the only minlat task is the currently
 	 * running one (removed from tree by set_next_task).
+	 *
+	 * If curr is delayed (sleeping), force-dequeue it here.
+	 * Unlike in-tree delayed entities (handled above), a delayed
+	 * curr is out-of-tree so __pick_first can't find it. We must
+	 * handle it explicitly. This happens when dequeue_task returns
+	 * false (delayed) and pick runs before put_prev re-inserts.
 	 */
-	if (minlat_rq->curr && minlat_rq->curr->on_rq)
-		return container_of(minlat_rq->curr, struct task_struct, minlat);
+	if (minlat_rq->curr && minlat_rq->curr->on_rq) {
+		p = container_of(minlat_rq->curr, struct task_struct, minlat);
+		if (!p->se.sched_delayed)
+			return p;
+
+		/* Force-dequeue delayed curr (out-of-tree) */
+		dequeue_task_minlat(rq, p, DEQUEUE_SLEEP | DEQUEUE_DELAYED);
+	}
 
 	/*
 	 * No minlat tasks on this CPU. Try idle-pull from a busy CPU.
@@ -735,6 +920,10 @@ set_next_task_minlat(struct rq *rq, struct task_struct *p, bool first)
 	 */
 	if (me->on_rq && !RB_EMPTY_NODE(&me->run_node))
 		__dequeue_minlat_entity(minlat_rq, me);
+
+	/* Clear buddy — it's been picked or is no longer relevant */
+	if (minlat_rq->next == me)
+		minlat_rq->next = NULL;
 
 	minlat_rq->curr = me;
 
@@ -914,26 +1103,41 @@ static int minlat_wake_affine_cpu(struct task_struct *p, int prev_cpu,
 
 	/*
 	 * Sync wakeup: the waker is going to sleep right after this.
-	 * Its CPU will be free — put the wakee there. This is the
-	 * critical path for futex ping-pong, pipe read/write, etc.
+	 * Place the wakee on the waker's CPU if its effective load
+	 * (after waker blocks) is no worse than the wakee's prev_cpu.
 	 *
-	 * Guards:
-	 *  - 1:1 pair only (last_wakee == p): prevents fan-out piling
-	 *  - Waker's CPU has only the waker: it'll truly be idle
-	 *  - wake_wide check: disables for high fan-out wakers
+	 * This mirrors CFS wake_affine_weight(): since the waker is
+	 * about to block, this_cpu's load drops by one. If that makes
+	 * it equal or lighter than prev_cpu, the wakee benefits from
+	 * the warm cache on this_cpu.
 	 */
-	if (!(flags & WF_SYNC))
-		return -1;
+	if (flags & WF_SYNC) {
+		unsigned int this_nr = cpu_rq(this_cpu)->minlat.nr_running;
+		unsigned int prev_nr = (this_cpu == prev_cpu) ?
+			UINT_MAX :
+			cpu_rq(prev_cpu)->minlat.nr_running;
 
-	if (current->last_wakee != p)
-		return -1;
-
-	{
-		struct rq *rq = cpu_rq(this_cpu);
-
-		if (rq->nr_running <= 1)
+		/*
+		 * After waker blocks, this_cpu has (this_nr - 1) tasks.
+		 * Pull wakee here if that's no heavier than prev_cpu.
+		 * Matches CFS wake_affine_weight() which subtracts the
+		 * waker's load from this_cpu for sync wakeups.
+		 */
+		if (this_nr <= prev_nr + 1)
 			return this_cpu;
 	}
+
+	/*
+	 * Non-sync: prefer an idle CPU for cache warmth.
+	 * Mirrors CFS wake_affine_idle().
+	 */
+	if (available_idle_cpu(this_cpu))
+		return this_cpu;
+
+	if (this_cpu != prev_cpu &&
+	    cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+	    available_idle_cpu(prev_cpu))
+		return prev_cpu;
 
 	return -1;
 }
@@ -983,10 +1187,21 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 	 * are forked from the same parent CPU.
 	 */
 	if (flags & WF_FORK) {
-		struct sched_domain *sd;
-		int best_llc_cpu = -1;
-		unsigned int best_llc_nr = UINT_MAX;
+		struct sched_domain *sd, *numa_sd;
+		int best_cpu_local = -1, best_cpu_remote = -1;
+		unsigned int best_nr_local = UINT_MAX;
+		unsigned int best_nr_remote = UINT_MAX;
+		int local_llc_load = 0, remote_llc_load = 0;
+		int local_llc_cpus = 0;
 
+		/*
+		 * Fork balancing with pick-2 LLC selection:
+		 *
+		 * 1. Scan current LLC for idle or least-loaded CPU
+		 * 2. Pick a random LLC in same NUMA, compare load
+		 * 3. Use the less-loaded LLC
+		 * 4. If NUMA node is saturated, try cross-NUMA
+		 */
 		rcu_read_lock();
 		sd = rcu_dereference(per_cpu(sd_llc, prev_cpu));
 		if (sd) {
@@ -997,23 +1212,113 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 
 				if (!cpumask_test_cpu(cpu, allowed))
 					continue;
+				local_llc_cpus++;
 				nr = cpu_rq(cpu)->minlat.nr_running;
+				local_llc_load += nr;
 				if (nr == 0) {
 					rcu_read_unlock();
 					return cpu;
 				}
-				if (nr < best_llc_nr) {
-					best_llc_nr = nr;
-					best_llc_cpu = cpu;
+				if (nr < best_nr_local) {
+					best_nr_local = nr;
+					best_cpu_local = cpu;
 				}
 			}
 		}
+
+		/*
+		 * Pick-2: sample a random LLC in the same NUMA node.
+		 * If it's less loaded, place the fork there instead.
+		 */
+		for_each_domain(prev_cpu, numa_sd) {
+			const struct cpumask *numa_span;
+			int rand_cpu, rand_llc;
+			struct sched_domain *rand_sd;
+			int rcpus = 0, rload = 0;
+
+			if (numa_sd == sd)
+				continue;
+
+			numa_span = sched_domain_span(numa_sd);
+			rand_cpu = cpumask_any_and_distribute(
+					numa_span, cpu_online_mask);
+			if (rand_cpu >= nr_cpu_ids ||
+			    rand_cpu == prev_cpu)
+				continue;
+
+			rand_llc = per_cpu(sd_llc_id, rand_cpu);
+			if (rand_llc == per_cpu(sd_llc_id, prev_cpu))
+				continue;
+
+			rand_sd = rcu_dereference(
+					per_cpu(sd_llc, rand_cpu));
+			if (!rand_sd)
+				continue;
+
+			for_each_cpu(cpu, sched_domain_span(rand_sd)) {
+				unsigned int nr;
+
+				if (!cpumask_test_cpu(cpu, allowed))
+					continue;
+				rcpus++;
+				nr = cpu_rq(cpu)->minlat.nr_running;
+				rload += nr;
+				if (nr == 0) {
+					rcu_read_unlock();
+					return cpu;
+				}
+				if (nr < best_nr_remote) {
+					best_nr_remote = nr;
+					best_cpu_remote = cpu;
+				}
+			}
+			remote_llc_load = rcpus ? rload : INT_MAX;
+
+			/*
+			 * Compare per-CPU average load between LLCs.
+			 * Use the less-loaded LLC if the imbalance exceeds
+			 * the tunable threshold percentage.
+			 *
+			 * Cross-NUMA requires a larger imbalance to justify
+			 * remote memory access cost.
+			 *
+			 * Formula: remote_avg * 100 + threshold * local_avg
+			 *          <= local_avg * 100
+			 * i.e.: remote is at least threshold% less loaded.
+			 */
+			if (best_cpu_remote >= 0 && rcpus > 0 &&
+			    local_llc_cpus > 0) {
+				bool cross_numa = numa_sd->flags & SD_NUMA;
+				unsigned int thresh = cross_numa ?
+					minlat_fork_numa_imbalance_pct :
+					minlat_fork_imbalance_pct;
+				unsigned int local_avg =
+					local_llc_load * 100 / local_llc_cpus;
+				unsigned int remote_avg =
+					rload * 100 / rcpus;
+
+				if (local_avg > 0 &&
+				    remote_avg * 100 <=
+				    local_avg * (100 - thresh)) {
+					rcu_read_unlock();
+					return best_cpu_remote;
+				}
+			}
+
+			/*
+			 * For same-NUMA domains, only try one random LLC
+			 * (pick-2). For cross-NUMA, also try one.
+			 */
+			break;
+		}
+
 		rcu_read_unlock();
 
-		if (best_llc_cpu >= 0)
-			return best_llc_cpu;
+		/* Local LLC least-loaded is our fallback */
+		if (best_cpu_local >= 0)
+			return best_cpu_local;
 
-		/* LLC had no valid CPUs — fall through to general path */
+		/* No valid CPUs found — fall through to general path */
 	}
 
 	/* 1. prev_cpu if idle — fast path, no scanning */
@@ -1058,9 +1363,16 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 		return best_cpu;
 
 	/*
-	 * 5. No idle CPU — least-loaded, scan from prev_cpu for
-	 * distribution. Early exit if we find an empty CPU.
+	 * 5. No idle CPU found.
+	 *
+	 * For fork: find least-loaded CPU globally to spread children.
+	 * For wakeup: stay on prev_cpu — the idle-pull mechanism and
+	 * wake affinity handle redistribution without the O(N) scan
+	 * cost on every wakeup.
 	 */
+	if (!(flags & WF_FORK))
+		return prev_cpu;
+
 	best_cpu = prev_cpu;
 	best_nr = cpu_rq(prev_cpu)->minlat.nr_running;
 
@@ -1164,6 +1476,10 @@ minlat_pick_pullable_task(struct rq *src_rq, int this_cpu, bool cross_numa)
 		p = container_of(me, struct task_struct, minlat);
 
 		if (task_current(src_rq, p))
+			continue;
+
+		/* Skip delayed sleepers — not actually runnable */
+		if (p->se.sched_delayed)
 			continue;
 
 		if (is_migration_disabled(p))
