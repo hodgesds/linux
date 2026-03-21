@@ -306,6 +306,7 @@ void init_minlat_rq(struct minlat_rq *minlat_rq)
 	minlat_rq->curr = NULL;
 	minlat_rq->next = NULL;
 	minlat_rq->nr_running = 0;
+	minlat_rq->nr_delayed = 0;
 	minlat_rq->min_vruntime = 0;
 	minlat_rq->load_weight = 0;
 }
@@ -519,6 +520,7 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	if (flags & ENQUEUE_DELAYED) {
 		WARN_ON_ONCE(!p->se.sched_delayed);
 		p->se.sched_delayed = 0;
+		minlat_rq->nr_delayed--;
 		return;
 	}
 
@@ -593,13 +595,16 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 		if (run_ns < max_t(u64, MINLAT_MIN_GRANULARITY_NS,
 				   sysctl_sched_base_slice)) {
 			p->se.sched_delayed = 1;
+			minlat_rq->nr_delayed++;
 			return false;
 		}
 	}
 
 	/* Clear delayed flag on force-dequeue */
-	if (flags & DEQUEUE_DELAYED)
+	if (flags & DEQUEUE_DELAYED) {
 		p->se.sched_delayed = 0;
+		minlat_rq->nr_delayed--;
+	}
 
 	if (was_curr) {
 		/*
@@ -616,7 +621,8 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 
 	minlat_rq->nr_running--;
 
-	if (minlat_rq->nr_running < 2 && minlat_rq->overloaded) {
+	if (minlat_rq->nr_running < 2 &&
+	    minlat_rq->overloaded) {
 		WRITE_ONCE(minlat_rq->overloaded, false);
 		atomic_dec(&minlat_nr_overloaded);
 	}
@@ -806,41 +812,46 @@ pick_task_minlat(struct rq *rq, struct rq_flags *rf)
 	minlat_rq->next = NULL;
 
 	/*
-	 * Pick leftmost entity. If it's a delayed sleeper (kept in
-	 * the tree to avoid rb-churn), force-dequeue it and try the
-	 * next one. Mirrors EEVDF's pick_next_entity() which calls
-	 * dequeue_entities(DEQUEUE_SLEEP | DEQUEUE_DELAYED) for
-	 * delayed entities.
+	 * Scan tree for first non-delayed entity. Delayed entities
+	 * are left in the tree — they'll be cleaned up when:
+	 *  - ttwu_runnable clears their delayed flag (common case)
+	 *  - All entities are delayed (force-dequeue below)
+	 *  - wait_task_inactive/exit forces dequeue
+	 *
+	 * This avoids the O(k * log n) cost of force-dequeuing
+	 * each delayed entity (rb_erase + __block_task + accounting).
+	 */
+	{
+		struct rb_node *node;
+
+		for (node = rb_first_cached(&minlat_rq->tasks_timeline);
+		     node; node = rb_next(node)) {
+			me = rb_entry(node, struct sched_minlat_entity,
+				      run_node);
+			p = container_of(me, struct task_struct, minlat);
+			if (!p->se.sched_delayed)
+				return p;
+		}
+	}
+
+	/*
+	 * All tree entities are delayed — force-dequeue them all.
+	 * This cleans up the tree and allows idle-pull to find work.
 	 */
 	while ((me = __pick_first_minlat_entity(minlat_rq))) {
 		p = container_of(me, struct task_struct, minlat);
-		if (!p->se.sched_delayed)
-			return p;
-
-		/*
-		 * dequeue_task_minlat with DEQUEUE_DELAYED handles
-		 * __block_task() internally, matching CFS behavior.
-		 */
 		dequeue_task_minlat(rq, p, DEQUEUE_SLEEP | DEQUEUE_DELAYED);
 	}
 
 	/*
 	 * Tree is empty but curr exists out-of-tree — return it.
-	 * This happens when the only minlat task is the currently
-	 * running one (removed from tree by set_next_task).
-	 *
-	 * If curr is delayed (sleeping), force-dequeue it here.
-	 * Unlike in-tree delayed entities (handled above), a delayed
-	 * curr is out-of-tree so __pick_first can't find it. We must
-	 * handle it explicitly. This happens when dequeue_task returns
-	 * false (delayed) and pick runs before put_prev re-inserts.
+	 * If curr is delayed, force-dequeue it.
 	 */
 	if (minlat_rq->curr && minlat_rq->curr->on_rq) {
 		p = container_of(minlat_rq->curr, struct task_struct, minlat);
 		if (!p->se.sched_delayed)
 			return p;
 
-		/* Force-dequeue delayed curr (out-of-tree) */
 		dequeue_task_minlat(rq, p, DEQUEUE_SLEEP | DEQUEUE_DELAYED);
 	}
 
