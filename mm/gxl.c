@@ -12,8 +12,8 @@
  * memory tiering infrastructure.
  *
  * Multiple GPUs are supported (up to GXL_MAX_DEVICES).  Each GPU gets
- * its own NUMA node but all share a single memory_dev_type at the same
- * abstract distance.  Per-device resize is available via:
+ * its own NUMA node and memory_dev_type (with per-device configurable
+ * abstract distance).  Per-device resize is available via:
  *   /sys/kernel/mm/gxl/<slot>/size_mb
  *
  * Pages are onlined to ZONE_MOVABLE so they can be migrated back
@@ -49,16 +49,17 @@
 #include <linux/slab.h>
 #include <linux/kobject.h>
 #include <linux/mutex.h>
+#include <linux/topology.h>
+#include <linux/vmstat.h>
 
 /*
- * Abstract distance for GPU VRAM over PCIe.
+ * Default abstract distance for GPU VRAM over PCIe.
  *
  * DRAM is MEMTIER_ADISTANCE_DRAM (576).  GPU VRAM over PCIe has
- * ~2-5x the latency of local DRAM, so we place it at 2x DRAM
- * distance.  This puts GPU VRAM in its own tier below DRAM,
- * making it a demotion target under memory pressure.
+ * ~2-5x the latency of local DRAM, so the default is 2x DRAM
+ * distance.  Tunable via gxl.adistance= kernel parameter.
  */
-#define GXL_ADISTANCE	(MEMTIER_ADISTANCE_DRAM * 2)
+#define GXL_ADISTANCE_DEFAULT	(MEMTIER_ADISTANCE_DRAM * 2)
 
 #define GXL_MAX_DEVICES	8
 
@@ -74,6 +75,12 @@ struct gxl_dev {
 	int			bar_idx;
 	int			mgid;
 	int			numa_node;
+	int			local_node;	/* closest DRAM NUMA node */
+	unsigned int		adistance;
+	unsigned int		pool_percent;
+	struct memory_dev_type	*mtype;
+	resource_size_t		bar_start;	/* raw BAR base */
+	unsigned long		bar_size;	/* raw BAR size */
 	resource_size_t		phys_start;
 	unsigned long		max_size;
 	unsigned long		online_size;
@@ -84,11 +91,6 @@ struct gxl_dev {
 
 static struct gxl_dev gxl_devs[GXL_MAX_DEVICES];
 static int gxl_nr_devs;
-
-/*
- * Shared memory type -- all GPUs live at the same abstract distance.
- */
-static struct memory_dev_type *gxl_mtype;
 
 /*
  * Parent kobject: /sys/kernel/mm/gxl/
@@ -110,6 +112,14 @@ static struct notifier_block gxl_pci_nb;
 static unsigned int gxl_max_pool_percent = 80;
 module_param_named(max_pool_percent, gxl_max_pool_percent, uint, 0644);
 MODULE_PARM_DESC(max_pool_percent, "Percentage of VRAM to expose as system memory (default 80)");
+
+static unsigned int gxl_adistance = GXL_ADISTANCE_DEFAULT;
+module_param_named(adistance, gxl_adistance, uint, 0444);
+MODULE_PARM_DESC(adistance, "Abstract distance for GPU VRAM tier (default: 2x DRAM)");
+
+static bool gxl_auto_online = true;
+module_param_named(auto_online, gxl_auto_online, bool, 0644);
+MODULE_PARM_DESC(auto_online, "Auto-register all usable VRAM at init (default: true)");
 
 /*
  * gxl.device=SLOT -- early_param, called once per GPU.
@@ -355,10 +365,153 @@ static ssize_t numa_node_show(struct kobject *kobj,
 static struct kobj_attribute gxl_numa_node_attr =
 	__ATTR(numa_node, 0444, numa_node_show, NULL);
 
+static ssize_t local_node_show(struct kobject *kobj,
+			       struct kobj_attribute *attr, char *buf)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+
+	if (!gdev)
+		return -ENODEV;
+	return sysfs_emit(buf, "%d\n", gdev->local_node);
+}
+
+static struct kobj_attribute gxl_local_node_attr =
+	__ATTR(local_node, 0444, local_node_show, NULL);
+
+static ssize_t nr_used_pages_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+	unsigned long present, free;
+
+	if (!gdev || !gdev->ready)
+		return -ENODEV;
+
+	present = node_present_pages(gdev->numa_node);
+	free = sum_zone_node_page_state(gdev->numa_node, NR_FREE_PAGES);
+	return sysfs_emit(buf, "%lu\n", present > free ? present - free : 0);
+}
+
+static struct kobj_attribute gxl_nr_used_pages_attr =
+	__ATTR(nr_used_pages, 0444, nr_used_pages_show, NULL);
+
+static ssize_t nr_free_pages_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+
+	if (!gdev || !gdev->ready)
+		return -ENODEV;
+
+	return sysfs_emit(buf, "%lu\n",
+		sum_zone_node_page_state(gdev->numa_node, NR_FREE_PAGES));
+}
+
+static struct kobj_attribute gxl_nr_free_pages_attr =
+	__ATTR(nr_free_pages, 0444, nr_free_pages_show, NULL);
+
+static ssize_t fill_percent_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+	unsigned long present, free;
+
+	if (!gdev || !gdev->ready)
+		return -ENODEV;
+
+	present = node_present_pages(gdev->numa_node);
+	if (!present)
+		return sysfs_emit(buf, "0\n");
+
+	free = sum_zone_node_page_state(gdev->numa_node, NR_FREE_PAGES);
+	return sysfs_emit(buf, "%lu\n", (present - free) * 100 / present);
+}
+
+static struct kobj_attribute gxl_fill_percent_attr =
+	__ATTR(fill_percent, 0444, fill_percent_show, NULL);
+
+static ssize_t adistance_show(struct kobject *kobj,
+			      struct kobj_attribute *attr, char *buf)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+
+	if (!gdev)
+		return -ENODEV;
+	return sysfs_emit(buf, "%u\n", gdev->adistance);
+}
+
+static struct kobj_attribute gxl_adistance_attr =
+	__ATTR(adistance, 0444, adistance_show, NULL);
+
+/*
+ * Recalculate max_size from the raw BAR and a new pool percent.
+ * Rejects changes that would strand already-online memory.
+ */
+static ssize_t pool_percent_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+
+	if (!gdev)
+		return -ENODEV;
+	return sysfs_emit(buf, "%u\n", gdev->pool_percent);
+}
+
+static ssize_t pool_percent_store(struct kobject *kobj,
+				  struct kobj_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+	unsigned long blk_size;
+	resource_size_t aligned_end;
+	unsigned long new_max;
+	unsigned int pct;
+	int rc;
+
+	if (!gdev || !gdev->ready)
+		return -ENODEV;
+
+	rc = kstrtouint(buf, 0, &pct);
+	if (rc)
+		return rc;
+	if (pct > 100)
+		pct = 100;
+
+	blk_size = memory_block_size_bytes();
+	aligned_end = ALIGN_DOWN(gdev->bar_start + gdev->bar_size * pct / 100,
+				 blk_size);
+	if (gdev->phys_start >= aligned_end)
+		return -EINVAL;
+
+	new_max = aligned_end - gdev->phys_start;
+
+	mutex_lock(&gdev->lock);
+	if (gdev->online_size > new_max) {
+		mutex_unlock(&gdev->lock);
+		return -EBUSY;
+	}
+	gdev->max_size = new_max;
+	gdev->pool_percent = pct;
+	mutex_unlock(&gdev->lock);
+
+	pr_info("%s: pool_percent=%u%%, max_size=%lu MB\n",
+		gdev->slot, pct, new_max >> 20);
+	return count;
+}
+
+static struct kobj_attribute gxl_pool_percent_attr =
+	__ATTR(pool_percent, 0644, pool_percent_show, pool_percent_store);
+
 static struct attribute *gxl_dev_attrs[] = {
 	&gxl_size_mb_attr.attr,
 	&gxl_max_size_mb_attr.attr,
 	&gxl_numa_node_attr.attr,
+	&gxl_local_node_attr.attr,
+	&gxl_nr_used_pages_attr.attr,
+	&gxl_nr_free_pages_attr.attr,
+	&gxl_fill_percent_attr.attr,
+	&gxl_adistance_attr.attr,
+	&gxl_pool_percent_attr.attr,
 	NULL,
 };
 
@@ -383,6 +536,41 @@ static int gxl_claim_node(void)
 }
 
 /*
+ * Set up NUMA distances for a synthetic GPU node.
+ *
+ * The GPU is modeled as "one PCIe hop past" its local DRAM node.
+ * This gives the demotion target selector correct topology on
+ * multi-socket systems so each DRAM node prefers demoting to
+ * the physically closest GPU.
+ */
+#define GXL_PCIE_HOP	11
+
+static void gxl_setup_distances(struct gxl_dev *gdev)
+{
+	int nid, gpu = gdev->numa_node;
+	int local = gdev->local_node;
+	int dist;
+
+	numa_set_distance_runtime(gpu, gpu, LOCAL_DISTANCE);
+
+	for_each_online_node(nid) {
+		if (nid == gpu)
+			continue;
+
+		if (nid == local)
+			dist = LOCAL_DISTANCE + GXL_PCIE_HOP;
+		else
+			dist = node_distance(local, nid) + GXL_PCIE_HOP;
+
+		if (dist > 255)
+			dist = 255;
+
+		numa_set_distance_runtime(gpu, nid, dist);
+		numa_set_distance_runtime(nid, gpu, dist);
+	}
+}
+
+/*
  * Initialize a single device given an already-referenced PCI device.
  */
 static int gxl_init_one(struct gxl_dev *gdev, struct pci_dev *pdev)
@@ -394,6 +582,13 @@ static int gxl_init_one(struct gxl_dev *gdev, struct pci_dev *pdev)
 	mutex_init(&gdev->lock);
 	gdev->mgid = -1;
 	gdev->numa_node = NUMA_NO_NODE;
+	gdev->adistance = gxl_adistance;
+	gdev->pool_percent = gxl_max_pool_percent;
+
+	/* Determine which DRAM node this GPU is closest to */
+	gdev->local_node = dev_to_node(&pdev->dev);
+	if (gdev->local_node == NUMA_NO_NODE)
+		gdev->local_node = first_online_node;
 
 	rc = gxl_find_vram_bar(pdev, &bar_start, &bar_size, &gdev->bar_idx);
 	if (rc) {
@@ -401,13 +596,16 @@ static int gxl_init_one(struct gxl_dev *gdev, struct pci_dev *pdev)
 		goto err_put_pdev;
 	}
 
-	pr_info("%s: found VRAM BAR: base=%pa size=%lu MB\n",
-		gdev->slot, &bar_start, bar_size >> 20);
+	pr_info("%s: found VRAM BAR: base=%pa size=%lu MB (local node %d)\n",
+		gdev->slot, &bar_start, bar_size >> 20, gdev->local_node);
+
+	gdev->bar_start = bar_start;
+	gdev->bar_size = bar_size;
 
 	blk_size = memory_block_size_bytes();
-	if (gxl_max_pool_percent > 100)
-		gxl_max_pool_percent = 100;
-	usable_size = bar_size * gxl_max_pool_percent / 100;
+	if (gdev->pool_percent > 100)
+		gdev->pool_percent = 100;
+	usable_size = bar_size * gdev->pool_percent / 100;
 	aligned_start = ALIGN(bar_start, blk_size);
 	aligned_end = ALIGN_DOWN(bar_start + usable_size, blk_size);
 
@@ -425,23 +623,34 @@ static int gxl_init_one(struct gxl_dev *gdev, struct pci_dev *pdev)
 		gdev->slot, gdev->max_size >> 20, bar_size >> 20,
 		blk_size >> 20);
 
+	/* Per-device memory type at this device's abstract distance */
+	gdev->mtype = alloc_memory_type(gdev->adistance);
+	if (IS_ERR(gdev->mtype)) {
+		rc = PTR_ERR(gdev->mtype);
+		pr_err("%s: failed to allocate memory type: %d\n",
+		       gdev->slot, rc);
+		gdev->mtype = NULL;
+		goto err_put_pdev;
+	}
+
 	/* Claim a NUMA node */
 	gdev->numa_node = gxl_claim_node();
 	if (gdev->numa_node == NUMA_NO_NODE) {
 		pr_err("%s: no offline-but-possible NUMA node available\n",
 		       gdev->slot);
 		rc = -ENOSPC;
-		goto err_put_pdev;
+		goto err_put_mtype;
 	}
 
 	rc = try_online_node(gdev->numa_node);
 	if (rc < 0) {
 		pr_err("%s: failed to online node %d: %d\n",
 		       gdev->slot, gdev->numa_node, rc);
-		goto err_put_pdev;
+		goto err_put_mtype;
 	}
 
-	init_node_memory_type(gdev->numa_node, gxl_mtype);
+	gxl_setup_distances(gdev);
+	init_node_memory_type(gdev->numa_node, gdev->mtype);
 
 	rc = memory_group_register_static(gdev->numa_node,
 					  PFN_UP(gdev->max_size));
@@ -466,11 +675,19 @@ static int gxl_init_one(struct gxl_dev *gdev, struct pci_dev *pdev)
 	gdev->pdev = pdev;
 	gdev->ready = true;
 
-	pr_info("%s: ready: %lu MB GPU VRAM on node %d (adist %ld)\n",
+	pr_info("%s: ready: %lu MB GPU VRAM on node %d (adist %u, local node %d)\n",
 		gdev->slot, gdev->max_size >> 20, gdev->numa_node,
-		(long)GXL_ADISTANCE);
-	pr_info("%s: write to /sys/kernel/mm/gxl/%s/size_mb to register VRAM\n",
-		gdev->slot, gdev->slot);
+		gdev->adistance, gdev->local_node);
+
+	if (gxl_auto_online) {
+		rc = gxl_do_resize(gdev, gdev->max_size);
+		if (rc)
+			pr_warn("%s: auto-online failed: %d\n",
+				gdev->slot, rc);
+	} else {
+		pr_info("%s: write to /sys/kernel/mm/gxl/%s/size_mb to register VRAM\n",
+			gdev->slot, gdev->slot);
+	}
 
 	return 0;
 
@@ -481,13 +698,14 @@ err_unreg_group:
 	memory_group_unregister(gdev->mgid);
 	gdev->mgid = -1;
 err_clear_type:
-	clear_node_memory_type(gdev->numa_node, gxl_mtype);
-	/* fall through to take node offline */
-	/* Undo try_online_node -- node has no memory or CPUs at this point */
+	clear_node_memory_type(gdev->numa_node, gdev->mtype);
 	lock_device_hotplug();
 	try_offline_node(gdev->numa_node);
 	unlock_device_hotplug();
 	gdev->numa_node = NUMA_NO_NODE;
+err_put_mtype:
+	put_memory_type(gdev->mtype);
+	gdev->mtype = NULL;
 err_put_pdev:
 	pci_dev_put(pdev);
 	return rc;
@@ -552,22 +770,10 @@ static int __init gxl_init(void)
 	if (!gxl_nr_devs)
 		return 0;
 
-	/* Shared memory type for all GPU devices */
-	gxl_mtype = alloc_memory_type(GXL_ADISTANCE);
-	if (IS_ERR(gxl_mtype)) {
-		rc = PTR_ERR(gxl_mtype);
-		pr_err("failed to allocate memory type: %d\n", rc);
-		gxl_mtype = NULL;
-		return rc;
-	}
-
 	/* Parent sysfs directory */
 	gxl_kobj = kobject_create_and_add("gxl", mm_kobj);
-	if (!gxl_kobj) {
-		put_memory_type(gxl_mtype);
-		gxl_mtype = NULL;
+	if (!gxl_kobj)
 		return -ENOMEM;
-	}
 
 	/*
 	 * Register notifier BEFORE scanning so that devices appearing

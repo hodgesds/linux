@@ -131,6 +131,34 @@ int __node_distance(int from, int to)
 		return from == to ? LOCAL_DISTANCE : REMOTE_DISTANCE;
 	return numa_distance[from * numa_distance_cnt + to];
 }
+
+/**
+ * numa_set_distance_runtime() - Set NUMA distance at runtime
+ * @from: source node
+ * @to: destination node
+ * @distance: distance value (1-255, 10 = LOCAL_DISTANCE)
+ *
+ * Like numa_set_distance() but callable after init.  Intended for
+ * subsystems that create synthetic NUMA nodes at runtime (e.g. for
+ * device memory).
+ *
+ * Returns 0 on success, -EINVAL if parameters are out of range.
+ */
+int numa_set_distance_runtime(int from, int to, int distance)
+{
+	if (!numa_distance)
+		return -EINVAL;
+
+	if (from < 0 || to < 0 ||
+	    from >= numa_distance_cnt || to >= numa_distance_cnt)
+		return -EINVAL;
+
+	if ((u8)distance != distance || distance < 1)
+		return -EINVAL;
+
+	numa_distance[from * numa_distance_cnt + to] = distance;
+	return 0;
+}
 EXPORT_SYMBOL(__node_distance);
 
 static int __init numa_add_memblk_to(int nid, u64 start, u64 end,
