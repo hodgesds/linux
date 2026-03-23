@@ -56,6 +56,9 @@
 #include <linux/highmem.h>
 #include <linux/workqueue.h>
 #include <linux/completion.h>
+#include <linux/swap.h>
+#include <linux/writeback.h>
+#include <linux/pagemap.h>
 
 #ifdef CONFIG_X86
 #include <asm/fpu/api.h>
@@ -95,7 +98,11 @@ struct gxl_dev {
 	unsigned long		max_size;
 	unsigned long		online_size;
 	void __iomem		*wc_base;	/* ioremap_wc of the BAR */
-	bool			ready;
+	enum {
+		GXL_STATE_INIT,		/* not yet initialized */
+		GXL_STATE_READY,	/* ready, GPU driver holds BAR claim */
+		GXL_STATE_BAR_FREE,	/* ready, BAR claim released by gxl */
+	}			state;
 	struct kobject		*kobj;		/* /sys/kernel/mm/gxl/<slot>/ */
 	struct mutex		lock;
 	atomic_long_t		nr_demotions;	/* DRAM->VRAM page copies */
@@ -125,7 +132,7 @@ static struct gxl_dev *gxl_node_to_dev(int nid)
 	int i;
 
 	for (i = 0; i < gxl_nr_devs; i++) {
-		if (gxl_devs[i].ready && gxl_devs[i].numa_node == nid)
+		if (gxl_devs[i].state >= GXL_STATE_READY && gxl_devs[i].numa_node == nid)
 			return &gxl_devs[i];
 	}
 	return NULL;
@@ -873,6 +880,49 @@ static int gxl_online_movable_cb(struct memory_block *mem, void *arg)
 }
 
 /*
+ * Drop page cache and slab caches to help offline ZONE_MOVABLE pages.
+ *
+ * Filesystem metadata pages (e.g. btrfs btree nodes) can be demoted to
+ * gxl VRAM via NUMA tiering.  These pages carry private data that
+ * prevents migration, so offline_and_remove_memory() fails.  Dropping
+ * caches releases clean page cache pages and reclaimable slab objects,
+ * giving the retry a much better chance of succeeding.
+ */
+static void gxl_drop_pagecache_sb(struct super_block *sb, void *unused)
+{
+	struct inode *inode, *toput_inode = NULL;
+
+	spin_lock(&sb->s_inode_list_lock);
+	list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+		spin_lock(&inode->i_lock);
+		if ((inode_state_read(inode) & (I_FREEING | I_WILL_FREE | I_NEW)) ||
+		    (mapping_empty(inode->i_mapping) && !need_resched())) {
+			spin_unlock(&inode->i_lock);
+			continue;
+		}
+		__iget(inode);
+		spin_unlock(&inode->i_lock);
+		spin_unlock(&sb->s_inode_list_lock);
+
+		invalidate_mapping_pages(inode->i_mapping, 0, -1);
+		iput(toput_inode);
+		toput_inode = inode;
+
+		cond_resched();
+		spin_lock(&sb->s_inode_list_lock);
+	}
+	spin_unlock(&sb->s_inode_list_lock);
+	iput(toput_inode);
+}
+
+static void gxl_drop_caches(void)
+{
+	lru_add_drain_all();
+	iterate_supers(gxl_drop_pagecache_sb, NULL);
+	drop_slab();
+}
+
+/*
  * Dynamic resize -- operates on a single device.
  */
 static int gxl_do_resize(struct gxl_dev *gdev, unsigned long new_size)
@@ -895,6 +945,22 @@ static int gxl_do_resize(struct gxl_dev *gdev, unsigned long new_size)
 		rc = offline_and_remove_memory(gdev->phys_start + new_size,
 					       shrink);
 		if (rc) {
+			pr_info("%s: shrink failed (%d), dropping caches and retrying\n",
+				gdev->slot, rc);
+			mutex_unlock(&gdev->lock);
+			gxl_drop_caches();
+			mutex_lock(&gdev->lock);
+			/*
+			 * Re-check: online_size may have changed while the
+			 * lock was dropped.
+			 */
+			if (new_size >= gdev->online_size)
+				goto out;
+			shrink = gdev->online_size - new_size;
+			rc = offline_and_remove_memory(gdev->phys_start + new_size,
+						       shrink);
+		}
+		if (rc) {
 			pr_warn("%s: shrink failed: %d (pages may be pinned)\n",
 				gdev->slot, rc);
 			goto out;
@@ -908,7 +974,7 @@ static int gxl_do_resize(struct gxl_dev *gdev, unsigned long new_size)
 		rc = add_memory_driver_managed(gdev->mgid, grow_start, grow,
 					       gxl_res_name,
 					       MHP_NID_IS_MGID | MHP_WC);
-		if (rc == -EEXIST) {
+		if (rc == -EEXIST && gdev->state == GXL_STATE_READY) {
 			/*
 			 * GPU driver's PCI BAR claim blocks the memory
 			 * resource.  Release it and retry -- the driver
@@ -917,21 +983,12 @@ static int gxl_do_resize(struct gxl_dev *gdev, unsigned long new_size)
 			pr_info("%s: releasing GPU driver BAR claim\n",
 				gdev->slot);
 			pci_release_region(gdev->pdev, gdev->bar_idx);
+			gdev->state = GXL_STATE_BAR_FREE;
 			rc = add_memory_driver_managed(gdev->mgid, grow_start,
 						       grow, gxl_res_name,
 						       MHP_NID_IS_MGID | MHP_WC);
-			if (rc) {
-				pr_warn("%s: grow failed after BAR release: %d, restoring\n",
-					gdev->slot, rc);
-				/* Best-effort restore; nothing to do if it fails */
-				if (pci_request_region(gdev->pdev,
-						       gdev->bar_idx,
-						       dev_driver_string(&gdev->pdev->dev)))
-					pr_warn("%s: could not restore GPU BAR claim\n",
-						gdev->slot);
-				goto out;
-			}
-		} else if (rc) {
+		}
+		if (rc) {
 			pr_warn("%s: grow failed: %d\n", gdev->slot, rc);
 			goto out;
 		}
@@ -985,7 +1042,7 @@ static ssize_t size_mb_store(struct kobject *kobj,
 	unsigned long mb;
 	int rc;
 
-	if (!gdev || !gdev->ready)
+	if (!gdev || gdev->state < GXL_STATE_READY)
 		return -ENODEV;
 
 	rc = kstrtoul(buf, 0, &mb);
@@ -1050,7 +1107,7 @@ static ssize_t nr_used_pages_show(struct kobject *kobj,
 	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
 	unsigned long present, free;
 
-	if (!gdev || !gdev->ready)
+	if (!gdev || gdev->state < GXL_STATE_READY)
 		return -ENODEV;
 
 	present = node_present_pages(gdev->numa_node);
@@ -1066,7 +1123,7 @@ static ssize_t nr_free_pages_show(struct kobject *kobj,
 {
 	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
 
-	if (!gdev || !gdev->ready)
+	if (!gdev || gdev->state < GXL_STATE_READY)
 		return -ENODEV;
 
 	return sysfs_emit(buf, "%lu\n",
@@ -1082,7 +1139,7 @@ static ssize_t fill_percent_show(struct kobject *kobj,
 	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
 	unsigned long present, free;
 
-	if (!gdev || !gdev->ready)
+	if (!gdev || gdev->state < GXL_STATE_READY)
 		return -ENODEV;
 
 	present = node_present_pages(gdev->numa_node);
@@ -1134,7 +1191,7 @@ static ssize_t pool_percent_store(struct kobject *kobj,
 	unsigned int pct;
 	int rc;
 
-	if (!gdev || !gdev->ready)
+	if (!gdev || gdev->state < GXL_STATE_READY)
 		return -ENODEV;
 
 	rc = kstrtouint(buf, 0, &pct);
@@ -1375,7 +1432,7 @@ static int gxl_init_one(struct gxl_dev *gdev, struct pci_dev *pdev)
 		goto err_put_kobj;
 
 	gdev->pdev = pdev;
-	gdev->ready = true;
+	gdev->state = GXL_STATE_READY;
 
 	/* Register this node for WC-accelerated migration copies */
 	if (gdev->wc_base) {
@@ -1455,7 +1512,7 @@ static int gxl_pci_bus_notify(struct notifier_block *nb,
 
 	mutex_lock(&gxl_init_mutex);
 	for (i = 0; i < gxl_nr_devs; i++) {
-		if (gxl_devs[i].ready)
+		if (gxl_devs[i].state >= GXL_STATE_READY)
 			continue;
 		if (strcmp(gxl_devs[i].slot, pci_name(pdev)) != 0)
 			continue;
@@ -1503,7 +1560,7 @@ static int __init gxl_init(void)
 	/* Try to initialize devices already present on the PCI bus */
 	mutex_lock(&gxl_init_mutex);
 	for (i = 0; i < gxl_nr_devs; i++) {
-		if (gxl_devs[i].ready)
+		if (gxl_devs[i].state >= GXL_STATE_READY)
 			continue;
 		pdev = gxl_find_pdev(&gxl_devs[i]);
 		if (!pdev)
