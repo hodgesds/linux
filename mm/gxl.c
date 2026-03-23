@@ -107,6 +107,8 @@ struct gxl_dev {
 	struct mutex		lock;
 	atomic_long_t		nr_demotions;	/* DRAM->VRAM page copies */
 	atomic_long_t		nr_promotions;	/* VRAM->DRAM page copies */
+	atomic_long_t		nr_zero_pages;	/* VRAM pages tracked as zero */
+	unsigned long		*zero_bitmap;	/* 1 bit per VRAM page: set = zero */
 };
 
 static struct gxl_dev gxl_devs[GXL_MAX_DEVICES];
@@ -136,6 +138,28 @@ static struct gxl_dev *gxl_node_to_dev(int nid)
 			return &gxl_devs[i];
 	}
 	return NULL;
+}
+
+static unsigned long gxl_vram_page_idx(struct gxl_dev *gdev, struct page *page)
+{
+	return (page_to_phys(page) - gdev->bar_start) >> PAGE_SHIFT;
+}
+
+/*
+ * Check if a page is entirely zero.  Simple word-at-a-time scan that
+ * bails on the first non-zero word — fast for the common non-zero case.
+ * Used on DRAM source pages during demotion where reads are cached and
+ * prefetched, so the full 4 KB scan is well under a microsecond.
+ */
+static bool gxl_page_all_zero(const void *addr)
+{
+	const unsigned long *p = addr;
+	unsigned int i;
+
+	for (i = 0; i < PAGE_SIZE / sizeof(unsigned long); i++)
+		if (p[i])
+			return false;
+	return true;
 }
 
 #ifdef CONFIG_X86
@@ -355,32 +379,49 @@ int gxl_copy_folio(struct folio *dst, struct folio *src)
 			void __iomem *wc_addr;
 
 			if (is_demotion) {
-				wc_addr = gdev->wc_base +
-					(page_to_phys(dp) - gdev->bar_start);
 				vaddr = kmap_local_page(sp);
-				if (static_branch_likely(&gxl_has_avx2))
-					gxl_memcpy_to_wc_avx2(
-						(void __force *)wc_addr,
-						vaddr, PAGE_SIZE);
-				else
-					gxl_memcpy_to_wc_sse(
-						(void __force *)wc_addr,
-						vaddr, PAGE_SIZE);
+				if (gdev->zero_bitmap &&
+				    gxl_page_all_zero(vaddr)) {
+					set_bit(gxl_vram_page_idx(gdev, dp),
+						gdev->zero_bitmap);
+					atomic_long_inc(&gdev->nr_zero_pages);
+				} else {
+					if (gdev->zero_bitmap)
+						clear_bit(gxl_vram_page_idx(gdev, dp),
+							  gdev->zero_bitmap);
+					wc_addr = gdev->wc_base +
+						(page_to_phys(dp) - gdev->bar_start);
+					if (static_branch_likely(&gxl_has_avx2))
+						gxl_memcpy_to_wc_avx2(
+							(void __force *)wc_addr,
+							vaddr, PAGE_SIZE);
+					else
+						gxl_memcpy_to_wc_sse(
+							(void __force *)wc_addr,
+							vaddr, PAGE_SIZE);
+				}
 				kunmap_local(vaddr);
 			} else {
-				wc_addr = gdev->wc_base +
-					(page_to_phys(sp) - gdev->bar_start);
 				vaddr = kmap_local_page(dp);
-				if (static_branch_likely(&gxl_has_avx2))
-					gxl_memcpy_ntdqa_avx2(
-						vaddr,
-						(const void __force *)wc_addr,
-						PAGE_SIZE);
-				else
-					gxl_memcpy_ntdqa_sse(
-						vaddr,
-						(const void __force *)wc_addr,
-						PAGE_SIZE);
+				if (gdev->zero_bitmap &&
+				    test_and_clear_bit(gxl_vram_page_idx(gdev, sp),
+						       gdev->zero_bitmap)) {
+					clear_page(vaddr);
+					atomic_long_dec(&gdev->nr_zero_pages);
+				} else {
+					wc_addr = gdev->wc_base +
+						(page_to_phys(sp) - gdev->bar_start);
+					if (static_branch_likely(&gxl_has_avx2))
+						gxl_memcpy_ntdqa_avx2(
+							vaddr,
+							(const void __force *)wc_addr,
+							PAGE_SIZE);
+					else
+						gxl_memcpy_ntdqa_sse(
+							vaddr,
+							(const void __force *)wc_addr,
+							PAGE_SIZE);
+				}
 				kunmap_local(vaddr);
 			}
 
@@ -408,16 +449,33 @@ int gxl_copy_folio(struct folio *dst, struct folio *src)
 
 		if (is_demotion) {
 			vaddr = kmap_local_page(sp);
-			memcpy_toio(gdev->wc_base +
-				    (page_to_phys(dp) - gdev->bar_start),
-				    vaddr, PAGE_SIZE);
+			if (gdev->zero_bitmap &&
+			    gxl_page_all_zero(vaddr)) {
+				set_bit(gxl_vram_page_idx(gdev, dp),
+					gdev->zero_bitmap);
+				atomic_long_inc(&gdev->nr_zero_pages);
+			} else {
+				if (gdev->zero_bitmap)
+					clear_bit(gxl_vram_page_idx(gdev, dp),
+						  gdev->zero_bitmap);
+				memcpy_toio(gdev->wc_base +
+					    (page_to_phys(dp) - gdev->bar_start),
+					    vaddr, PAGE_SIZE);
+			}
 			kunmap_local(vaddr);
 		} else {
 			vaddr = kmap_local_page(dp);
-			memcpy_fromio(vaddr,
-				      gdev->wc_base +
-				      (page_to_phys(sp) - gdev->bar_start),
-				      PAGE_SIZE);
+			if (gdev->zero_bitmap &&
+			    test_and_clear_bit(gxl_vram_page_idx(gdev, sp),
+					       gdev->zero_bitmap)) {
+				clear_page(vaddr);
+				atomic_long_dec(&gdev->nr_zero_pages);
+			} else {
+				memcpy_fromio(vaddr,
+					      gdev->wc_base +
+					      (page_to_phys(sp) - gdev->bar_start),
+					      PAGE_SIZE);
+			}
 			kunmap_local(vaddr);
 		}
 		if (i + 1 < nr)
@@ -484,32 +542,49 @@ static void gxl_copy_worker(struct work_struct *work)
 			void __iomem *wc_addr;
 
 			if (cw->is_demotion) {
-				wc_addr = gdev->wc_base +
-					(page_to_phys(dp) - gdev->bar_start);
 				vaddr = kmap_local_page(sp);
-				if (static_branch_likely(&gxl_has_avx2))
-					gxl_memcpy_to_wc_avx2(
-						(void __force *)wc_addr,
-						vaddr, PAGE_SIZE);
-				else
-					gxl_memcpy_to_wc_sse(
-						(void __force *)wc_addr,
-						vaddr, PAGE_SIZE);
+				if (gdev->zero_bitmap &&
+				    gxl_page_all_zero(vaddr)) {
+					set_bit(gxl_vram_page_idx(gdev, dp),
+						gdev->zero_bitmap);
+					atomic_long_inc(&gdev->nr_zero_pages);
+				} else {
+					if (gdev->zero_bitmap)
+						clear_bit(gxl_vram_page_idx(gdev, dp),
+							  gdev->zero_bitmap);
+					wc_addr = gdev->wc_base +
+						(page_to_phys(dp) - gdev->bar_start);
+					if (static_branch_likely(&gxl_has_avx2))
+						gxl_memcpy_to_wc_avx2(
+							(void __force *)wc_addr,
+							vaddr, PAGE_SIZE);
+					else
+						gxl_memcpy_to_wc_sse(
+							(void __force *)wc_addr,
+							vaddr, PAGE_SIZE);
+				}
 				kunmap_local(vaddr);
 			} else {
-				wc_addr = gdev->wc_base +
-					(page_to_phys(sp) - gdev->bar_start);
 				vaddr = kmap_local_page(dp);
-				if (static_branch_likely(&gxl_has_avx2))
-					gxl_memcpy_ntdqa_avx2(
-						vaddr,
-						(const void __force *)wc_addr,
-						PAGE_SIZE);
-				else
-					gxl_memcpy_ntdqa_sse(
-						vaddr,
-						(const void __force *)wc_addr,
-						PAGE_SIZE);
+				if (gdev->zero_bitmap &&
+				    test_and_clear_bit(gxl_vram_page_idx(gdev, sp),
+						       gdev->zero_bitmap)) {
+					clear_page(vaddr);
+					atomic_long_dec(&gdev->nr_zero_pages);
+				} else {
+					wc_addr = gdev->wc_base +
+						(page_to_phys(sp) - gdev->bar_start);
+					if (static_branch_likely(&gxl_has_avx2))
+						gxl_memcpy_ntdqa_avx2(
+							vaddr,
+							(const void __force *)wc_addr,
+							PAGE_SIZE);
+					else
+						gxl_memcpy_ntdqa_sse(
+							vaddr,
+							(const void __force *)wc_addr,
+							PAGE_SIZE);
+				}
 				kunmap_local(vaddr);
 			}
 
@@ -533,18 +608,35 @@ static void gxl_copy_worker(struct work_struct *work)
 
 		if (cw->is_demotion) {
 			vaddr = kmap_local_page(cw->items[i].src);
-			memcpy_toio(gdev->wc_base +
-				    (page_to_phys(cw->items[i].dst) -
-				     gdev->bar_start),
-				    vaddr, PAGE_SIZE);
+			if (gdev->zero_bitmap &&
+			    gxl_page_all_zero(vaddr)) {
+				set_bit(gxl_vram_page_idx(gdev, cw->items[i].dst),
+					gdev->zero_bitmap);
+				atomic_long_inc(&gdev->nr_zero_pages);
+			} else {
+				if (gdev->zero_bitmap)
+					clear_bit(gxl_vram_page_idx(gdev, cw->items[i].dst),
+						  gdev->zero_bitmap);
+				memcpy_toio(gdev->wc_base +
+					    (page_to_phys(cw->items[i].dst) -
+					     gdev->bar_start),
+					    vaddr, PAGE_SIZE);
+			}
 			kunmap_local(vaddr);
 		} else {
 			vaddr = kmap_local_page(cw->items[i].dst);
-			memcpy_fromio(vaddr,
-				      gdev->wc_base +
-				      (page_to_phys(cw->items[i].src) -
-				       gdev->bar_start),
-				      PAGE_SIZE);
+			if (gdev->zero_bitmap &&
+			    test_and_clear_bit(gxl_vram_page_idx(gdev, cw->items[i].src),
+					       gdev->zero_bitmap)) {
+				clear_page(vaddr);
+				atomic_long_dec(&gdev->nr_zero_pages);
+			} else {
+				memcpy_fromio(vaddr,
+					      gdev->wc_base +
+					      (page_to_phys(cw->items[i].src) -
+					       gdev->bar_start),
+					      PAGE_SIZE);
+			}
 			kunmap_local(vaddr);
 		}
 	}
@@ -1181,6 +1273,19 @@ static ssize_t nr_promotions_show(struct kobject *kobj,
 static struct kobj_attribute gxl_nr_promotions_attr =
 	__ATTR(nr_promotions, 0444, nr_promotions_show, NULL);
 
+static ssize_t nr_zero_pages_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+
+	if (!gdev)
+		return -ENODEV;
+	return sysfs_emit(buf, "%ld\n", atomic_long_read(&gdev->nr_zero_pages));
+}
+
+static struct kobj_attribute gxl_nr_zero_pages_attr =
+	__ATTR(nr_zero_pages, 0444, nr_zero_pages_show, NULL);
+
 static struct attribute *gxl_dev_attrs[] = {
 	&gxl_size_mb_attr.attr,
 	&gxl_max_size_mb_attr.attr,
@@ -1193,6 +1298,7 @@ static struct attribute *gxl_dev_attrs[] = {
 	&gxl_pool_percent_attr.attr,
 	&gxl_nr_demotions_attr.attr,
 	&gxl_nr_promotions_attr.attr,
+	&gxl_nr_zero_pages_attr.attr,
 	NULL,
 };
 
@@ -1290,6 +1396,13 @@ static int gxl_init_one(struct gxl_dev *gdev, struct pci_dev *pdev)
 			gdev->slot);
 		/* Non-fatal: fall through to normal memcpy path */
 	}
+
+	/* Zero-page tracking bitmap: 1 bit per VRAM page */
+	gdev->zero_bitmap = kvmalloc_array(
+		BITS_TO_LONGS(bar_size >> PAGE_SHIFT),
+		sizeof(unsigned long), GFP_KERNEL | __GFP_ZERO);
+	if (!gdev->zero_bitmap)
+		pr_warn("%s: zero-page tracking unavailable\n", gdev->slot);
 
 	blk_size = memory_block_size_bytes();
 	if (gdev->pool_percent > 100)
@@ -1402,6 +1515,8 @@ err_put_mtype:
 	put_memory_type(gdev->mtype);
 	gdev->mtype = NULL;
 err_put_pdev:
+	kvfree(gdev->zero_bitmap);
+	gdev->zero_bitmap = NULL;
 	if (gdev->wc_base) {
 		iounmap(gdev->wc_base);
 		gdev->wc_base = NULL;
