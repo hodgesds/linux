@@ -53,6 +53,9 @@
 #include <linux/vmstat.h>
 #include <linux/io.h>
 #include <linux/swap.h>
+#include <linux/writeback.h>
+#include <linux/pagemap.h>
+
 
 /*
  * Default abstract distance for GPU VRAM over PCIe.
@@ -66,7 +69,7 @@
 #define GXL_MAX_DEVICES	8
 
 /* Memory resource name for add_memory_driver_managed() */
-static const char *gxl_res_name __used = "System RAM (gxl)";
+static const char *gxl_res_name = "System RAM (gxl)";
 
 /*
  * Per-device state
@@ -197,6 +200,431 @@ static int gxl_find_vram_bar(struct pci_dev *pdev, resource_size_t *bar_start,
 	*bar_idxp = best_bar;
 	return 0;
 }
+
+/*
+ * Online callback -- online each memory block to ZONE_MOVABLE
+ * so pages can be migrated back to DRAM on shrink.
+ */
+static int gxl_online_movable_cb(struct memory_block *mem, void *arg)
+{
+	if (mem->state == MEM_ONLINE)
+		return 0;	/* already onlined correctly by auto-online */
+
+	if (mem->state != MEM_OFFLINE)
+		return 0;
+
+	mem->online_type = MMOP_ONLINE_MOVABLE;
+	return device_online(&mem->dev);
+}
+
+/*
+ * Drop page cache and slab caches to help offline ZONE_MOVABLE pages.
+ *
+ * Filesystem metadata pages (e.g. btrfs btree nodes) can be demoted to
+ * gxl VRAM via NUMA tiering.  These pages carry private data that
+ * prevents migration, so offline_and_remove_memory() fails.  Dropping
+ * caches releases clean page cache pages and reclaimable slab objects,
+ * giving the retry a much better chance of succeeding.
+ */
+static void gxl_drop_pagecache_sb(struct super_block *sb, void *unused)
+{
+	struct inode *inode, *toput_inode = NULL;
+
+	spin_lock(&sb->s_inode_list_lock);
+	list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+		spin_lock(&inode->i_lock);
+		if ((inode_state_read(inode) & (I_FREEING | I_WILL_FREE | I_NEW)) ||
+		    (mapping_empty(inode->i_mapping) && !need_resched())) {
+			spin_unlock(&inode->i_lock);
+			continue;
+		}
+		__iget(inode);
+		spin_unlock(&inode->i_lock);
+		spin_unlock(&sb->s_inode_list_lock);
+
+		invalidate_mapping_pages(inode->i_mapping, 0, -1);
+		iput(toput_inode);
+		toput_inode = inode;
+
+		cond_resched();
+		spin_lock(&sb->s_inode_list_lock);
+	}
+	spin_unlock(&sb->s_inode_list_lock);
+	iput(toput_inode);
+}
+
+static void gxl_drop_caches(void)
+{
+	lru_add_drain_all();
+	iterate_supers(gxl_drop_pagecache_sb, NULL);
+	drop_slab();
+}
+
+/*
+ * Dynamic resize -- operates on a single device.
+ */
+static int gxl_do_resize(struct gxl_dev *gdev, unsigned long new_size)
+{
+	unsigned long blk_size = memory_block_size_bytes();
+	int rc = 0;
+
+	new_size = ALIGN_DOWN(new_size, blk_size);
+	if (new_size > gdev->max_size)
+		new_size = gdev->max_size;
+
+	mutex_lock(&gdev->lock);
+
+	if (new_size == gdev->online_size)
+		goto out;
+
+	if (new_size < gdev->online_size) {
+		unsigned long shrink = gdev->online_size - new_size;
+
+		rc = offline_and_remove_memory(gdev->phys_start + new_size,
+					       shrink);
+		if (rc) {
+			pr_info("%s: shrink failed (%d), dropping caches and retrying\n",
+				gdev->slot, rc);
+			mutex_unlock(&gdev->lock);
+			gxl_drop_caches();
+			mutex_lock(&gdev->lock);
+			/*
+			 * Re-check: online_size may have changed while the
+			 * lock was dropped.
+			 */
+			if (new_size >= gdev->online_size)
+				goto out;
+			shrink = gdev->online_size - new_size;
+			rc = offline_and_remove_memory(gdev->phys_start + new_size,
+						       shrink);
+		}
+		if (rc) {
+			pr_warn("%s: shrink failed: %d (pages may be pinned)\n",
+				gdev->slot, rc);
+			goto out;
+		}
+		gdev->online_size = new_size;
+		pr_info("%s: shrunk to %lu MB\n", gdev->slot, new_size >> 20);
+	} else {
+		unsigned long grow_start = gdev->phys_start + gdev->online_size;
+		unsigned long grow = new_size - gdev->online_size;
+		int saved_online_type;
+
+		/*
+		 * Force auto-onlined blocks into ZONE_MOVABLE so pages
+		 * can be migrated back to DRAM on shrink.  Restore the
+		 * original default after add_memory_driver_managed()
+		 * returns -- the window is serialised by
+		 * device_hotplug_lock inside the call.
+		 */
+		saved_online_type = mhp_get_default_online_type();
+		mhp_set_default_online_type(MMOP_ONLINE_MOVABLE);
+
+		rc = add_memory_driver_managed(gdev->mgid, grow_start, grow,
+					       gxl_res_name,
+					       MHP_NID_IS_MGID | MHP_MERGE_RESOURCE | MHP_WC);
+		if (rc == -EEXIST && gdev->state == GXL_STATE_READY) {
+			/*
+			 * GPU driver's PCI BAR claim blocks the memory
+			 * resource.  Release it and retry -- the driver
+			 * keeps working through existing ioremap mappings.
+			 */
+			pr_info("%s: releasing GPU driver BAR claim\n",
+				gdev->slot);
+			pci_release_region(gdev->pdev, gdev->bar_idx);
+			gdev->state = GXL_STATE_BAR_FREE;
+			rc = add_memory_driver_managed(gdev->mgid, grow_start,
+						       grow, gxl_res_name,
+						       MHP_NID_IS_MGID | MHP_MERGE_RESOURCE | MHP_WC);
+		}
+
+		mhp_set_default_online_type(saved_online_type);
+
+		if (rc) {
+			pr_warn("%s: grow failed: %d\n", gdev->slot, rc);
+			goto out;
+		}
+
+		/*
+		 * Online any blocks that were not auto-onlined (e.g.
+		 * when the system default is memhp_default_state=offline).
+		 */
+		lock_device_hotplug();
+		walk_memory_blocks(grow_start, grow, NULL,
+				   gxl_online_movable_cb);
+		unlock_device_hotplug();
+
+		gdev->online_size = new_size;
+		pr_info("%s: grown to %lu MB\n", gdev->slot, new_size >> 20);
+	}
+
+out:
+	mutex_unlock(&gdev->lock);
+	return rc;
+}
+
+/*
+ * sysfs helpers -- map kobject back to gxl_dev.
+ */
+static struct gxl_dev *gxl_kobj_to_dev(struct kobject *kobj)
+{
+	int i;
+
+	for (i = 0; i < gxl_nr_devs; i++) {
+		if (gxl_devs[i].kobj == kobj)
+			return &gxl_devs[i];
+	}
+	return NULL;
+}
+
+/*
+ * Per-device sysfs: /sys/kernel/mm/gxl/<slot>/
+ */
+static ssize_t size_mb_show(struct kobject *kobj,
+			    struct kobj_attribute *attr, char *buf)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+
+	if (!gdev)
+		return -ENODEV;
+	return sysfs_emit(buf, "%lu\n", gdev->online_size >> 20);
+}
+
+static ssize_t size_mb_store(struct kobject *kobj,
+			     struct kobj_attribute *attr,
+			     const char *buf, size_t count)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+	unsigned long mb;
+	int rc;
+
+	if (!gdev || gdev->state < GXL_STATE_READY)
+		return -ENODEV;
+
+	rc = kstrtoul(buf, 0, &mb);
+	if (rc)
+		return rc;
+
+	if (mb > (gdev->max_size >> 20))
+		mb = gdev->max_size >> 20;
+
+	rc = gxl_do_resize(gdev, mb << 20);
+	if (rc)
+		return rc;
+
+	return count;
+}
+
+static struct kobj_attribute gxl_size_mb_attr =
+	__ATTR(size_mb, 0644, size_mb_show, size_mb_store);
+
+static ssize_t max_size_mb_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+
+	if (!gdev)
+		return -ENODEV;
+	return sysfs_emit(buf, "%lu\n", gdev->max_size >> 20);
+}
+
+static struct kobj_attribute gxl_max_size_mb_attr =
+	__ATTR(max_size_mb, 0444, max_size_mb_show, NULL);
+
+static ssize_t numa_node_show(struct kobject *kobj,
+			      struct kobj_attribute *attr, char *buf)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+
+	if (!gdev)
+		return -ENODEV;
+	return sysfs_emit(buf, "%d\n", gdev->numa_node);
+}
+
+static struct kobj_attribute gxl_numa_node_attr =
+	__ATTR(numa_node, 0444, numa_node_show, NULL);
+
+static ssize_t local_node_show(struct kobject *kobj,
+			       struct kobj_attribute *attr, char *buf)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+
+	if (!gdev)
+		return -ENODEV;
+	return sysfs_emit(buf, "%d\n", gdev->local_node);
+}
+
+static struct kobj_attribute gxl_local_node_attr =
+	__ATTR(local_node, 0444, local_node_show, NULL);
+
+static ssize_t nr_used_pages_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+	unsigned long present, free;
+
+	if (!gdev || gdev->state < GXL_STATE_READY)
+		return -ENODEV;
+
+	present = node_present_pages(gdev->numa_node);
+	free = sum_zone_node_page_state(gdev->numa_node, NR_FREE_PAGES);
+	return sysfs_emit(buf, "%lu\n", present > free ? present - free : 0);
+}
+
+static struct kobj_attribute gxl_nr_used_pages_attr =
+	__ATTR(nr_used_pages, 0444, nr_used_pages_show, NULL);
+
+static ssize_t nr_free_pages_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+
+	if (!gdev || gdev->state < GXL_STATE_READY)
+		return -ENODEV;
+
+	return sysfs_emit(buf, "%lu\n",
+		sum_zone_node_page_state(gdev->numa_node, NR_FREE_PAGES));
+}
+
+static struct kobj_attribute gxl_nr_free_pages_attr =
+	__ATTR(nr_free_pages, 0444, nr_free_pages_show, NULL);
+
+static ssize_t fill_percent_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+	unsigned long present, free;
+
+	if (!gdev || gdev->state < GXL_STATE_READY)
+		return -ENODEV;
+
+	present = node_present_pages(gdev->numa_node);
+	if (!present)
+		return sysfs_emit(buf, "0\n");
+
+	free = sum_zone_node_page_state(gdev->numa_node, NR_FREE_PAGES);
+	return sysfs_emit(buf, "%lu\n", (present - free) * 100 / present);
+}
+
+static struct kobj_attribute gxl_fill_percent_attr =
+	__ATTR(fill_percent, 0444, fill_percent_show, NULL);
+
+static ssize_t adistance_show(struct kobject *kobj,
+			      struct kobj_attribute *attr, char *buf)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+
+	if (!gdev)
+		return -ENODEV;
+	return sysfs_emit(buf, "%u\n", gdev->adistance);
+}
+
+static struct kobj_attribute gxl_adistance_attr =
+	__ATTR(adistance, 0444, adistance_show, NULL);
+
+/*
+ * Recalculate max_size from the raw BAR and a new pool percent.
+ * Rejects changes that would strand already-online memory.
+ */
+static ssize_t pool_percent_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+
+	if (!gdev)
+		return -ENODEV;
+	return sysfs_emit(buf, "%u\n", gdev->pool_percent);
+}
+
+static ssize_t pool_percent_store(struct kobject *kobj,
+				  struct kobj_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+	unsigned long blk_size;
+	resource_size_t aligned_end;
+	unsigned long new_max;
+	unsigned int pct;
+	int rc;
+
+	if (!gdev || gdev->state < GXL_STATE_READY)
+		return -ENODEV;
+
+	rc = kstrtouint(buf, 0, &pct);
+	if (rc)
+		return rc;
+	if (pct > 100)
+		pct = 100;
+
+	blk_size = memory_block_size_bytes();
+	aligned_end = ALIGN_DOWN(gdev->bar_start + gdev->bar_size * pct / 100,
+				 blk_size);
+	if (gdev->phys_start >= aligned_end)
+		return -EINVAL;
+
+	new_max = aligned_end - gdev->phys_start;
+
+	mutex_lock(&gdev->lock);
+	if (gdev->online_size > new_max) {
+		mutex_unlock(&gdev->lock);
+		return -EBUSY;
+	}
+	gdev->max_size = new_max;
+	gdev->pool_percent = pct;
+	mutex_unlock(&gdev->lock);
+
+	pr_info("%s: pool_percent=%u%%, max_size=%lu MB\n",
+		gdev->slot, pct, new_max >> 20);
+	return count;
+}
+
+static struct kobj_attribute gxl_pool_percent_attr =
+	__ATTR(pool_percent, 0644, pool_percent_show, pool_percent_store);
+
+static ssize_t nr_demotions_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+
+	if (!gdev)
+		return -ENODEV;
+	return sysfs_emit(buf, "%ld\n", atomic_long_read(&gdev->nr_demotions));
+}
+
+static struct kobj_attribute gxl_nr_demotions_attr =
+	__ATTR(nr_demotions, 0444, nr_demotions_show, NULL);
+
+static ssize_t nr_promotions_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+
+	if (!gdev)
+		return -ENODEV;
+	return sysfs_emit(buf, "%ld\n", atomic_long_read(&gdev->nr_promotions));
+}
+
+static struct kobj_attribute gxl_nr_promotions_attr =
+	__ATTR(nr_promotions, 0444, nr_promotions_show, NULL);
+
+static struct attribute *gxl_dev_attrs[] = {
+	&gxl_size_mb_attr.attr,
+	&gxl_max_size_mb_attr.attr,
+	&gxl_numa_node_attr.attr,
+	&gxl_local_node_attr.attr,
+	&gxl_nr_used_pages_attr.attr,
+	&gxl_nr_free_pages_attr.attr,
+	&gxl_fill_percent_attr.attr,
+	&gxl_adistance_attr.attr,
+	&gxl_pool_percent_attr.attr,
+	&gxl_nr_demotions_attr.attr,
+	&gxl_nr_promotions_attr.attr,
+	NULL,
+};
+
+static const struct attribute_group gxl_dev_attr_group = {
+	.attrs = gxl_dev_attrs,
+};
 
 /*
  * Claim a NUMA node for a device.
@@ -348,6 +776,17 @@ static int gxl_init_one(struct gxl_dev *gdev, struct pci_dev *pdev)
 	}
 	gdev->mgid = rc;
 
+	/* Per-device sysfs kobject */
+	gdev->kobj = kobject_create_and_add(gdev->slot, gxl_kobj);
+	if (!gdev->kobj) {
+		rc = -ENOMEM;
+		goto err_unreg_group;
+	}
+
+	rc = sysfs_create_group(gdev->kobj, &gxl_dev_attr_group);
+	if (rc)
+		goto err_put_kobj;
+
 	gdev->pdev = pdev;
 	gdev->state = GXL_STATE_READY;
 
@@ -355,11 +794,25 @@ static int gxl_init_one(struct gxl_dev *gdev, struct pci_dev *pdev)
 		gdev->slot, gdev->max_size >> 20, gdev->numa_node,
 		gdev->adistance, gdev->local_node);
 
+	if (gxl_auto_online) {
+		rc = gxl_do_resize(gdev, gdev->max_size);
+		if (rc)
+			pr_warn("%s: auto-online failed: %d\n",
+				gdev->slot, rc);
+	} else {
+		pr_info("%s: write to /sys/kernel/mm/gxl/%s/size_mb to register VRAM\n",
+			gdev->slot, gdev->slot);
+	}
+
 	return 0;
 
-err_clear_type:
+err_put_kobj:
+	kobject_put(gdev->kobj);
+	gdev->kobj = NULL;
+err_unreg_group:
 	memory_group_unregister(gdev->mgid);
 	gdev->mgid = -1;
+err_clear_type:
 	clear_node_memory_type(gdev->numa_node, gdev->mtype);
 	lock_device_hotplug();
 	try_offline_node(gdev->numa_node);

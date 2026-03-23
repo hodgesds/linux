@@ -1511,6 +1511,9 @@ int add_memory_resource(int nid, struct resource *res, mhp_t mhp_flags)
 		nid = group->nid;
 	}
 
+	if (mhp_flags & MHP_WC)
+		params.pgprot = pgprot_writecombine(params.pgprot);
+
 	if (!node_possible(nid)) {
 		WARN(1, "node %d was absent from the node_possible_map\n", nid);
 		return -EINVAL;
