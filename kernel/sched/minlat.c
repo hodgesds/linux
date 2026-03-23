@@ -148,7 +148,8 @@ static void minlat_set_load_weight(struct task_struct *p)
 	}
 }
 
-static u64 minlat_calc_delta(u64 delta, struct sched_minlat_entity *me)
+static __always_inline u64
+minlat_calc_delta(u64 delta, struct sched_minlat_entity *me)
 {
 	if (me->load.weight == scale_load(1024))
 		return delta;
@@ -320,7 +321,8 @@ void init_minlat_rq(struct minlat_rq *minlat_rq)
 
 /* ==== rb-tree operations ==== */
 
-static inline bool __minlat_less(struct rb_node *a, const struct rb_node *b)
+static __always_inline bool __minlat_less(struct rb_node *a,
+					  const struct rb_node *b)
 {
 	struct sched_minlat_entity *ea, *eb;
 
@@ -329,15 +331,17 @@ static inline bool __minlat_less(struct rb_node *a, const struct rb_node *b)
 	return (s64)(ea->vruntime - eb->vruntime) < 0;
 }
 
-static inline void __enqueue_minlat_entity(struct minlat_rq *minlat_rq,
-					   struct sched_minlat_entity *me)
+static __always_inline void
+__enqueue_minlat_entity(struct minlat_rq *minlat_rq,
+			struct sched_minlat_entity *me)
 {
 	rb_add_cached(&me->run_node, &minlat_rq->tasks_timeline,
 		      __minlat_less);
 }
 
-static inline void __dequeue_minlat_entity(struct minlat_rq *minlat_rq,
-					   struct sched_minlat_entity *me)
+static __always_inline void
+__dequeue_minlat_entity(struct minlat_rq *minlat_rq,
+			struct sched_minlat_entity *me)
 {
 	if (RB_EMPTY_NODE(&me->run_node))
 		return;
@@ -345,7 +349,7 @@ static inline void __dequeue_minlat_entity(struct minlat_rq *minlat_rq,
 	RB_CLEAR_NODE(&me->run_node);
 }
 
-static struct sched_minlat_entity *
+static __always_inline struct sched_minlat_entity *
 __pick_first_minlat_entity(struct minlat_rq *minlat_rq)
 {
 	struct rb_node *left = rb_first_cached(&minlat_rq->tasks_timeline);
@@ -355,7 +359,7 @@ __pick_first_minlat_entity(struct minlat_rq *minlat_rq)
 	return rb_entry(left, struct sched_minlat_entity, run_node);
 }
 
-static inline struct rq *rq_of_minlat_rq(struct minlat_rq *minlat_rq)
+static __always_inline struct rq *rq_of_minlat_rq(struct minlat_rq *minlat_rq)
 {
 	return container_of(minlat_rq, struct rq, minlat);
 }
@@ -370,7 +374,7 @@ static inline struct rq *rq_of_minlat_rq(struct minlat_rq *minlat_rq)
  * low-nice tasks to lose their vruntime advantage when they sleep
  * and wake up (place_minlat_entity uses min_vruntime for placement).
  */
-static void update_min_vruntime(struct minlat_rq *minlat_rq)
+static __always_inline void update_min_vruntime(struct minlat_rq *minlat_rq)
 {
 	struct sched_minlat_entity *leftmost;
 	struct task_struct *curr = rq_of_minlat_rq(minlat_rq)->curr;
@@ -423,7 +427,7 @@ static void place_minlat_entity(struct minlat_rq *minlat_rq,
  * Used on the wakeup preemption path where we need fresh vruntime
  * for comparison but don't need correct tree ordering yet.
  */
-static void update_curr_minlat_vruntime(struct rq *rq)
+static __always_inline void update_curr_minlat_vruntime(struct rq *rq)
 {
 	struct task_struct *curr = rq->curr;
 	struct sched_minlat_entity *me;
@@ -734,8 +738,9 @@ static void yield_task_minlat(struct rq *rq)
  * run). This mirrors CFS set_preempt_buddy() which keeps an existing
  * buddy with an earlier deadline.
  */
-static void set_next_buddy_minlat(struct minlat_rq *minlat_rq,
-				  struct sched_minlat_entity *me)
+static __always_inline void
+set_next_buddy_minlat(struct minlat_rq *minlat_rq,
+		      struct sched_minlat_entity *me)
 {
 	if (minlat_rq->next &&
 	    (s64)(me->vruntime - minlat_rq->next->vruntime) > 0)
@@ -837,8 +842,9 @@ wakeup_preempt_minlat(struct rq *rq, struct task_struct *p, int flags)
  * checks vruntime <= avg_vruntime. Since minlat doesn't track
  * avg_vruntime, we use min_vruntime + latency_target as the bound.
  */
-static bool minlat_buddy_eligible(struct minlat_rq *minlat_rq,
-				  struct sched_minlat_entity *me)
+static __always_inline bool
+minlat_buddy_eligible(struct minlat_rq *minlat_rq,
+		      struct sched_minlat_entity *me)
 {
 	return (s64)(me->vruntime - minlat_rq->min_vruntime) <=
 	       (s64)MINLAT_LATENCY_NS;
@@ -940,27 +946,43 @@ put_prev_task_minlat(struct rq *rq, struct task_struct *p,
 {
 	struct sched_minlat_entity *me = &p->minlat;
 	struct minlat_rq *minlat_rq = &rq->minlat;
+	struct sched_minlat_entity *leftmost;
+	u64 now, delta_exec, vruntime;
 
-	/*
-	 * Only re-insert if this entity is the current out-of-tree task.
-	 * If minlat_rq->curr != me, the entity was already handled by
-	 * dequeue_task_minlat (e.g., DEQUEUE_SAVE class-change path)
-	 * and may already be in the tree or will be re-enqueued separately.
-	 */
-	if (minlat_rq->curr != me) {
-		/* Not curr — nothing to re-insert */
+	if (unlikely(minlat_rq->curr != me))
 		return;
-	}
 
-	if (!me->on_rq) {
+	if (unlikely(!me->on_rq)) {
 		minlat_rq->curr = NULL;
 		return;
 	}
 
-	update_curr_minlat_vruntime(rq);
-	update_min_vruntime(minlat_rq);
+	/*
+	 * Combined vruntime + min_vruntime update.
+	 * We know curr is minlat class — skip the class check that
+	 * the standalone update_curr_minlat_vruntime() does.
+	 * Inline min_vruntime update to avoid redundant rq lookup
+	 * and second class check.
+	 */
+	now = rq_clock_task(rq);
+	delta_exec = now - p->se.exec_start;
 
-	/* Re-insert into the rb-tree at the correct position. */
+	if (likely((s64)delta_exec > 0)) {
+		p->se.exec_start = now;
+		p->se.sum_exec_runtime += delta_exec;
+		account_group_exec_runtime(p, delta_exec);
+		cgroup_account_cputime(p, delta_exec);
+		me->vruntime += minlat_calc_delta(delta_exec, me);
+	}
+
+	/* Inline min_vruntime: curr vruntime is fresh, check leftmost */
+	vruntime = me->vruntime;
+	leftmost = __pick_first_minlat_entity(minlat_rq);
+	if (leftmost)
+		vruntime = min_t(u64, vruntime, leftmost->vruntime);
+	minlat_rq->min_vruntime = max_t(u64, minlat_rq->min_vruntime,
+					vruntime);
+
 	__enqueue_minlat_entity(minlat_rq, me);
 	minlat_rq->curr = NULL;
 }
@@ -977,11 +999,11 @@ set_next_task_minlat(struct rq *rq, struct task_struct *p, bool first)
 	 * repositioning in update_curr_minlat(). put_prev_task will
 	 * re-insert it when it stops running.
 	 */
-	if (me->on_rq && !RB_EMPTY_NODE(&me->run_node))
+	if (likely(me->on_rq) && likely(!RB_EMPTY_NODE(&me->run_node)))
 		__dequeue_minlat_entity(minlat_rq, me);
 
 	/* Clear buddy — it's been picked or is no longer relevant */
-	if (minlat_rq->next == me)
+	if (unlikely(minlat_rq->next == me))
 		minlat_rq->next = NULL;
 
 	minlat_rq->curr = me;
