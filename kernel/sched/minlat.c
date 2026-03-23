@@ -631,16 +631,22 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 		/*
 		 * Only delay for short-running tasks (IPC pattern).
 		 *
-		 * Skip delay when this would make all entities delayed
-		 * (nr_running - nr_delayed == 1 means this is the last
-		 * non-delayed entity). Fully dequeue instead so the CPU
-		 * can become idle and receive migrated tasks. This fixes
-		 * schbench regressions where delayed dequeue prevents
-		 * workers from migrating to idle CPUs.
+		 * Cap delayed entities to bound pick_task scan cost.
+		 * At high oversubscription (75+ tasks/CPU), unbounded
+		 * delayed entities cause O(n) scan or excessive
+		 * force-dequeue overhead. Cap at nr_running/4 (min 2)
+		 * to keep scan cost bounded while preserving
+		 * ttwu_runnable benefits for the hottest IPC tasks.
+		 *
+		 * Also prevent all-delayed state (nr_running -
+		 * nr_delayed > 1) so the CPU can become idle.
 		 */
 		if (run_ns < max_t(u64, MINLAT_MIN_GRANULARITY_NS,
 				   sysctl_sched_base_slice) &&
-		    minlat_rq->nr_running - minlat_rq->nr_delayed > 1) {
+		    minlat_rq->nr_running - minlat_rq->nr_delayed > 1 &&
+		    minlat_rq->nr_delayed <
+			    max_t(unsigned int, 2,
+				  minlat_rq->nr_running >> 2)) {
 			p->se.sched_delayed = 1;
 			minlat_rq->nr_delayed++;
 			return false;
@@ -829,6 +835,10 @@ wakeup_preempt_minlat(struct rq *rq, struct task_struct *p, int flags)
 	 * Preempt if the wakee has a vruntime advantage exceeding
 	 * the threshold. This prevents excessive preemption when
 	 * many tasks wake up with slightly better vruntimes.
+	 *
+	 * Use resched_curr_lazy to avoid IPI storms in IPC-heavy
+	 * workloads like hackbench where many tasks wake on remote
+	 * CPUs simultaneously.
 	 */
 	if (delta > (s64)minlat_wakeup_preempt_thresh_ns)
 		resched_curr_lazy(rq);
@@ -874,34 +884,19 @@ pick_task_minlat(struct rq *rq, struct rq_flags *rf)
 	minlat_rq->next = NULL;
 
 	/*
-	 * Scan tree for first non-delayed entity. Delayed entities
-	 * are left in the tree — they'll be cleaned up when:
-	 *  - ttwu_runnable clears their delayed flag (common case)
-	 *  - All entities are delayed (force-dequeue below)
-	 *  - wait_task_inactive/exit forces dequeue
+	 * Pick leftmost non-delayed entity. Force-dequeue any delayed
+	 * entities at the head of the tree instead of scanning past
+	 * them (O(n) scan degrades at high oversubscription).
 	 *
-	 * Skip scan entirely when all entities are known-delayed
-	 * (nr_delayed tracks in-tree delayed count).
-	 */
-	if (minlat_rq->nr_running > minlat_rq->nr_delayed) {
-		struct rb_node *node;
-
-		for (node = rb_first_cached(&minlat_rq->tasks_timeline);
-		     node; node = rb_next(node)) {
-			me = rb_entry(node, struct sched_minlat_entity,
-				      run_node);
-			p = container_of(me, struct task_struct, minlat);
-			if (!p->se.sched_delayed)
-				return p;
-		}
-	}
-
-	/*
-	 * All tree entities are delayed — force-dequeue them all.
-	 * This cleans up the tree and allows idle-pull to find work.
+	 * This mirrors CFS's pick_next_entity approach: pick the best
+	 * candidate, and if it's delayed, force-dequeue it and retry.
+	 * Force-dequeued entities go through full ttwu on wakeup,
+	 * getting a chance to migrate to a less loaded CPU.
 	 */
 	while ((me = __pick_first_minlat_entity(minlat_rq))) {
 		p = container_of(me, struct task_struct, minlat);
+		if (!p->se.sched_delayed)
+			return p;
 		dequeue_task_minlat(rq, p, DEQUEUE_SLEEP | DEQUEUE_DELAYED);
 	}
 

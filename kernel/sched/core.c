@@ -5971,27 +5971,26 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 			}
 
 			/*
-			 * Tree scan: find the first non-delayed entity.
-			 * Skip scan entirely when all entities are delayed
-			 * (nr_delayed == nr_running) — go to restart which
-			 * calls balance_minlat to pull real work.
+			 * Tree pick: check leftmost only. If delayed,
+			 * fall to restart — pick_task_minlat will
+			 * force-dequeue it (mirrors CFS approach).
+			 * Avoids O(n) scan that degrades at high
+			 * oversubscription.
 			 */
-			if (rq->minlat.nr_running >
-			    rq->minlat.nr_delayed) {
-				for (left = rb_first_cached(
-						&rq->minlat.tasks_timeline);
-				     left; left = rb_next(left)) {
-					me = rb_entry(left,
-						struct sched_minlat_entity,
-						run_node);
-					p = container_of(me,
-						struct task_struct, minlat);
-					if (likely(!p->se.sched_delayed)) {
-						put_prev_set_next_task(
-							rq, prev, p);
-						return p;
-					}
+			left = rb_first_cached(
+					&rq->minlat.tasks_timeline);
+			if (left) {
+				me = rb_entry(left,
+					struct sched_minlat_entity,
+					run_node);
+				p = container_of(me,
+					struct task_struct, minlat);
+				if (likely(!p->se.sched_delayed)) {
+					put_prev_set_next_task(
+						rq, prev, p);
+					return p;
 				}
+				goto restart;
 			}
 
 			/*
@@ -6008,16 +6007,11 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 			}
 
 			/*
-			 * All minlat entities are delayed (sleeping) with
-			 * no curr. The fast path can't force-dequeue them,
-			 * so fall through to the normal pick path which
-			 * calls pick_task_minlat to clean them up. Without
-			 * this, delayed entities stay on the rq forever,
-			 * keeping nr_running > 0 and preventing the CPU
-			 * from appearing idle.
+			 * No minlat entities — nr_running > 0 due to
+			 * delayed entities. Fall to pick_task_minlat
+			 * for cleanup.
 			 */
-			if (rq->minlat.nr_delayed)
-				goto restart;
+			goto restart;
 		}
 
 		/* No minlat tasks — fall through to CFS */
