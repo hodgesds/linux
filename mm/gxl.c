@@ -51,11 +51,17 @@
 #include <linux/mutex.h>
 #include <linux/topology.h>
 #include <linux/vmstat.h>
+#include <linux/gxl.h>
 #include <linux/io.h>
+#include <linux/highmem.h>
 #include <linux/swap.h>
 #include <linux/writeback.h>
 #include <linux/pagemap.h>
 
+#ifdef CONFIG_X86
+#include <asm/fpu/api.h>
+#include <asm/cpufeatures.h>
+#endif
 
 /*
  * Default abstract distance for GPU VRAM over PCIe.
@@ -108,6 +114,317 @@ static int gxl_nr_devs;
  * Parent kobject: /sys/kernel/mm/gxl/
  */
 static struct kobject *gxl_kobj;
+
+/*
+ * WC copy acceleration: node tracking and MOVNTDQA streaming reads.
+ *
+ * gxl_wc_node[] tracks which NUMA nodes are WC-mapped GPU VRAM.
+ * The static key ensures zero overhead on systems without gxl devices.
+ */
+static DEFINE_STATIC_KEY_FALSE(gxl_has_wc_nodes);
+static bool gxl_wc_node[MAX_NUMNODES];
+
+static struct gxl_dev *gxl_node_to_dev(int nid)
+{
+	int i;
+
+	for (i = 0; i < gxl_nr_devs; i++) {
+		if (gxl_devs[i].state >= GXL_STATE_READY && gxl_devs[i].numa_node == nid)
+			return &gxl_devs[i];
+	}
+	return NULL;
+}
+
+#ifdef CONFIG_X86
+static DEFINE_STATIC_KEY_FALSE(gxl_has_movntdqa);
+static DEFINE_STATIC_KEY_FALSE(gxl_has_avx2);
+
+/*
+ * SSE4.1 streaming read from WC memory, 64 bytes per iteration.
+ * Pattern from drivers/gpu/drm/drm_cache.c:__memcpy_ntdqa().
+ *
+ * Both src and dst must be 16-byte aligned; len is in bytes.
+ */
+static void gxl_memcpy_ntdqa_sse(void *dst, const void *src, unsigned long len)
+{
+	while (len >= 64) {
+		asm("movntdqa   (%0), %%xmm0\n"
+		    "movntdqa 16(%0), %%xmm1\n"
+		    "movntdqa 32(%0), %%xmm2\n"
+		    "movntdqa 48(%0), %%xmm3\n"
+		    "movaps %%xmm0,   (%1)\n"
+		    "movaps %%xmm1, 16(%1)\n"
+		    "movaps %%xmm2, 32(%1)\n"
+		    "movaps %%xmm3, 48(%1)\n"
+		    :: "r" (src), "r" (dst) : "memory");
+		src += 64;
+		dst += 64;
+		len -= 64;
+	}
+}
+
+/*
+ * AVX2 streaming read from WC memory, 256 bytes per iteration.
+ * VMOVNTDQA with 256-bit YMM registers using 8 registers to maximise
+ * the number of outstanding PCIe read requests the CPU can pipeline.
+ *
+ * Both src and dst must be 32-byte aligned; len is in bytes.
+ */
+static void gxl_memcpy_ntdqa_avx2(void *dst, const void *src, unsigned long len)
+{
+	while (len >= 256) {
+		asm("vmovntdqa     (%0), %%ymm0\n"
+		    "vmovntdqa   32(%0), %%ymm1\n"
+		    "vmovntdqa   64(%0), %%ymm2\n"
+		    "vmovntdqa   96(%0), %%ymm3\n"
+		    "vmovntdqa  128(%0), %%ymm4\n"
+		    "vmovntdqa  160(%0), %%ymm5\n"
+		    "vmovntdqa  192(%0), %%ymm6\n"
+		    "vmovntdqa  224(%0), %%ymm7\n"
+		    "vmovdqa %%ymm0,     (%1)\n"
+		    "vmovdqa %%ymm1,   32(%1)\n"
+		    "vmovdqa %%ymm2,   64(%1)\n"
+		    "vmovdqa %%ymm3,   96(%1)\n"
+		    "vmovdqa %%ymm4,  128(%1)\n"
+		    "vmovdqa %%ymm5,  160(%1)\n"
+		    "vmovdqa %%ymm6,  192(%1)\n"
+		    "vmovdqa %%ymm7,  224(%1)\n"
+		    :: "r" (src), "r" (dst) : "memory");
+		src += 256;
+		dst += 256;
+		len -= 256;
+	}
+	/* Remainder via SSE path (handles 64-byte chunks) */
+	if (len)
+		gxl_memcpy_ntdqa_sse(dst, src, len);
+}
+
+/*
+ * AVX2 non-temporal write to WC destination, 256 bytes per iteration.
+ * Reads from WB source with VMOVDQA, writes to WC with VMOVNTDQ.
+ * 8 YMM registers keep the WC combining buffers saturated.
+ *
+ * Both src and dst must be 32-byte aligned; len is in bytes.
+ */
+static void gxl_memcpy_to_wc_avx2(void *dst, const void *src, unsigned long len)
+{
+	while (len >= 256) {
+		asm("vmovdqa     (%0), %%ymm0\n"
+		    "vmovdqa   32(%0), %%ymm1\n"
+		    "vmovdqa   64(%0), %%ymm2\n"
+		    "vmovdqa   96(%0), %%ymm3\n"
+		    "vmovdqa  128(%0), %%ymm4\n"
+		    "vmovdqa  160(%0), %%ymm5\n"
+		    "vmovdqa  192(%0), %%ymm6\n"
+		    "vmovdqa  224(%0), %%ymm7\n"
+		    "vmovntdq %%ymm0,     (%1)\n"
+		    "vmovntdq %%ymm1,   32(%1)\n"
+		    "vmovntdq %%ymm2,   64(%1)\n"
+		    "vmovntdq %%ymm3,   96(%1)\n"
+		    "vmovntdq %%ymm4,  128(%1)\n"
+		    "vmovntdq %%ymm5,  160(%1)\n"
+		    "vmovntdq %%ymm6,  192(%1)\n"
+		    "vmovntdq %%ymm7,  224(%1)\n"
+		    :: "r" (src), "r" (dst) : "memory");
+		src += 256;
+		dst += 256;
+		len -= 256;
+	}
+	while (len >= 32) {
+		asm("vmovdqa (%0), %%ymm0\n"
+		    "vmovntdq %%ymm0, (%1)\n"
+		    :: "r" (src), "r" (dst) : "memory");
+		src += 32;
+		dst += 32;
+		len -= 32;
+	}
+}
+
+/*
+ * SSE non-temporal write to WC destination, 64 bytes per iteration.
+ */
+static void gxl_memcpy_to_wc_sse(void *dst, const void *src, unsigned long len)
+{
+	while (len >= 64) {
+		asm("movdqa    (%0), %%xmm0\n"
+		    "movdqa  16(%0), %%xmm1\n"
+		    "movdqa  32(%0), %%xmm2\n"
+		    "movdqa  48(%0), %%xmm3\n"
+		    "movntdq %%xmm0,   (%1)\n"
+		    "movntdq %%xmm1, 16(%1)\n"
+		    "movntdq %%xmm2, 32(%1)\n"
+		    "movntdq %%xmm3, 48(%1)\n"
+		    :: "r" (src), "r" (dst) : "memory");
+		src += 64;
+		dst += 64;
+		len -= 64;
+	}
+}
+
+static void __init gxl_init_movntdqa(void)
+{
+	/*
+	 * Some hypervisors (e.g. KVM) don't support VEX-prefix instructions
+	 * emulation.  Don't enable movntdqa in hypervisor guests.
+	 */
+	if (!static_cpu_has(X86_FEATURE_XMM4_1) ||
+	    boot_cpu_has(X86_FEATURE_HYPERVISOR))
+		return;
+
+	static_branch_enable(&gxl_has_movntdqa);
+
+	if (static_cpu_has(X86_FEATURE_AVX2))
+		static_branch_enable(&gxl_has_avx2);
+}
+
+#else /* !CONFIG_X86 */
+
+static void __init gxl_init_movntdqa(void) { }
+#endif /* CONFIG_X86 */
+
+/*
+ * Folio-level batch copy for migration (demotion/promotion).
+ *
+ * For demotion (DRAM->VRAM), non-temporal stores (MOVNTDQ/VMOVNTDQ)
+ * go through WC combining buffers which are not drained by LOCK-
+ * prefixed instructions.  An explicit sfence is required before
+ * returning to ensure stores are globally visible before the
+ * migration framework installs the new PTE.
+ *
+ * Batches kernel_fpu_begin/end across all sub-pages in a folio,
+ * yielding every 32 pages (~128 KB) to bound scheduling latency.
+ *
+ * Returns 0 if the copy was handled, -1 to fall through to the
+ * default copy_mc_highpage() path.
+ */
+int gxl_copy_folio(struct folio *dst, struct folio *src)
+{
+	int snid, dnid;
+	struct gxl_dev *gdev;
+	long nr, i;
+	bool is_demotion;
+
+	if (!static_branch_unlikely(&gxl_has_wc_nodes))
+		return -1;
+
+	/* Bulk copy already handled this folio — skip inline copy */
+		return 0;
+
+	snid = folio_nid(src);
+	dnid = folio_nid(dst);
+
+	if (gxl_wc_node[snid]) {
+		gdev = gxl_node_to_dev(snid);
+		is_demotion = false;
+	} else if (gxl_wc_node[dnid]) {
+		gdev = gxl_node_to_dev(dnid);
+		is_demotion = true;
+	} else {
+		return -1;
+	}
+
+	if (!gdev || !gdev->wc_base)
+		return -1;
+
+	/*
+	 * Fall through to copy_mc_highpage() for HWPoison source folios
+	 * so that machine check errors are properly detected and reported.
+	 */
+	if (unlikely(folio_test_hwpoison(src)))
+		return -1;
+
+	nr = folio_nr_pages(src);
+
+#ifdef CONFIG_X86
+	if (static_branch_likely(&gxl_has_movntdqa)) {
+		kernel_fpu_begin();
+
+		for (i = 0; i < nr; i++) {
+			struct page *sp = folio_page(src, i);
+			struct page *dp = folio_page(dst, i);
+			void *vaddr;
+			void __iomem *wc_addr;
+
+			if (is_demotion) {
+				wc_addr = gdev->wc_base +
+					(page_to_phys(dp) - gdev->bar_start);
+				vaddr = kmap_local_page(sp);
+				if (static_branch_likely(&gxl_has_avx2))
+					gxl_memcpy_to_wc_avx2(
+						(void __force *)wc_addr,
+						vaddr, PAGE_SIZE);
+				else
+					gxl_memcpy_to_wc_sse(
+						(void __force *)wc_addr,
+						vaddr, PAGE_SIZE);
+				kunmap_local(vaddr);
+			} else {
+				wc_addr = gdev->wc_base +
+					(page_to_phys(sp) - gdev->bar_start);
+				vaddr = kmap_local_page(dp);
+				if (static_branch_likely(&gxl_has_avx2))
+					gxl_memcpy_ntdqa_avx2(
+						vaddr,
+						(const void __force *)wc_addr,
+						PAGE_SIZE);
+				else
+					gxl_memcpy_ntdqa_sse(
+						vaddr,
+						(const void __force *)wc_addr,
+						PAGE_SIZE);
+				kunmap_local(vaddr);
+			}
+
+			/* Yield FPU every 32 pages to bound latency */
+			if ((i & 31) == 31 && i + 1 < nr) {
+				if (is_demotion)
+					wmb();
+				kernel_fpu_end();
+				cond_resched();
+				kernel_fpu_begin();
+			}
+		}
+
+		if (is_demotion)
+			wmb();
+		kernel_fpu_end();
+		goto done;
+	}
+#endif
+	/* Non-x86 or no MOVNTDQA: per-page fallback */
+	for (i = 0; i < nr; i++) {
+		struct page *sp = folio_page(src, i);
+		struct page *dp = folio_page(dst, i);
+		void *vaddr;
+
+		if (is_demotion) {
+			vaddr = kmap_local_page(sp);
+			memcpy_toio(gdev->wc_base +
+				    (page_to_phys(dp) - gdev->bar_start),
+				    vaddr, PAGE_SIZE);
+			kunmap_local(vaddr);
+		} else {
+			vaddr = kmap_local_page(dp);
+			memcpy_fromio(vaddr,
+				      gdev->wc_base +
+				      (page_to_phys(sp) - gdev->bar_start),
+				      PAGE_SIZE);
+			kunmap_local(vaddr);
+		}
+		if (i + 1 < nr)
+			cond_resched();
+	}
+
+	if (is_demotion)
+		wmb();
+
+done:
+	if (is_demotion)
+		atomic_long_add(nr, &gdev->nr_demotions);
+	else
+		atomic_long_add(nr, &gdev->nr_promotions);
+	return 0;
+}
 
 
 /*
@@ -790,6 +1107,12 @@ static int gxl_init_one(struct gxl_dev *gdev, struct pci_dev *pdev)
 	gdev->pdev = pdev;
 	gdev->state = GXL_STATE_READY;
 
+	/* Register this node for WC-accelerated migration copies */
+	if (gdev->wc_base) {
+		gxl_wc_node[gdev->numa_node] = true;
+		static_branch_enable(&gxl_has_wc_nodes);
+	}
+
 	pr_info("%s: ready: %lu MB GPU VRAM on node %d (adist %u, local node %d)\n",
 		gdev->slot, gdev->max_size >> 20, gdev->numa_node,
 		gdev->adistance, gdev->local_node);
@@ -888,6 +1211,8 @@ static int __init gxl_init(void)
 
 	if (!gxl_nr_devs)
 		return 0;
+
+	gxl_init_movntdqa();
 
 	/* Parent sysfs directory */
 	gxl_kobj = kobject_create_and_add("gxl", mm_kobj);
