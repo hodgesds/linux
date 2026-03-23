@@ -6006,6 +6006,18 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 				put_prev_set_next_task(rq, prev, p);
 				return p;
 			}
+
+			/*
+			 * All minlat entities are delayed (sleeping) with
+			 * no curr. The fast path can't force-dequeue them,
+			 * so fall through to the normal pick path which
+			 * calls pick_task_minlat to clean them up. Without
+			 * this, delayed entities stay on the rq forever,
+			 * keeping nr_running > 0 and preventing the CPU
+			 * from appearing idle.
+			 */
+			if (rq->minlat.nr_delayed)
+				goto restart;
 		}
 
 		/* No minlat tasks — fall through to CFS */

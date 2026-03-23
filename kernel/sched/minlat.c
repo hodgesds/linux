@@ -624,9 +624,19 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 		u64 run_ns = p->se.sum_exec_runtime -
 			     p->se.prev_sum_exec_runtime;
 
-		/* Only delay for short-running tasks (IPC pattern) */
+		/*
+		 * Only delay for short-running tasks (IPC pattern).
+		 *
+		 * Skip delay when this would make all entities delayed
+		 * (nr_running - nr_delayed == 1 means this is the last
+		 * non-delayed entity). Fully dequeue instead so the CPU
+		 * can become idle and receive migrated tasks. This fixes
+		 * schbench regressions where delayed dequeue prevents
+		 * workers from migrating to idle CPUs.
+		 */
 		if (run_ns < max_t(u64, MINLAT_MIN_GRANULARITY_NS,
-				   sysctl_sched_base_slice)) {
+				   sysctl_sched_base_slice) &&
+		    minlat_rq->nr_running - minlat_rq->nr_delayed > 1) {
 			p->se.sched_delayed = 1;
 			minlat_rq->nr_delayed++;
 			return false;
@@ -1115,6 +1125,30 @@ static bool minlat_wake_wide(struct task_struct *p)
 }
 
 /*
+ * Check if a CPU is effectively idle for minlat task placement.
+ * A CPU is effectively idle if:
+ *  - It's truly idle (available_idle_cpu), OR
+ *  - It only has delayed minlat entities (sleeping tasks kept
+ *    in the tree for fast wakeup). These will be force-dequeued
+ *    when the new task is picked, so the CPU is available.
+ */
+static inline bool minlat_cpu_effectively_idle(int cpu)
+{
+	struct minlat_rq *mrq = &cpu_rq(cpu)->minlat;
+
+	if (available_idle_cpu(cpu))
+		return true;
+
+	/*
+	 * CPU has only delayed entities — it will become idle once
+	 * they're force-dequeued in pick_task_minlat.
+	 */
+	return mrq->nr_running > 0 &&
+	       mrq->nr_running == mrq->nr_delayed &&
+	       cpu_rq(cpu)->nr_running == mrq->nr_running;
+}
+
+/*
  * Wake affinity: try to place the wakee on the waker's CPU.
  *
  * For sync wakeups (WF_SYNC, e.g. futex_wake, pipe_write), the waker
@@ -1188,12 +1222,12 @@ static int minlat_wake_affine_cpu(struct task_struct *p, int prev_cpu,
 	 * Non-sync: prefer an idle CPU for cache warmth.
 	 * Mirrors CFS wake_affine_idle().
 	 */
-	if (available_idle_cpu(this_cpu))
+	if (minlat_cpu_effectively_idle(this_cpu))
 		return this_cpu;
 
 	if (this_cpu != prev_cpu &&
 	    cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
-	    available_idle_cpu(prev_cpu))
+	    minlat_cpu_effectively_idle(prev_cpu))
 		return prev_cpu;
 
 	return -1;
@@ -1380,7 +1414,7 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 
 	/* 1. prev_cpu if idle — fast path, no scanning */
 	if (cpu_active(prev_cpu) && cpumask_test_cpu(prev_cpu, allowed) &&
-	    available_idle_cpu(prev_cpu))
+	    minlat_cpu_effectively_idle(prev_cpu))
 		return prev_cpu;
 
 	/*
@@ -1396,7 +1430,7 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 	    cpu_active(recent_used_cpu) &&
 	    cpumask_test_cpu(recent_used_cpu, allowed) &&
 	    cpus_share_cache(recent_used_cpu, prev_cpu) &&
-	    available_idle_cpu(recent_used_cpu))
+	    minlat_cpu_effectively_idle(recent_used_cpu))
 		return recent_used_cpu;
 
 	/*
@@ -1407,7 +1441,7 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 	for_each_cpu_wrap(cpu, cpu_active_mask, prev_cpu) {
 		if (!cpumask_test_cpu(cpu, allowed))
 			continue;
-		if (!available_idle_cpu(cpu))
+		if (!minlat_cpu_effectively_idle(cpu))
 			continue;
 
 		if (cpus_share_cache(cpu, prev_cpu))
