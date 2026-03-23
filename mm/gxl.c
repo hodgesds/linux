@@ -54,6 +54,8 @@
 #include <linux/gxl.h>
 #include <linux/io.h>
 #include <linux/highmem.h>
+#include <linux/workqueue.h>
+#include <linux/completion.h>
 #include <linux/swap.h>
 #include <linux/writeback.h>
 #include <linux/pagemap.h>
@@ -123,6 +125,7 @@ static struct kobject *gxl_kobj;
  */
 static DEFINE_STATIC_KEY_FALSE(gxl_has_wc_nodes);
 static bool gxl_wc_node[MAX_NUMNODES];
+static DEFINE_PER_CPU(struct task_struct *, gxl_bulk_copy_owner);
 
 static struct gxl_dev *gxl_node_to_dev(int nid)
 {
@@ -307,7 +310,13 @@ int gxl_copy_folio(struct folio *dst, struct folio *src)
 	if (!static_branch_unlikely(&gxl_has_wc_nodes))
 		return -1;
 
-	/* Bulk copy already handled this folio — skip inline copy */
+	/*
+	 * Bulk copy already handled this folio — skip inline copy.
+	 * Use this_cpu_read() (preempt-safe) to avoid reading the wrong
+	 * CPU's slot if preempted.  A CPU migration between set and check
+	 * just causes a harmless redundant copy.
+	 */
+	if (this_cpu_read(gxl_bulk_copy_owner) == current)
 		return 0;
 
 	snid = folio_nid(src);
@@ -426,6 +435,254 @@ done:
 	return 0;
 }
 
+/*
+ * Parallel bulk page copy via work queue.
+ *
+ * The single-core bottleneck for VRAM reads is PCIe round-trip latency ×
+ * Line Fill Buffers (~800 MB/s).  Each additional core adds its own LFBs,
+ * scaling linearly to ~6 GB/s at 12 cores on PCIe 4.0 x16.
+ *
+ * gxl_bulk_copy_folios() pre-copies all page data in parallel before
+ * the normal migration loop runs.  A per-CPU flag tells gxl_copy_folio()
+ * to skip the redundant inline copy for pages already handled here.
+ */
+
+#define GXL_PARALLEL_MIN_PAGES	64	/* overhead threshold */
+#define GXL_PAGES_PER_WORKER	512	/* pages per work item */
+
+static struct workqueue_struct *gxl_copy_wq;
+
+struct gxl_copy_item {
+	struct page	*src;
+	struct page	*dst;
+};
+
+struct gxl_copy_work {
+	struct work_struct	work;
+	struct gxl_dev		*gdev;
+	bool			is_demotion;
+	struct gxl_copy_item	*items;
+	int			nr_items;
+	atomic_t		*remaining;
+	struct completion	*done;
+};
+
+static void gxl_copy_worker(struct work_struct *work)
+{
+	struct gxl_copy_work *cw = container_of(work, struct gxl_copy_work, work);
+	struct gxl_dev *gdev = cw->gdev;
+	int i;
+
+#ifdef CONFIG_X86
+	if (static_branch_likely(&gxl_has_movntdqa)) {
+		kernel_fpu_begin();
+
+		for (i = 0; i < cw->nr_items; i++) {
+			struct page *sp = cw->items[i].src;
+			struct page *dp = cw->items[i].dst;
+			void *vaddr;
+			void __iomem *wc_addr;
+
+			if (cw->is_demotion) {
+				wc_addr = gdev->wc_base +
+					(page_to_phys(dp) - gdev->bar_start);
+				vaddr = kmap_local_page(sp);
+				if (static_branch_likely(&gxl_has_avx2))
+					gxl_memcpy_to_wc_avx2(
+						(void __force *)wc_addr,
+						vaddr, PAGE_SIZE);
+				else
+					gxl_memcpy_to_wc_sse(
+						(void __force *)wc_addr,
+						vaddr, PAGE_SIZE);
+				kunmap_local(vaddr);
+			} else {
+				wc_addr = gdev->wc_base +
+					(page_to_phys(sp) - gdev->bar_start);
+				vaddr = kmap_local_page(dp);
+				if (static_branch_likely(&gxl_has_avx2))
+					gxl_memcpy_ntdqa_avx2(
+						vaddr,
+						(const void __force *)wc_addr,
+						PAGE_SIZE);
+				else
+					gxl_memcpy_ntdqa_sse(
+						vaddr,
+						(const void __force *)wc_addr,
+						PAGE_SIZE);
+				kunmap_local(vaddr);
+			}
+
+			if ((i & 31) == 31) {
+				if (cw->is_demotion)
+					wmb();
+				kernel_fpu_end();
+				cond_resched();
+				kernel_fpu_begin();
+			}
+		}
+
+		if (cw->is_demotion)
+			wmb();
+		kernel_fpu_end();
+		goto out;
+	}
+#endif
+	for (i = 0; i < cw->nr_items; i++) {
+		void *vaddr;
+
+		if (cw->is_demotion) {
+			vaddr = kmap_local_page(cw->items[i].src);
+			memcpy_toio(gdev->wc_base +
+				    (page_to_phys(cw->items[i].dst) -
+				     gdev->bar_start),
+				    vaddr, PAGE_SIZE);
+			kunmap_local(vaddr);
+		} else {
+			vaddr = kmap_local_page(cw->items[i].dst);
+			memcpy_fromio(vaddr,
+				      gdev->wc_base +
+				      (page_to_phys(cw->items[i].src) -
+				       gdev->bar_start),
+				      PAGE_SIZE);
+			kunmap_local(vaddr);
+		}
+	}
+
+	if (cw->is_demotion)
+		wmb();
+
+out:
+	if (atomic_dec_and_test(cw->remaining))
+		complete(cw->done);
+}
+
+/**
+ * gxl_bulk_copy_folios - pre-copy folio data in parallel before migration
+ * @src_folios: list of source folios (already unmapped)
+ * @dst_folios: corresponding list of destination folios
+ *
+ * Called from migrate_folios_move() before the sequential move loop.
+ * Distributes page copies across multiple CPUs via work queue, then
+ * sets a per-CPU flag so that gxl_copy_folio() skips the redundant
+ * inline copy when called later from the normal migration path.
+ */
+void gxl_bulk_copy_folios(struct list_head *src_folios,
+			  struct list_head *dst_folios)
+{
+	struct folio *sf, *df;
+	struct gxl_dev *gdev;
+	struct gxl_copy_item *items;
+	struct gxl_copy_work *workers;
+	bool is_demotion;
+	int total_pages, nr_workers, per_worker, i, idx;
+	int snid, dnid;
+	DECLARE_COMPLETION_ONSTACK(done);
+	atomic_t remaining;
+
+	if (!static_branch_unlikely(&gxl_has_wc_nodes))
+		return;
+	if (!gxl_copy_wq)
+		return;
+
+	/* Peek at first src/dst to determine direction and device */
+	sf = list_first_entry_or_null(src_folios, struct folio, lru);
+	df = list_first_entry_or_null(dst_folios, struct folio, lru);
+	if (!sf || !df)
+		return;
+
+	snid = folio_nid(sf);
+	dnid = folio_nid(df);
+
+	if (gxl_wc_node[snid]) {
+		gdev = gxl_node_to_dev(snid);
+		is_demotion = false;
+	} else if (gxl_wc_node[dnid]) {
+		gdev = gxl_node_to_dev(dnid);
+		is_demotion = true;
+	} else {
+		return;
+	}
+
+	if (!gdev || !gdev->wc_base)
+		return;
+
+	/* Count total pages across all folios */
+	total_pages = 0;
+	list_for_each_entry(sf, src_folios, lru)
+		total_pages += folio_nr_pages(sf);
+
+	if (total_pages < GXL_PARALLEL_MIN_PAGES)
+		return;
+
+	items = kvmalloc_array(total_pages, sizeof(*items), GFP_NOWAIT);
+	if (!items)
+		return;
+
+	/* Collect (src, dst) page pairs from both lists in lockstep */
+	idx = 0;
+	df = list_first_entry(dst_folios, struct folio, lru);
+	list_for_each_entry(sf, src_folios, lru) {
+		int nr = folio_nr_pages(sf);
+
+		for (i = 0; i < nr; i++) {
+			items[idx].src = folio_page(sf, i);
+			items[idx].dst = folio_page(df, i);
+			idx++;
+		}
+		df = list_next_entry(df, lru);
+	}
+
+	/* Distribute across workers */
+	nr_workers = min_t(int,
+			   DIV_ROUND_UP(total_pages, GXL_PAGES_PER_WORKER),
+			   num_online_cpus());
+	if (nr_workers < 2)
+		nr_workers = 1;
+
+	workers = kcalloc(nr_workers, sizeof(*workers), GFP_NOWAIT);
+	if (!workers) {
+		kvfree(items);
+		return;
+	}
+
+	atomic_set(&remaining, nr_workers);
+	per_worker = total_pages / nr_workers;
+
+	for (i = 0; i < nr_workers; i++) {
+		int off = i * per_worker;
+		int cnt = (i == nr_workers - 1) ?
+			  total_pages - off : per_worker;
+
+		workers[i].gdev = gdev;
+		workers[i].is_demotion = is_demotion;
+		workers[i].items = &items[off];
+		workers[i].nr_items = cnt;
+		workers[i].remaining = &remaining;
+		workers[i].done = &done;
+
+		INIT_WORK(&workers[i].work, gxl_copy_worker);
+		queue_work(gxl_copy_wq, &workers[i].work);
+	}
+
+	wait_for_completion(&done);
+
+	if (is_demotion)
+		atomic_long_add(total_pages, &gdev->nr_demotions);
+	else
+		atomic_long_add(total_pages, &gdev->nr_promotions);
+
+	kfree(workers);
+	kvfree(items);
+
+	/* Tell gxl_copy_folio to skip inline copies in the move loop */
+	this_cpu_write(gxl_bulk_copy_owner, current);
+}
+
+void gxl_bulk_copy_done(void)
+{
+	this_cpu_write(gxl_bulk_copy_owner, NULL);
+}
 
 /*
  * PCI bus notifier for deferred device initialization.
@@ -1213,6 +1470,10 @@ static int __init gxl_init(void)
 		return 0;
 
 	gxl_init_movntdqa();
+
+	gxl_copy_wq = alloc_workqueue("gxl_copy", WQ_UNBOUND | WQ_HIGHPRI, 0);
+	if (!gxl_copy_wq)
+		pr_warn("failed to create copy workqueue, parallel copy disabled\n");
 
 	/* Parent sysfs directory */
 	gxl_kobj = kobject_create_and_add("gxl", mm_kobj);

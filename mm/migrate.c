@@ -43,6 +43,7 @@
 #include <linux/sched/sysctl.h>
 #include <linux/memory-tiers.h>
 #include <linux/pagewalk.h>
+#include <linux/gxl.h>
 
 #include <asm/tlbflush.h>
 
@@ -1710,6 +1711,13 @@ static void migrate_folios_move(struct list_head *src_folios,
 	int nr_pages;
 	int rc;
 
+	/*
+	 * Pre-copy page data in parallel for GXL WC pages.
+	 * gxl_copy_folio() will skip the inline copy for pages
+	 * already handled here.
+	 */
+	gxl_bulk_copy_folios(src_folios, dst_folios);
+
 	dst = list_first_entry(dst_folios, struct folio, lru);
 	dst2 = list_next_entry(dst, lru);
 	list_for_each_entry_safe(folio, folio2, src_folios, lru) {
@@ -1746,6 +1754,8 @@ static void migrate_folios_move(struct list_head *src_folios,
 		dst = dst2;
 		dst2 = list_next_entry(dst, lru);
 	}
+
+	gxl_bulk_copy_done();
 }
 
 static void migrate_folios_undo(struct list_head *src_folios,
