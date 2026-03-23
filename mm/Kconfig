@@ -128,7 +128,7 @@ config GXL
 	depends on MEMORY_HOTPLUG
 	depends on NUMA
 	depends on MIGRATION
-	depends on 64BIT
+	depends on X86_64
 	help
 	  Expose GPU VRAM (via PCI resizable BAR) as a kernel-managed
 	  memory tier.  Pages are automatically demoted from DRAM to

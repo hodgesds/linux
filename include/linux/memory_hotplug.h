@@ -58,6 +58,12 @@ typedef int __bitwise mhp_t;
  * implies the node id (nid).
  */
 #define MHP_NID_IS_MGID		((__force mhp_t)BIT(2))
+/*
+ * Map hotplugged memory with write-combining pgprot instead of write-back.
+ * Used for GPU VRAM BARs where WC enables streaming reads (MOVNTDQA) and
+ * write-combining buffers for fast PCIe transfers.
+ */
+#define MHP_WC			((__force mhp_t)BIT(3))
 
 /*
  * Extended parameters for memory hotplug:

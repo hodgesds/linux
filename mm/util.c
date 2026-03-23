@@ -26,6 +26,7 @@
 #include <linux/compat.h>
 #include <linux/fsnotify.h>
 #include <linux/page_idle.h>
+#include <linux/gxl.h>
 
 #include <linux/uaccess.h>
 
@@ -737,8 +738,17 @@ int folio_mc_copy(struct folio *dst, struct folio *src)
 	long nr = folio_nr_pages(src);
 	long i = 0;
 
+	/*
+	 * Try GXL folio-level batch copy first.  This amortizes FPU
+	 * save/restore and sfence across all sub-pages, giving much
+	 * better throughput than per-page gxl_copy_highpage().
+	 */
+	if (!gxl_copy_folio(dst, src))
+		return 0;
+
 	for (;;) {
-		if (copy_mc_highpage(folio_page(dst, i), folio_page(src, i)))
+		if (copy_mc_highpage(folio_page(dst, i),
+				     folio_page(src, i)))
 			return -EHWPOISON;
 		if (++i == nr)
 			break;

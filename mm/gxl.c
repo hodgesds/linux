@@ -51,6 +51,16 @@
 #include <linux/mutex.h>
 #include <linux/topology.h>
 #include <linux/vmstat.h>
+#include <linux/gxl.h>
+#include <linux/io.h>
+#include <linux/highmem.h>
+#include <linux/workqueue.h>
+#include <linux/completion.h>
+
+#ifdef CONFIG_X86
+#include <asm/fpu/api.h>
+#include <asm/cpufeatures.h>
+#endif
 
 /*
  * Default abstract distance for GPU VRAM over PCIe.
@@ -84,9 +94,12 @@ struct gxl_dev {
 	resource_size_t		phys_start;
 	unsigned long		max_size;
 	unsigned long		online_size;
+	void __iomem		*wc_base;	/* ioremap_wc of the BAR */
 	bool			ready;
 	struct kobject		*kobj;		/* /sys/kernel/mm/gxl/<slot>/ */
 	struct mutex		lock;
+	atomic_long_t		nr_demotions;	/* DRAM->VRAM page copies */
+	atomic_long_t		nr_promotions;	/* VRAM->DRAM page copies */
 };
 
 static struct gxl_dev gxl_devs[GXL_MAX_DEVICES];
@@ -96,6 +109,658 @@ static int gxl_nr_devs;
  * Parent kobject: /sys/kernel/mm/gxl/
  */
 static struct kobject *gxl_kobj;
+
+/*
+ * WC copy acceleration: node tracking and MOVNTDQA streaming reads.
+ *
+ * gxl_wc_node[] tracks which NUMA nodes are WC-mapped GPU VRAM.
+ * The static key ensures zero overhead on systems without gxl devices.
+ */
+static DEFINE_STATIC_KEY_FALSE(gxl_has_wc_nodes);
+static bool gxl_wc_node[MAX_NUMNODES];
+static DEFINE_PER_CPU(struct task_struct *, gxl_bulk_copy_owner);
+
+static struct gxl_dev *gxl_node_to_dev(int nid)
+{
+	int i;
+
+	for (i = 0; i < gxl_nr_devs; i++) {
+		if (gxl_devs[i].ready && gxl_devs[i].numa_node == nid)
+			return &gxl_devs[i];
+	}
+	return NULL;
+}
+
+#ifdef CONFIG_X86
+static DEFINE_STATIC_KEY_FALSE(gxl_has_movntdqa);
+static DEFINE_STATIC_KEY_FALSE(gxl_has_avx2);
+
+/*
+ * SSE4.1 streaming read from WC memory, 64 bytes per iteration.
+ * Pattern from drivers/gpu/drm/drm_cache.c:__memcpy_ntdqa().
+ *
+ * Both src and dst must be 16-byte aligned; len is in bytes.
+ */
+static void gxl_memcpy_ntdqa_sse(void *dst, const void *src, unsigned long len)
+{
+	while (len >= 64) {
+		asm("movntdqa   (%0), %%xmm0\n"
+		    "movntdqa 16(%0), %%xmm1\n"
+		    "movntdqa 32(%0), %%xmm2\n"
+		    "movntdqa 48(%0), %%xmm3\n"
+		    "movaps %%xmm0,   (%1)\n"
+		    "movaps %%xmm1, 16(%1)\n"
+		    "movaps %%xmm2, 32(%1)\n"
+		    "movaps %%xmm3, 48(%1)\n"
+		    :: "r" (src), "r" (dst) : "memory");
+		src += 64;
+		dst += 64;
+		len -= 64;
+	}
+}
+
+/*
+ * AVX2 streaming read from WC memory, 256 bytes per iteration.
+ * VMOVNTDQA with 256-bit YMM registers using 8 registers to maximise
+ * the number of outstanding PCIe read requests the CPU can pipeline.
+ *
+ * Both src and dst must be 32-byte aligned; len is in bytes.
+ */
+static void gxl_memcpy_ntdqa_avx2(void *dst, const void *src, unsigned long len)
+{
+	while (len >= 256) {
+		asm("vmovntdqa     (%0), %%ymm0\n"
+		    "vmovntdqa   32(%0), %%ymm1\n"
+		    "vmovntdqa   64(%0), %%ymm2\n"
+		    "vmovntdqa   96(%0), %%ymm3\n"
+		    "vmovntdqa  128(%0), %%ymm4\n"
+		    "vmovntdqa  160(%0), %%ymm5\n"
+		    "vmovntdqa  192(%0), %%ymm6\n"
+		    "vmovntdqa  224(%0), %%ymm7\n"
+		    "vmovdqa %%ymm0,     (%1)\n"
+		    "vmovdqa %%ymm1,   32(%1)\n"
+		    "vmovdqa %%ymm2,   64(%1)\n"
+		    "vmovdqa %%ymm3,   96(%1)\n"
+		    "vmovdqa %%ymm4,  128(%1)\n"
+		    "vmovdqa %%ymm5,  160(%1)\n"
+		    "vmovdqa %%ymm6,  192(%1)\n"
+		    "vmovdqa %%ymm7,  224(%1)\n"
+		    :: "r" (src), "r" (dst) : "memory");
+		src += 256;
+		dst += 256;
+		len -= 256;
+	}
+	/* Remainder via SSE path (handles 64-byte chunks) */
+	if (len)
+		gxl_memcpy_ntdqa_sse(dst, src, len);
+}
+
+/*
+ * AVX2 non-temporal write to WC destination, 256 bytes per iteration.
+ * Reads from WB source with VMOVDQA, writes to WC with VMOVNTDQ.
+ * 8 YMM registers keep the WC combining buffers saturated.
+ *
+ * Both src and dst must be 32-byte aligned; len is in bytes.
+ */
+static void gxl_memcpy_to_wc_avx2(void *dst, const void *src, unsigned long len)
+{
+	while (len >= 256) {
+		asm("vmovdqa     (%0), %%ymm0\n"
+		    "vmovdqa   32(%0), %%ymm1\n"
+		    "vmovdqa   64(%0), %%ymm2\n"
+		    "vmovdqa   96(%0), %%ymm3\n"
+		    "vmovdqa  128(%0), %%ymm4\n"
+		    "vmovdqa  160(%0), %%ymm5\n"
+		    "vmovdqa  192(%0), %%ymm6\n"
+		    "vmovdqa  224(%0), %%ymm7\n"
+		    "vmovntdq %%ymm0,     (%1)\n"
+		    "vmovntdq %%ymm1,   32(%1)\n"
+		    "vmovntdq %%ymm2,   64(%1)\n"
+		    "vmovntdq %%ymm3,   96(%1)\n"
+		    "vmovntdq %%ymm4,  128(%1)\n"
+		    "vmovntdq %%ymm5,  160(%1)\n"
+		    "vmovntdq %%ymm6,  192(%1)\n"
+		    "vmovntdq %%ymm7,  224(%1)\n"
+		    :: "r" (src), "r" (dst) : "memory");
+		src += 256;
+		dst += 256;
+		len -= 256;
+	}
+	while (len >= 32) {
+		asm("vmovdqa (%0), %%ymm0\n"
+		    "vmovntdq %%ymm0, (%1)\n"
+		    :: "r" (src), "r" (dst) : "memory");
+		src += 32;
+		dst += 32;
+		len -= 32;
+	}
+}
+
+/*
+ * SSE non-temporal write to WC destination, 64 bytes per iteration.
+ */
+static void gxl_memcpy_to_wc_sse(void *dst, const void *src, unsigned long len)
+{
+	while (len >= 64) {
+		asm("movdqa    (%0), %%xmm0\n"
+		    "movdqa  16(%0), %%xmm1\n"
+		    "movdqa  32(%0), %%xmm2\n"
+		    "movdqa  48(%0), %%xmm3\n"
+		    "movntdq %%xmm0,   (%1)\n"
+		    "movntdq %%xmm1, 16(%1)\n"
+		    "movntdq %%xmm2, 32(%1)\n"
+		    "movntdq %%xmm3, 48(%1)\n"
+		    :: "r" (src), "r" (dst) : "memory");
+		src += 64;
+		dst += 64;
+		len -= 64;
+	}
+}
+
+/* Streaming read from WC source to WB destination (promotion: VRAM->DRAM) */
+static void gxl_memcpy_from_wc(void *dst, const void __iomem *src,
+				unsigned long len)
+{
+	if (!static_branch_likely(&gxl_has_movntdqa) || !len)
+		goto fallback;
+
+	kernel_fpu_begin();
+	if (static_branch_likely(&gxl_has_avx2))
+		gxl_memcpy_ntdqa_avx2(dst, (const void __force *)src, len);
+	else
+		gxl_memcpy_ntdqa_sse(dst, (const void __force *)src, len);
+	kernel_fpu_end();
+	return;
+
+fallback:
+	memcpy_fromio(dst, src, len);
+}
+
+/*
+ * Write to WC destination (demotion: DRAM->VRAM).
+ *
+ * Uses non-temporal stores (MOVNTDQ/VMOVNTDQ) which bypass the CPU
+ * cache and write directly through the WC buffers.  sfence at the
+ * end ensures stores are globally visible.
+ */
+static void gxl_memcpy_to_wc(void __iomem *dst, const void *src,
+			      unsigned long len)
+{
+	if (!static_branch_likely(&gxl_has_movntdqa) || !len)
+		goto fallback;
+
+	kernel_fpu_begin();
+	if (static_branch_likely(&gxl_has_avx2))
+		gxl_memcpy_to_wc_avx2((void __force *)dst, src, len);
+	else
+		gxl_memcpy_to_wc_sse((void __force *)dst, src, len);
+	/* sfence to flush NT stores — replaces the per-page wmb() */
+	asm volatile("sfence" ::: "memory");
+	kernel_fpu_end();
+	return;
+
+fallback:
+	memcpy_toio(dst, src, len);
+	wmb();
+}
+
+static void __init gxl_init_movntdqa(void)
+{
+	/*
+	 * Some hypervisors (e.g. KVM) don't support VEX-prefix instructions
+	 * emulation.  Don't enable movntdqa in hypervisor guests.
+	 */
+	if (!static_cpu_has(X86_FEATURE_XMM4_1) ||
+	    boot_cpu_has(X86_FEATURE_HYPERVISOR))
+		return;
+
+	static_branch_enable(&gxl_has_movntdqa);
+
+	if (static_cpu_has(X86_FEATURE_AVX2))
+		static_branch_enable(&gxl_has_avx2);
+}
+
+#else /* !CONFIG_X86 */
+
+static void gxl_memcpy_from_wc(void *dst, const void __iomem *src,
+				unsigned long len)
+{
+	memcpy_fromio(dst, src, len);
+}
+
+static void gxl_memcpy_to_wc(void __iomem *dst, const void *src,
+			      unsigned long len)
+{
+	memcpy_toio(dst, src, len);
+	wmb();
+}
+
+static void __init gxl_init_movntdqa(void) { }
+#endif /* CONFIG_X86 */
+
+/*
+ * Fast page copy hook for migration (demotion/promotion).
+ *
+ * Returns true if one of the pages belongs to a gxl WC node and the
+ * copy was handled via the WC path.  Returns false to fall through to
+ * the default copy_mc_highpage().
+ */
+bool gxl_copy_highpage(struct page *dst, struct page *src)
+{
+	int snid, dnid;
+	struct gxl_dev *gdev;
+	void *vaddr;
+
+	if (!static_branch_unlikely(&gxl_has_wc_nodes))
+		return false;
+
+	snid = page_to_nid(src);
+	dnid = page_to_nid(dst);
+
+	if (gxl_wc_node[snid]) {
+		/* Promotion: VRAM->DRAM — streaming read from WC mapping */
+		gdev = gxl_node_to_dev(snid);
+		if (!gdev || !gdev->wc_base)
+			return false;
+
+		vaddr = kmap_local_page(dst);
+		gxl_memcpy_from_wc(vaddr,
+				    gdev->wc_base + (page_to_phys(src) - gdev->bar_start),
+				    PAGE_SIZE);
+		kunmap_local(vaddr);
+		atomic_long_inc(&gdev->nr_promotions);
+		return true;
+	}
+
+	if (gxl_wc_node[dnid]) {
+		/* Demotion: DRAM->VRAM — write to WC mapping */
+		gdev = gxl_node_to_dev(dnid);
+		if (!gdev || !gdev->wc_base)
+			return false;
+
+		vaddr = kmap_local_page(src);
+		gxl_memcpy_to_wc(gdev->wc_base + (page_to_phys(dst) - gdev->bar_start),
+				  vaddr, PAGE_SIZE);
+		kunmap_local(vaddr);
+		atomic_long_inc(&gdev->nr_demotions);
+		return true;
+	}
+
+	return false;
+}
+
+/*
+ * Folio-level batch copy for migration (demotion/promotion).
+ *
+ * No explicit sfence/wmb: the migration framework guarantees that
+ * remove_migration_ptes() takes spin_lock(ptl) before installing the
+ * new PTE.  That LOCK-prefixed instruction serialises all prior WC
+ * stores (Intel SDM Vol 3 §8.2.5), so the page data is globally
+ * visible before any CPU can access the new mapping.
+ *
+ * Batches kernel_fpu_begin/end across all sub-pages in a folio,
+ * yielding every 32 pages (~128 KB) to bound scheduling latency.
+ *
+ * Returns 0 if the copy was handled, -1 to fall through to the
+ * default copy_mc_highpage() path.
+ */
+int gxl_copy_folio(struct folio *dst, struct folio *src)
+{
+	int snid, dnid;
+	struct gxl_dev *gdev;
+	long nr, i;
+	bool is_demotion;
+
+	if (!static_branch_unlikely(&gxl_has_wc_nodes))
+		return -1;
+
+	/* Bulk copy already handled this folio — skip inline copy */
+	if (__this_cpu_read(gxl_bulk_copy_owner) == current)
+		return 0;
+
+	snid = folio_nid(src);
+	dnid = folio_nid(dst);
+
+	if (gxl_wc_node[snid]) {
+		gdev = gxl_node_to_dev(snid);
+		is_demotion = false;
+	} else if (gxl_wc_node[dnid]) {
+		gdev = gxl_node_to_dev(dnid);
+		is_demotion = true;
+	} else {
+		return -1;
+	}
+
+	if (!gdev || !gdev->wc_base)
+		return -1;
+
+	nr = folio_nr_pages(src);
+
+#ifdef CONFIG_X86
+	if (static_branch_likely(&gxl_has_movntdqa)) {
+		kernel_fpu_begin();
+
+		for (i = 0; i < nr; i++) {
+			struct page *sp = folio_page(src, i);
+			struct page *dp = folio_page(dst, i);
+			void *vaddr;
+			void __iomem *wc_addr;
+
+			if (is_demotion) {
+				wc_addr = gdev->wc_base +
+					(page_to_phys(dp) - gdev->bar_start);
+				vaddr = kmap_local_page(sp);
+				if (static_branch_likely(&gxl_has_avx2))
+					gxl_memcpy_to_wc_avx2(
+						(void __force *)wc_addr,
+						vaddr, PAGE_SIZE);
+				else
+					gxl_memcpy_to_wc_sse(
+						(void __force *)wc_addr,
+						vaddr, PAGE_SIZE);
+				kunmap_local(vaddr);
+			} else {
+				wc_addr = gdev->wc_base +
+					(page_to_phys(sp) - gdev->bar_start);
+				vaddr = kmap_local_page(dp);
+				if (static_branch_likely(&gxl_has_avx2))
+					gxl_memcpy_ntdqa_avx2(
+						vaddr,
+						(const void __force *)wc_addr,
+						PAGE_SIZE);
+				else
+					gxl_memcpy_ntdqa_sse(
+						vaddr,
+						(const void __force *)wc_addr,
+						PAGE_SIZE);
+				kunmap_local(vaddr);
+			}
+
+			/* Yield FPU every 32 pages to bound latency */
+			if ((i & 31) == 31 && i + 1 < nr) {
+				kernel_fpu_end();
+				cond_resched();
+				kernel_fpu_begin();
+			}
+		}
+
+		kernel_fpu_end();
+		goto done;
+	}
+#endif
+	/* Non-x86 or no MOVNTDQA: per-page fallback */
+	for (i = 0; i < nr; i++) {
+		struct page *sp = folio_page(src, i);
+		struct page *dp = folio_page(dst, i);
+		void *vaddr;
+
+		if (is_demotion) {
+			vaddr = kmap_local_page(sp);
+			memcpy_toio(gdev->wc_base +
+				    (page_to_phys(dp) - gdev->bar_start),
+				    vaddr, PAGE_SIZE);
+			kunmap_local(vaddr);
+		} else {
+			vaddr = kmap_local_page(dp);
+			memcpy_fromio(vaddr,
+				      gdev->wc_base +
+				      (page_to_phys(sp) - gdev->bar_start),
+				      PAGE_SIZE);
+			kunmap_local(vaddr);
+		}
+		if (i + 1 < nr)
+			cond_resched();
+	}
+
+done:
+	if (is_demotion)
+		atomic_long_add(nr, &gdev->nr_demotions);
+	else
+		atomic_long_add(nr, &gdev->nr_promotions);
+	return 0;
+}
+
+/*
+ * Parallel bulk page copy via work queue.
+ *
+ * The single-core bottleneck for VRAM reads is PCIe round-trip latency ×
+ * Line Fill Buffers (~800 MB/s).  Each additional core adds its own LFBs,
+ * scaling linearly to ~6 GB/s at 12 cores on PCIe 4.0 x16.
+ *
+ * gxl_bulk_copy_folios() pre-copies all page data in parallel before
+ * the normal migration loop runs.  A per-CPU flag tells gxl_copy_folio()
+ * to skip the redundant inline copy for pages already handled here.
+ */
+
+#define GXL_PARALLEL_MIN_PAGES	64	/* overhead threshold */
+#define GXL_PAGES_PER_WORKER	512	/* pages per work item */
+
+static struct workqueue_struct *gxl_copy_wq;
+
+struct gxl_copy_item {
+	struct page	*src;
+	struct page	*dst;
+};
+
+struct gxl_copy_work {
+	struct work_struct	work;
+	struct gxl_dev		*gdev;
+	bool			is_demotion;
+	struct gxl_copy_item	*items;
+	int			nr_items;
+	atomic_t		*remaining;
+	struct completion	*done;
+};
+
+static void gxl_copy_worker(struct work_struct *work)
+{
+	struct gxl_copy_work *cw = container_of(work, struct gxl_copy_work, work);
+	struct gxl_dev *gdev = cw->gdev;
+	int i;
+
+#ifdef CONFIG_X86
+	if (static_branch_likely(&gxl_has_movntdqa)) {
+		kernel_fpu_begin();
+
+		for (i = 0; i < cw->nr_items; i++) {
+			struct page *sp = cw->items[i].src;
+			struct page *dp = cw->items[i].dst;
+			void *vaddr;
+			void __iomem *wc_addr;
+
+			if (cw->is_demotion) {
+				wc_addr = gdev->wc_base +
+					(page_to_phys(dp) - gdev->bar_start);
+				vaddr = kmap_local_page(sp);
+				if (static_branch_likely(&gxl_has_avx2))
+					gxl_memcpy_to_wc_avx2(
+						(void __force *)wc_addr,
+						vaddr, PAGE_SIZE);
+				else
+					gxl_memcpy_to_wc_sse(
+						(void __force *)wc_addr,
+						vaddr, PAGE_SIZE);
+				kunmap_local(vaddr);
+			} else {
+				wc_addr = gdev->wc_base +
+					(page_to_phys(sp) - gdev->bar_start);
+				vaddr = kmap_local_page(dp);
+				if (static_branch_likely(&gxl_has_avx2))
+					gxl_memcpy_ntdqa_avx2(
+						vaddr,
+						(const void __force *)wc_addr,
+						PAGE_SIZE);
+				else
+					gxl_memcpy_ntdqa_sse(
+						vaddr,
+						(const void __force *)wc_addr,
+						PAGE_SIZE);
+				kunmap_local(vaddr);
+			}
+
+			if ((i & 31) == 31) {
+				kernel_fpu_end();
+				cond_resched();
+				kernel_fpu_begin();
+			}
+		}
+
+		kernel_fpu_end();
+		goto out;
+	}
+#endif
+	for (i = 0; i < cw->nr_items; i++) {
+		void *vaddr;
+
+		if (cw->is_demotion) {
+			vaddr = kmap_local_page(cw->items[i].src);
+			memcpy_toio(gdev->wc_base +
+				    (page_to_phys(cw->items[i].dst) -
+				     gdev->bar_start),
+				    vaddr, PAGE_SIZE);
+			kunmap_local(vaddr);
+		} else {
+			vaddr = kmap_local_page(cw->items[i].dst);
+			memcpy_fromio(vaddr,
+				      gdev->wc_base +
+				      (page_to_phys(cw->items[i].src) -
+				       gdev->bar_start),
+				      PAGE_SIZE);
+			kunmap_local(vaddr);
+		}
+	}
+
+out:
+	if (atomic_dec_and_test(cw->remaining))
+		complete(cw->done);
+}
+
+/**
+ * gxl_bulk_copy_folios - pre-copy folio data in parallel before migration
+ * @src_folios: list of source folios (already unmapped)
+ * @dst_folios: corresponding list of destination folios
+ *
+ * Called from migrate_folios_move() before the sequential move loop.
+ * Distributes page copies across multiple CPUs via work queue, then
+ * sets a per-CPU flag so that gxl_copy_folio() skips the redundant
+ * inline copy when called later from the normal migration path.
+ */
+void gxl_bulk_copy_folios(struct list_head *src_folios,
+			  struct list_head *dst_folios)
+{
+	struct folio *sf, *df;
+	struct gxl_dev *gdev;
+	struct gxl_copy_item *items;
+	struct gxl_copy_work *workers;
+	bool is_demotion;
+	int total_pages, nr_workers, per_worker, i, idx;
+	int snid, dnid;
+	DECLARE_COMPLETION_ONSTACK(done);
+	atomic_t remaining;
+
+	if (!static_branch_unlikely(&gxl_has_wc_nodes))
+		return;
+	if (!gxl_copy_wq)
+		return;
+
+	/* Peek at first src/dst to determine direction and device */
+	sf = list_first_entry_or_null(src_folios, struct folio, lru);
+	df = list_first_entry_or_null(dst_folios, struct folio, lru);
+	if (!sf || !df)
+		return;
+
+	snid = folio_nid(sf);
+	dnid = folio_nid(df);
+
+	if (gxl_wc_node[snid]) {
+		gdev = gxl_node_to_dev(snid);
+		is_demotion = false;
+	} else if (gxl_wc_node[dnid]) {
+		gdev = gxl_node_to_dev(dnid);
+		is_demotion = true;
+	} else {
+		return;
+	}
+
+	if (!gdev || !gdev->wc_base)
+		return;
+
+	/* Count total pages across all folios */
+	total_pages = 0;
+	list_for_each_entry(sf, src_folios, lru)
+		total_pages += folio_nr_pages(sf);
+
+	if (total_pages < GXL_PARALLEL_MIN_PAGES)
+		return;
+
+	items = kvmalloc_array(total_pages, sizeof(*items), GFP_KERNEL);
+	if (!items)
+		return;
+
+	/* Collect (src, dst) page pairs from both lists in lockstep */
+	idx = 0;
+	df = list_first_entry(dst_folios, struct folio, lru);
+	list_for_each_entry(sf, src_folios, lru) {
+		int nr = folio_nr_pages(sf);
+
+		for (i = 0; i < nr; i++) {
+			items[idx].src = folio_page(sf, i);
+			items[idx].dst = folio_page(df, i);
+			idx++;
+		}
+		df = list_next_entry(df, lru);
+	}
+
+	/* Distribute across workers */
+	nr_workers = min_t(int,
+			   DIV_ROUND_UP(total_pages, GXL_PAGES_PER_WORKER),
+			   num_online_cpus());
+	if (nr_workers < 2)
+		nr_workers = 1;
+
+	workers = kcalloc(nr_workers, sizeof(*workers), GFP_KERNEL);
+	if (!workers) {
+		kvfree(items);
+		return;
+	}
+
+	atomic_set(&remaining, nr_workers);
+	per_worker = total_pages / nr_workers;
+
+	for (i = 0; i < nr_workers; i++) {
+		int off = i * per_worker;
+		int cnt = (i == nr_workers - 1) ?
+			  total_pages - off : per_worker;
+
+		workers[i].gdev = gdev;
+		workers[i].is_demotion = is_demotion;
+		workers[i].items = &items[off];
+		workers[i].nr_items = cnt;
+		workers[i].remaining = &remaining;
+		workers[i].done = &done;
+
+		INIT_WORK(&workers[i].work, gxl_copy_worker);
+		queue_work(gxl_copy_wq, &workers[i].work);
+	}
+
+	wait_for_completion(&done);
+
+	if (is_demotion)
+		atomic_long_add(total_pages, &gdev->nr_demotions);
+	else
+		atomic_long_add(total_pages, &gdev->nr_promotions);
+
+	kfree(workers);
+	kvfree(items);
+
+	/* Tell gxl_copy_folio to skip inline copies in the move loop */
+	__this_cpu_write(gxl_bulk_copy_owner, current);
+}
+
+void gxl_bulk_copy_done(void)
+{
+	__this_cpu_write(gxl_bulk_copy_owner, NULL);
+}
 
 /*
  * PCI bus notifier for deferred device initialization.
@@ -241,7 +906,8 @@ static int gxl_do_resize(struct gxl_dev *gdev, unsigned long new_size)
 		unsigned long grow = new_size - gdev->online_size;
 
 		rc = add_memory_driver_managed(gdev->mgid, grow_start, grow,
-					       gxl_res_name, MHP_NID_IS_MGID);
+					       gxl_res_name,
+					       MHP_NID_IS_MGID | MHP_WC);
 		if (rc == -EEXIST) {
 			/*
 			 * GPU driver's PCI BAR claim blocks the memory
@@ -253,7 +919,7 @@ static int gxl_do_resize(struct gxl_dev *gdev, unsigned long new_size)
 			pci_release_region(gdev->pdev, gdev->bar_idx);
 			rc = add_memory_driver_managed(gdev->mgid, grow_start,
 						       grow, gxl_res_name,
-						       MHP_NID_IS_MGID);
+						       MHP_NID_IS_MGID | MHP_WC);
 			if (rc) {
 				pr_warn("%s: grow failed after BAR release: %d, restoring\n",
 					gdev->slot, rc);
@@ -502,6 +1168,32 @@ static ssize_t pool_percent_store(struct kobject *kobj,
 static struct kobj_attribute gxl_pool_percent_attr =
 	__ATTR(pool_percent, 0644, pool_percent_show, pool_percent_store);
 
+static ssize_t nr_demotions_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+
+	if (!gdev)
+		return -ENODEV;
+	return sysfs_emit(buf, "%ld\n", atomic_long_read(&gdev->nr_demotions));
+}
+
+static struct kobj_attribute gxl_nr_demotions_attr =
+	__ATTR(nr_demotions, 0444, nr_demotions_show, NULL);
+
+static ssize_t nr_promotions_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	struct gxl_dev *gdev = gxl_kobj_to_dev(kobj);
+
+	if (!gdev)
+		return -ENODEV;
+	return sysfs_emit(buf, "%ld\n", atomic_long_read(&gdev->nr_promotions));
+}
+
+static struct kobj_attribute gxl_nr_promotions_attr =
+	__ATTR(nr_promotions, 0444, nr_promotions_show, NULL);
+
 static struct attribute *gxl_dev_attrs[] = {
 	&gxl_size_mb_attr.attr,
 	&gxl_max_size_mb_attr.attr,
@@ -512,6 +1204,8 @@ static struct attribute *gxl_dev_attrs[] = {
 	&gxl_fill_percent_attr.attr,
 	&gxl_adistance_attr.attr,
 	&gxl_pool_percent_attr.attr,
+	&gxl_nr_demotions_attr.attr,
+	&gxl_nr_promotions_attr.attr,
 	NULL,
 };
 
@@ -602,6 +1296,14 @@ static int gxl_init_one(struct gxl_dev *gdev, struct pci_dev *pdev)
 	gdev->bar_start = bar_start;
 	gdev->bar_size = bar_size;
 
+	/* WC mapping for fast MOVNTDQA reads and write-combining writes */
+	gdev->wc_base = ioremap_wc(bar_start, bar_size);
+	if (!gdev->wc_base) {
+		pr_warn("%s: ioremap_wc failed, WC copy acceleration unavailable\n",
+			gdev->slot);
+		/* Non-fatal: fall through to normal memcpy path */
+	}
+
 	blk_size = memory_block_size_bytes();
 	if (gdev->pool_percent > 100)
 		gdev->pool_percent = 100;
@@ -675,6 +1377,12 @@ static int gxl_init_one(struct gxl_dev *gdev, struct pci_dev *pdev)
 	gdev->pdev = pdev;
 	gdev->ready = true;
 
+	/* Register this node for WC-accelerated migration copies */
+	if (gdev->wc_base) {
+		gxl_wc_node[gdev->numa_node] = true;
+		static_branch_enable(&gxl_has_wc_nodes);
+	}
+
 	pr_info("%s: ready: %lu MB GPU VRAM on node %d (adist %u, local node %d)\n",
 		gdev->slot, gdev->max_size >> 20, gdev->numa_node,
 		gdev->adistance, gdev->local_node);
@@ -707,6 +1415,10 @@ err_put_mtype:
 	put_memory_type(gdev->mtype);
 	gdev->mtype = NULL;
 err_put_pdev:
+	if (gdev->wc_base) {
+		iounmap(gdev->wc_base);
+		gdev->wc_base = NULL;
+	}
 	pci_dev_put(pdev);
 	return rc;
 }
@@ -769,6 +1481,12 @@ static int __init gxl_init(void)
 
 	if (!gxl_nr_devs)
 		return 0;
+
+	gxl_init_movntdqa();
+
+	gxl_copy_wq = alloc_workqueue("gxl_copy", WQ_UNBOUND | WQ_HIGHPRI, 0);
+	if (!gxl_copy_wq)
+		pr_warn("failed to create copy workqueue, parallel copy disabled\n");
 
 	/* Parent sysfs directory */
 	gxl_kobj = kobject_create_and_add("gxl", mm_kobj);
