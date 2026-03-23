@@ -651,6 +651,12 @@ static __init int sched_init_debug(void)
 				   &minlat_numa_saturated_pct);
 		debugfs_create_u32("wake_affine", 0644, d_minlat,
 				   &minlat_wake_affine);
+		debugfs_create_u32("wakeup_preempt_thresh_ns", 0644, d_minlat,
+				   &minlat_wakeup_preempt_thresh_ns);
+		debugfs_create_u32("fork_imbalance_pct", 0644, d_minlat,
+				   &minlat_fork_imbalance_pct);
+		debugfs_create_u32("fork_numa_imbalance_pct", 0644, d_minlat,
+				   &minlat_fork_numa_imbalance_pct);
 	}
 #endif
 

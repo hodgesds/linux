@@ -935,6 +935,7 @@ struct minlat_rq {
 	struct sched_minlat_entity *curr;
 	struct sched_minlat_entity *next;	/* wakeup buddy (like CFS next) */
 	unsigned int		nr_running;
+	unsigned int		nr_delayed;	/* delayed entities on this rq */
 	u64			min_vruntime;
 	unsigned long		load_weight;
 	bool			overloaded;
@@ -2827,6 +2828,9 @@ extern unsigned int minlat_numa_imbalance_min;
 extern unsigned int minlat_migration_cooldown_ns;
 extern unsigned int minlat_numa_saturated_pct;
 extern unsigned int minlat_wake_affine;
+extern unsigned int minlat_fork_imbalance_pct;
+extern unsigned int minlat_fork_numa_imbalance_pct;
+extern unsigned int minlat_wakeup_preempt_thresh_ns;
 #else
 static inline bool sched_minlat_runnable(struct rq *rq)
 {

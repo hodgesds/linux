@@ -69,7 +69,7 @@ static u64 minlat_calc_delta_weighted(u64 delta_exec, unsigned long weight,
 
 /* ---- tuning knobs (debugfs-tunable) ---- */
 
-unsigned int minlat_latency_ns = 4 * NSEC_PER_MSEC;
+unsigned int minlat_latency_ns = 1500 * NSEC_PER_USEC;
 unsigned int minlat_min_granularity_ns = 500 * NSEC_PER_USEC;
 unsigned int minlat_cache_hot_ns = 500 * NSEC_PER_USEC;
 unsigned int minlat_numa_imbalance_min = 2;
@@ -84,6 +84,13 @@ unsigned int minlat_wake_affine = 1;
  */
 unsigned int minlat_fork_imbalance_pct = 25;
 unsigned int minlat_fork_numa_imbalance_pct = 50;
+/*
+ * Wakeup preemption threshold (ns). Non-sync wakeups only preempt
+ * if the vruntime advantage exceeds this value. Higher values
+ * reduce context switches but increase latency for new wakeups.
+ * 0 = preempt whenever wakee has lower vruntime (aggressive).
+ */
+unsigned int minlat_wakeup_preempt_thresh_ns = 1 * NSEC_PER_MSEC;
 
 #define MINLAT_LATENCY_NS		minlat_latency_ns
 #define MINLAT_MIN_GRANULARITY_NS	minlat_min_granularity_ns
@@ -481,7 +488,7 @@ static void check_preempt_tick_minlat(struct rq *rq, struct task_struct *curr)
 	struct sched_minlat_entity *next_me;
 	struct minlat_rq *minlat_rq = &rq->minlat;
 	struct rb_node *next_node;
-	u64 ideal_runtime;
+	u64 ideal_runtime, delta_exec;
 	s64 delta;
 
 	if (minlat_rq->nr_running <= 1)
@@ -490,13 +497,32 @@ static void check_preempt_tick_minlat(struct rq *rq, struct task_struct *curr)
 	ideal_runtime = minlat_sched_slice(minlat_rq, curr_me);
 
 	/*
-	 * Current entity is out of the tree — rb_first_cached always
-	 * returns the next competitor, no skip logic needed.
+	 * Minimum running time protection. Don't preempt until the
+	 * task has run for at least min_granularity. This prevents
+	 * thrashing from rapid preemption while keeping latency low.
 	 */
-	next_node = rb_first_cached(&minlat_rq->tasks_timeline);
+	delta_exec = curr->se.sum_exec_runtime -
+		     curr->se.prev_sum_exec_runtime;
+	if (delta_exec < MINLAT_MIN_GRANULARITY_NS)
+		return;
+
+	/*
+	 * Current entity is out of the tree — find the first
+	 * non-delayed competitor. Delayed entities have stale
+	 * vruntimes that would cause spurious preemption.
+	 */
+	for (next_node = rb_first_cached(&minlat_rq->tasks_timeline);
+	     next_node; next_node = rb_next(next_node)) {
+		struct task_struct *next_p;
+
+		next_me = rb_entry(next_node, struct sched_minlat_entity,
+				   run_node);
+		next_p = container_of(next_me, struct task_struct, minlat);
+		if (!next_p->se.sched_delayed)
+			break;
+	}
 	if (!next_node)
 		return;
-	next_me = rb_entry(next_node, struct sched_minlat_entity, run_node);
 
 	delta = (s64)(curr_me->vruntime - next_me->vruntime);
 	if (delta > (s64)ideal_runtime)
@@ -547,7 +573,14 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	minlat_rq->load_weight += scale_load_down(me->load.weight);
 	add_nr_running(rq, 1);
 
-	if (minlat_rq->nr_running >= 2 && !minlat_rq->overloaded) {
+	/*
+	 * Track overloaded based on effective runnable count
+	 * (excluding delayed sleepers). Delayed entities are sleeping
+	 * tasks kept in the tree for O(1) wakeup — they don't need
+	 * CPU time and shouldn't trigger migration pressure.
+	 */
+	if (minlat_rq->nr_running - minlat_rq->nr_delayed >= 2 &&
+	    !minlat_rq->overloaded) {
 		WRITE_ONCE(minlat_rq->overloaded, true);
 		atomic_inc(&minlat_nr_overloaded);
 	}
@@ -621,7 +654,7 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 
 	minlat_rq->nr_running--;
 
-	if (minlat_rq->nr_running < 2 &&
+	if (minlat_rq->nr_running - minlat_rq->nr_delayed < 2 &&
 	    minlat_rq->overloaded) {
 		WRITE_ONCE(minlat_rq->overloaded, false);
 		atomic_dec(&minlat_nr_overloaded);
@@ -745,15 +778,28 @@ wakeup_preempt_minlat(struct rq *rq, struct task_struct *p, int flags)
 	set_next_buddy_minlat(minlat_rq, &p->minlat);
 
 	/*
-	 * WF_SYNC: waker expects to sleep soon. The buddy is set above,
-	 * ensuring the wakee gets picked at the next scheduling decision.
+	 * WF_SYNC: waker expects to sleep soon.
 	 *
-	 * Skip update_curr — put_prev_task will freshen vruntime when
-	 * the waker actually blocks. This eliminates a redundant
-	 * rq_clock_task + vruntime update on the hot sync wakeup path.
+	 * For same-CPU: no resched needed — the waker blocks soon,
+	 * schedule() picks the buddy. Avoids extra switches in
+	 * pipe/hackbench where the waker blocks immediately.
+	 *
+	 * For remote-CPU: the wakee is on a different CPU. If the
+	 * wakee has significant vruntime advantage over that CPU's
+	 * current task, use resched_curr for prompt scheduling.
+	 * Small advantages don't justify the IPI cost (the tick
+	 * will handle it). This gives hackbench throughput (senders
+	 * complete all writes before being preempted) while keeping
+	 * schbench latency low (computing workers get preempted).
 	 */
 	if (flags & WF_SYNC) {
-		resched_curr_lazy(rq);
+		if (task_cpu(p) != smp_processor_id()) {
+			update_curr_minlat_vruntime(rq);
+			delta = (s64)(rq->curr->minlat.vruntime -
+				      p->minlat.vruntime);
+			if (delta > (s64)MINLAT_MIN_GRANULARITY_NS)
+				resched_curr(rq);
+		}
 		return;
 	}
 
@@ -765,11 +811,11 @@ wakeup_preempt_minlat(struct rq *rq, struct task_struct *p, int flags)
 	delta = (s64)(curr->minlat.vruntime - p->minlat.vruntime);
 
 	/*
-	 * Pick check: preempt if the wakee has a vruntime advantage.
-	 * No min_granularity guard here; that's enforced only at tick
-	 * time to prevent thrashing among competing running tasks.
+	 * Preempt if the wakee has a vruntime advantage exceeding
+	 * the threshold. This prevents excessive preemption when
+	 * many tasks wake up with slightly better vruntimes.
 	 */
-	if (delta > 0)
+	if (delta > (s64)minlat_wakeup_preempt_thresh_ns)
 		resched_curr_lazy(rq);
 }
 
@@ -818,10 +864,10 @@ pick_task_minlat(struct rq *rq, struct rq_flags *rf)
 	 *  - All entities are delayed (force-dequeue below)
 	 *  - wait_task_inactive/exit forces dequeue
 	 *
-	 * This avoids the O(k * log n) cost of force-dequeuing
-	 * each delayed entity (rb_erase + __block_task + accounting).
+	 * Skip scan entirely when all entities are known-delayed
+	 * (nr_delayed tracks in-tree delayed count).
 	 */
-	{
+	if (minlat_rq->nr_running > minlat_rq->nr_delayed) {
 		struct rb_node *node;
 
 		for (node = rb_first_cached(&minlat_rq->tasks_timeline);
@@ -1130,8 +1176,10 @@ static int minlat_wake_affine_cpu(struct task_struct *p, int prev_cpu,
 		 * Matches CFS wake_affine_weight() which subtracts the
 		 * waker's load from this_cpu for sync wakeups.
 		 */
-		this_nr = cpu_rq(this_cpu)->minlat.nr_running;
-		prev_nr = cpu_rq(prev_cpu)->minlat.nr_running;
+		this_nr = cpu_rq(this_cpu)->minlat.nr_running -
+			  cpu_rq(this_cpu)->minlat.nr_delayed;
+		prev_nr = cpu_rq(prev_cpu)->minlat.nr_running -
+			  cpu_rq(prev_cpu)->minlat.nr_delayed;
 		if (this_nr <= prev_nr + 1)
 			return this_cpu;
 	}
@@ -1690,25 +1738,27 @@ static void pull_minlat_task(struct rq *this_rq)
 static int
 balance_minlat(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 {
-	if (rq->minlat.nr_running > 0)
+	struct minlat_rq *minlat_rq = &rq->minlat;
+
+	/* Have actual runnable (non-delayed) tasks — no pull needed */
+	if (minlat_rq->nr_running > minlat_rq->nr_delayed)
 		return 1;
 
-	if (!sched_minlat_any_overloaded(rq))
-		return 0;
-
 	/*
-	 * This CPU has no minlat tasks. Try to pull from busy CPUs.
-	 *
-	 * Follow the RT pattern: unpin the rq lock so that
-	 * double_lock_balance can safely reorder locks, then repin.
-	 * This is safe because current is on_cpu (can't be picked
-	 * for load balance) and IRQs are disabled.
+	 * All tasks are delayed or none exist. Try to pull real
+	 * work before pick_task has to scan/force-dequeue.
 	 */
-	rq_unpin_lock(rq, rf);
-	pull_minlat_task(rq);
-	rq_repin_lock(rq, rf);
+	if (sched_minlat_any_overloaded(rq)) {
+		rq_unpin_lock(rq, rf);
+		pull_minlat_task(rq);
+		rq_repin_lock(rq, rf);
 
-	return rq->minlat.nr_running > 0;
+		if (minlat_rq->nr_running > minlat_rq->nr_delayed)
+			return 1;
+	}
+
+	/* Delayed entities still need pick_task to handle them */
+	return minlat_rq->nr_running > 0;
 }
 
 /* ==== tick / lifecycle ==== */

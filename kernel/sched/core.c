@@ -5970,45 +5970,27 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 				}
 			}
 
-			left = rb_first_cached(&rq->minlat.tasks_timeline);
-			if (likely(left)) {
-				me = rb_entry(left, struct sched_minlat_entity,
-					      run_node);
-				p = container_of(me, struct task_struct, minlat);
-
-				if (unlikely(p->se.sched_delayed)) {
-					/*
-					 * Delayed entity at leftmost —
-					 * force-dequeue inline and retry.
-					 * Avoids the expensive restart path
-					 * (prev_balance + class iteration).
-					 *
-					 * PSI/uclamp already handled when
-					 * the task first slept — safe to
-					 * call the class method directly.
-					 */
-					dequeue_task_minlat(rq, p,
-						DEQUEUE_SLEEP | DEQUEUE_DELAYED);
-
-					left = rb_first_cached(
+			/*
+			 * Tree scan: find the first non-delayed entity.
+			 * Skip scan entirely when all entities are delayed
+			 * (nr_delayed == nr_running) — go to restart which
+			 * calls balance_minlat to pull real work.
+			 */
+			if (rq->minlat.nr_running >
+			    rq->minlat.nr_delayed) {
+				for (left = rb_first_cached(
 						&rq->minlat.tasks_timeline);
-					if (left) {
-						me = rb_entry(left,
-						    struct sched_minlat_entity,
-						    run_node);
-						p = container_of(me,
-						    struct task_struct, minlat);
-						if (likely(!p->se.sched_delayed)) {
-							put_prev_set_next_task(
-								rq, prev, p);
-							return p;
-						}
+				     left; left = rb_next(left)) {
+					me = rb_entry(left,
+						struct sched_minlat_entity,
+						run_node);
+					p = container_of(me,
+						struct task_struct, minlat);
+					if (likely(!p->se.sched_delayed)) {
+						put_prev_set_next_task(
+							rq, prev, p);
+						return p;
 					}
-
-					/* Fall to curr check below */
-				} else {
-					put_prev_set_next_task(rq, prev, p);
-					return p;
 				}
 			}
 
