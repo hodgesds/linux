@@ -973,7 +973,7 @@ static int gxl_do_resize(struct gxl_dev *gdev, unsigned long new_size)
 
 		rc = add_memory_driver_managed(gdev->mgid, grow_start, grow,
 					       gxl_res_name,
-					       MHP_NID_IS_MGID | MHP_WC);
+					       MHP_NID_IS_MGID | MHP_MERGE_RESOURCE | MHP_WC);
 		if (rc == -EEXIST && gdev->state == GXL_STATE_READY) {
 			/*
 			 * GPU driver's PCI BAR claim blocks the memory
@@ -986,7 +986,7 @@ static int gxl_do_resize(struct gxl_dev *gdev, unsigned long new_size)
 			gdev->state = GXL_STATE_BAR_FREE;
 			rc = add_memory_driver_managed(gdev->mgid, grow_start,
 						       grow, gxl_res_name,
-						       MHP_NID_IS_MGID | MHP_WC);
+						       MHP_NID_IS_MGID | MHP_MERGE_RESOURCE | MHP_WC);
 		}
 		if (rc) {
 			pr_warn("%s: grow failed: %d\n", gdev->slot, rc);
