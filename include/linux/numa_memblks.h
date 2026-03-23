@@ -31,6 +31,8 @@ int __init numa_memblks_init(int (*init_func)(void),
 			     bool memblock_force_top_down);
 
 extern int numa_distance_cnt;
+extern int numa_extra_reserve_count;
+int numa_set_distance_runtime(int from, int to, int distance);
 
 #ifdef CONFIG_NUMA_EMU
 extern int emu_nid_to_phys[MAX_NUMNODES];
