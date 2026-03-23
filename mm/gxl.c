@@ -866,11 +866,8 @@ static int gxl_find_vram_bar(struct pci_dev *pdev, resource_size_t *bar_start,
  */
 static int gxl_online_movable_cb(struct memory_block *mem, void *arg)
 {
-	if (mem->state == MEM_ONLINE) {
-		pr_warn_once("blocks auto-onlined before ZONE_MOVABLE set; "
-			     "add memhp_default_state=online_movable to cmdline\n");
-		return 0;
-	}
+	if (mem->state == MEM_ONLINE)
+		return 0;	/* already onlined correctly by auto-online */
 
 	if (mem->state != MEM_OFFLINE)
 		return 0;
@@ -970,6 +967,17 @@ static int gxl_do_resize(struct gxl_dev *gdev, unsigned long new_size)
 	} else {
 		unsigned long grow_start = gdev->phys_start + gdev->online_size;
 		unsigned long grow = new_size - gdev->online_size;
+		int saved_online_type;
+
+		/*
+		 * Force auto-onlined blocks into ZONE_MOVABLE so pages
+		 * can be migrated back to DRAM on shrink.  Restore the
+		 * original default after add_memory_driver_managed()
+		 * returns -- the window is serialised by
+		 * device_hotplug_lock inside the call.
+		 */
+		saved_online_type = mhp_get_default_online_type();
+		mhp_set_default_online_type(MMOP_ONLINE_MOVABLE);
 
 		rc = add_memory_driver_managed(gdev->mgid, grow_start, grow,
 					       gxl_res_name,
@@ -988,11 +996,18 @@ static int gxl_do_resize(struct gxl_dev *gdev, unsigned long new_size)
 						       grow, gxl_res_name,
 						       MHP_NID_IS_MGID | MHP_MERGE_RESOURCE | MHP_WC);
 		}
+
+		mhp_set_default_online_type(saved_online_type);
+
 		if (rc) {
 			pr_warn("%s: grow failed: %d\n", gdev->slot, rc);
 			goto out;
 		}
 
+		/*
+		 * Online any blocks that were not auto-onlined (e.g.
+		 * when the system default is memhp_default_state=offline).
+		 */
 		lock_device_hotplug();
 		walk_memory_blocks(grow_start, grow, NULL,
 				   gxl_online_movable_cb);
