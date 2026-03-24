@@ -16,6 +16,7 @@
  */
 
 #include "sched.h"
+#include <linux/sched/cputime.h>
 #include <linux/sched/signal.h>
 
 DEFINE_STATIC_KEY_TRUE(sched_minlat_enabled);
@@ -97,6 +98,114 @@ unsigned int minlat_wakeup_preempt_thresh_ns = 1 * NSEC_PER_MSEC;
 
 #define MINLAT_LATENCY_NS		minlat_latency_ns
 #define MINLAT_MIN_GRANULARITY_NS	minlat_min_granularity_ns
+
+/* ---- capacity helpers (big.LITTLE support) ---- */
+
+/*
+ * fits_capacity - check if utilization fits within capacity with margin.
+ * Uses ~20% margin (same as CFS) to avoid premature misfit detection.
+ */
+#define minlat_fits_capacity(util, cap) ((util) * 1280 < (cap) * 1024)
+
+static inline unsigned long minlat_capacity_of(int cpu)
+{
+	return cpu_rq(cpu)->cpu_capacity;
+}
+
+/*
+ * Utilization EWMA decay factor. Higher = more stable, slower to react.
+ * 4 gives a half-life of ~2.4 ticks, fast enough to detect compute-bound
+ * tasks within a few scheduling periods.
+ */
+#define MINLAT_UTIL_DECAY	4
+
+/*
+ * Update the task's utilization estimate. Called from put_prev_task
+ * (on every context switch out) and task_tick (periodically for curr).
+ *
+ * Uses a simple duty-cycle estimate: if the task ran for delta_exec
+ * out of a period, its instantaneous utilization is:
+ *   instant_util = delta_exec * SCHED_CAPACITY_SCALE / period
+ *
+ * For the running task at tick time, we use the tick interval as the
+ * period (TICK_NSEC). For tasks switching out, we use the run duration
+ * as a fraction of (run + last_sleep). This is smoothed with an EWMA.
+ */
+static void minlat_update_util(struct task_struct *p)
+{
+	struct sched_minlat_entity *me = &p->minlat;
+	unsigned long instant_util;
+	u64 run_ns = me->total_run_ns;
+	u64 sleep_ns = me->total_sleep_ns;
+	u64 total;
+
+	/*
+	 * Compute duty cycle from EWMA run/sleep durations.
+	 * These are already maintained by minlat_record_sleep()
+	 * and minlat_update_interactivity().
+	 */
+	total = run_ns + sleep_ns;
+	if (total > 0)
+		instant_util = div64_ul(run_ns * SCHED_CAPACITY_SCALE, total);
+	else
+		instant_util = SCHED_CAPACITY_SCALE; /* assume busy if no data */
+
+	me->util_avg = (me->util_avg * (MINLAT_UTIL_DECAY - 1) +
+			instant_util) / MINLAT_UTIL_DECAY;
+}
+
+/*
+ * Check if a task fits on a given CPU based on utilization vs capacity.
+ * Returns true if the task's utilization can be served by this CPU.
+ */
+static inline bool minlat_task_fits_cpu(struct task_struct *p, int cpu)
+{
+	if (!sched_asym_cpucap_active())
+		return true;
+
+	return minlat_fits_capacity(p->minlat.util_avg,
+				    arch_scale_cpu_capacity(cpu));
+}
+
+/*
+ * Update misfit task status on the rq. Called from task_tick and
+ * set_next_task to detect tasks that need higher-capacity CPUs.
+ *
+ * Mirrors CFS update_misfit_status() logic:
+ * - No misfit if system has symmetric capacity
+ * - No misfit if task is pinned to one CPU
+ * - No misfit if task is already on biggest available CPU
+ * - No misfit if task's utilization fits the CPU's capacity
+ */
+static void minlat_update_misfit_status(struct task_struct *p, struct rq *rq)
+{
+	int cpu;
+
+	if (!sched_asym_cpucap_active())
+		return;
+
+	if (!p) {
+		rq->misfit_task_load = 0;
+		return;
+	}
+
+	cpu = cpu_of(rq);
+
+	if (p->nr_cpus_allowed == 1 ||
+	    arch_scale_cpu_capacity(cpu) == p->max_allowed_capacity ||
+	    minlat_task_fits_cpu(p, cpu)) {
+		rq->misfit_task_load = 0;
+		return;
+	}
+
+	/*
+	 * Task doesn't fit — set misfit load. Use the task's weight as
+	 * a proxy for load since minlat doesn't track PELT load_avg.
+	 * Ensure non-zero so check_misfit_status() returns true.
+	 */
+	rq->misfit_task_load = max_t(unsigned long,
+				     scale_load_down(p->minlat.load.weight), 1);
+}
 
 /*
  * Global count of overloaded CPUs (those with 2+ minlat tasks).
@@ -688,7 +797,15 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	if (flags & DEQUEUE_SLEEP) {
 		me->on_rq = 0;
 		minlat_record_sleep(p, rq);
+		minlat_update_util(p);
 	}
+
+	/*
+	 * Clear misfit status if no minlat tasks remain — the CPU
+	 * will go idle or pick from another class.
+	 */
+	if (minlat_rq->nr_running == 0)
+		rq->misfit_task_load = 0;
 
 	/* Only update min_vruntime if the leftmost node changed */
 	if (was_leftmost)
@@ -1019,6 +1136,9 @@ set_next_task_minlat(struct rq *rq, struct task_struct *p, bool first)
 
 	p->se.exec_start = rq_clock_task(rq);
 	p->se.prev_sum_exec_runtime = p->se.sum_exec_runtime;
+
+	/* Update misfit status for the newly scheduled task */
+	minlat_update_misfit_status(p, rq);
 }
 
 /* ==== SMT-aware interactivity tracking ==== */
@@ -1216,6 +1336,14 @@ static int minlat_wake_affine_cpu(struct task_struct *p, int prev_cpu,
 		return -1;
 
 	/*
+	 * Don't pull a task to a CPU where it doesn't fit.
+	 * A compute-bound task on a big core shouldn't be pulled
+	 * to a little core just because the waker is there.
+	 */
+	if (!minlat_task_fits_cpu(p, this_cpu))
+		return -1;
+
+	/*
 	 * Sync wakeup: the waker is going to sleep right after this.
 	 * Place the wakee on the waker's CPU if its effective load
 	 * (after waker blocks) is no worse than the wakee's prev_cpu.
@@ -1315,6 +1443,7 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 		unsigned int best_nr_remote = UINT_MAX;
 		int local_llc_load = 0, remote_llc_load = 0;
 		int local_llc_cpus = 0;
+		bool asym = sched_asym_cpucap_active();
 
 		/*
 		 * Fork balancing with pick-2 LLC selection:
@@ -1323,11 +1452,17 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 		 * 2. Pick a random LLC in same NUMA, compare load
 		 * 3. Use the less-loaded LLC
 		 * 4. If NUMA node is saturated, try cross-NUMA
+		 *
+		 * On asymmetric capacity systems, prefer the highest-
+		 * capacity idle CPU since forked tasks have no
+		 * utilization history to guide placement.
 		 */
 		rcu_read_lock();
 		sd = rcu_dereference(per_cpu(sd_llc, prev_cpu));
 		if (sd) {
 			const struct cpumask *llc_span = sched_domain_span(sd);
+			int idle_big_cpu = -1;
+			unsigned long idle_big_cap = 0;
 
 			for_each_cpu_wrap(cpu, llc_span, prev_cpu + 1) {
 				unsigned int nr;
@@ -1338,13 +1473,31 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 				nr = cpu_rq(cpu)->minlat.nr_running;
 				local_llc_load += nr;
 				if (nr == 0) {
-					rcu_read_unlock();
-					return cpu;
+					/*
+					 * On symmetric systems, return the
+					 * first idle CPU immediately.
+					 * On asymmetric, track the highest-
+					 * capacity idle CPU.
+					 */
+					if (!asym) {
+						rcu_read_unlock();
+						return cpu;
+					}
+					if (arch_scale_cpu_capacity(cpu) >
+					    idle_big_cap) {
+						idle_big_cap =
+						    arch_scale_cpu_capacity(cpu);
+						idle_big_cpu = cpu;
+					}
 				}
 				if (nr < best_nr_local) {
 					best_nr_local = nr;
 					best_cpu_local = cpu;
 				}
+			}
+			if (idle_big_cpu >= 0) {
+				rcu_read_unlock();
+				return idle_big_cpu;
 			}
 		}
 
@@ -1377,6 +1530,10 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 			if (!rand_sd)
 				continue;
 
+			{
+			int remote_idle_big = -1;
+			unsigned long remote_big_cap = 0;
+
 			for_each_cpu(cpu, sched_domain_span(rand_sd)) {
 				unsigned int nr;
 
@@ -1386,13 +1543,26 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 				nr = cpu_rq(cpu)->minlat.nr_running;
 				rload += nr;
 				if (nr == 0) {
-					rcu_read_unlock();
-					return cpu;
+					if (!asym) {
+						rcu_read_unlock();
+						return cpu;
+					}
+					if (arch_scale_cpu_capacity(cpu) >
+					    remote_big_cap) {
+						remote_big_cap =
+						    arch_scale_cpu_capacity(cpu);
+						remote_idle_big = cpu;
+					}
 				}
 				if (nr < best_nr_remote) {
 					best_nr_remote = nr;
 					best_cpu_remote = cpu;
 				}
+			}
+			if (remote_idle_big >= 0) {
+				rcu_read_unlock();
+				return remote_idle_big;
+			}
 			}
 			remote_llc_load = rcpus ? rload : INT_MAX;
 
@@ -1445,7 +1615,8 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 
 	/* 1. prev_cpu if idle — fast path, no scanning */
 	if (cpu_active(prev_cpu) && cpumask_test_cpu(prev_cpu, allowed) &&
-	    minlat_cpu_effectively_idle(prev_cpu))
+	    minlat_cpu_effectively_idle(prev_cpu) &&
+	    minlat_task_fits_cpu(p, prev_cpu))
 		return prev_cpu;
 
 	/*
@@ -1461,28 +1632,48 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 	    cpu_active(recent_used_cpu) &&
 	    cpumask_test_cpu(recent_used_cpu, allowed) &&
 	    cpus_share_cache(recent_used_cpu, prev_cpu) &&
-	    minlat_cpu_effectively_idle(recent_used_cpu))
+	    minlat_cpu_effectively_idle(recent_used_cpu) &&
+	    minlat_task_fits_cpu(p, recent_used_cpu))
 		return recent_used_cpu;
 
 	/*
 	 * 3-4. Single scan for idle CPU, starting from prev_cpu so
 	 * each task scans a different order and spreads evenly.
 	 * Prefer same-LLC idle CPUs (cheaper migration).
+	 *
+	 * On asymmetric capacity systems, skip CPUs where the task
+	 * doesn't fit (little cores for compute-bound tasks). Track
+	 * a fallback for the case where no fitting CPU is idle — a
+	 * little core is better than staying on an overloaded big.
 	 */
-	for_each_cpu_wrap(cpu, cpu_active_mask, prev_cpu) {
-		if (!cpumask_test_cpu(cpu, allowed))
-			continue;
-		if (!minlat_cpu_effectively_idle(cpu))
-			continue;
+	{
+		int fallback_cpu = -1;
 
-		if (cpus_share_cache(cpu, prev_cpu))
-			return cpu;
+		for_each_cpu_wrap(cpu, cpu_active_mask, prev_cpu) {
+			if (!cpumask_test_cpu(cpu, allowed))
+				continue;
+			if (!minlat_cpu_effectively_idle(cpu))
+				continue;
 
-		if (best_cpu < 0)
-			best_cpu = cpu;
+			if (!minlat_task_fits_cpu(p, cpu)) {
+				if (fallback_cpu < 0)
+					fallback_cpu = cpu;
+				continue;
+			}
+
+			if (cpus_share_cache(cpu, prev_cpu))
+				return cpu;
+
+			if (best_cpu < 0)
+				best_cpu = cpu;
+		}
+		if (best_cpu >= 0)
+			return best_cpu;
+
+		/* No fitting idle CPU — use a non-fitting idle one */
+		if (fallback_cpu >= 0)
+			return fallback_cpu;
 	}
-	if (best_cpu >= 0)
-		return best_cpu;
 
 	/*
 	 * 5. No idle CPU found.
@@ -1678,6 +1869,40 @@ minlat_find_busiest_rq(struct rq *this_rq, const struct cpumask *mask,
 }
 
 /*
+ * Find a CPU with a misfit task that we can help.
+ * Returns the rq of a lower-capacity CPU with a misfit task, or NULL.
+ * Only useful when this_cpu has higher capacity than the source.
+ */
+static struct rq *
+minlat_find_misfit_rq(struct rq *this_rq, const struct cpumask *mask)
+{
+	struct rq *best_rq = NULL;
+	unsigned long best_misfit = 0;
+	unsigned long this_cap = arch_scale_cpu_capacity(this_rq->cpu);
+	int cpu;
+
+	for_each_cpu(cpu, mask) {
+		struct rq *rq;
+
+		if (cpu == this_rq->cpu)
+			continue;
+
+		rq = cpu_rq(cpu);
+
+		/* Only pull from CPUs with lower capacity than ours */
+		if (arch_scale_cpu_capacity(cpu) >= this_cap)
+			continue;
+
+		if (rq->misfit_task_load > best_misfit) {
+			best_misfit = rq->misfit_task_load;
+			best_rq = rq;
+		}
+	}
+
+	return best_rq;
+}
+
+/*
  * Try to pull a task from @src_rq with double-lock.
  * Returns true if a task was successfully migrated.
  */
@@ -1758,6 +1983,29 @@ static void pull_minlat_task(struct rq *this_rq)
 	struct rq *src_rq;
 
 	rcu_read_lock();
+
+	/*
+	 * Misfit pull: on asymmetric capacity systems, prioritize
+	 * pulling misfit tasks from lower-capacity CPUs. This runs
+	 * before the normal overloaded pull so that big cores rescue
+	 * compute-bound tasks stuck on little cores even when those
+	 * little cores only have a single task (not overloaded).
+	 */
+	if (sched_asym_cpucap_active()) {
+		sd = rcu_dereference(per_cpu(sd_asym_cpucapacity, this_cpu));
+		if (sd) {
+			src_rq = minlat_find_misfit_rq(this_rq,
+						sched_domain_span(sd));
+			if (src_rq) {
+				bool cross = sd->flags & SD_NUMA;
+
+				if (minlat_try_pull(this_rq, src_rq, cross)) {
+					rcu_read_unlock();
+					return;
+				}
+			}
+		}
+	}
 
 	for_each_domain(this_cpu, sd) {
 		const struct cpumask *span = sched_domain_span(sd);
@@ -1841,6 +2089,10 @@ static void task_tick_minlat(struct rq *rq, struct task_struct *p, int queued)
 
 	/* Deferred interactivity update — keep enqueue path fast */
 	minlat_update_interactivity(p, rq, ENQUEUE_WAKEUP);
+
+	/* Update utilization estimate and misfit status */
+	minlat_update_util(p);
+	minlat_update_misfit_status(p, rq);
 }
 
 static void task_dead_minlat(struct task_struct *p)

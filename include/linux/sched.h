@@ -779,6 +779,9 @@ struct sched_minlat_entity {
 	u64				total_sleep_ns;
 	u64				total_run_ns;
 	unsigned int			interactive : 1; /* short-burst task */
+
+	/* Capacity-aware scheduling (big.LITTLE) */
+	unsigned long			util_avg;	/* EWMA utilization 0-1024 */
 };
 #endif
 
