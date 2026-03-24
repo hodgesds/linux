@@ -832,16 +832,27 @@ wakeup_preempt_minlat(struct rq *rq, struct task_struct *p, int flags)
 	delta = (s64)(curr->minlat.vruntime - p->minlat.vruntime);
 
 	/*
-	 * Preempt if the wakee has a vruntime advantage exceeding
-	 * the threshold. This prevents excessive preemption when
-	 * many tasks wake up with slightly better vruntimes.
+	 * Preempt if the wakee has a vruntime advantage.
 	 *
-	 * Use resched_curr_lazy to avoid IPI storms in IPC-heavy
-	 * workloads like hackbench where many tasks wake on remote
-	 * CPUs simultaneously.
+	 * Very light load (at most 2 effective runnable tasks):
+	 * preempt immediately for best latency. No IPI storm risk
+	 * with so few tasks. This helps schbench where futex-woken
+	 * tasks (non-sync) need prompt scheduling on lightly-loaded
+	 * CPUs.
+	 *
+	 * Heavier load: require a significant vruntime advantage
+	 * (threshold) and use resched_curr_lazy to avoid IPI
+	 * storms in IPC-heavy workloads like hackbench.
 	 */
-	if (delta > (s64)minlat_wakeup_preempt_thresh_ns)
-		resched_curr_lazy(rq);
+	if (delta > 0) {
+		unsigned int eff = minlat_rq->nr_running -
+				   minlat_rq->nr_delayed;
+
+		if (eff <= 2)
+			resched_curr(rq);
+		else if (delta > (s64)minlat_wakeup_preempt_thresh_ns)
+			resched_curr_lazy(rq);
+	}
 }
 
 /*
