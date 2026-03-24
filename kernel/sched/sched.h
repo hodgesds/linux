@@ -2751,6 +2751,13 @@ extern const struct sched_class minlat_sched_class;
 extern void init_minlat_rq(struct minlat_rq *minlat_rq);
 extern void init_sched_minlat_class(void);
 extern bool dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags);
+DECLARE_STATIC_KEY_TRUE(sched_minlat_enabled);
+static inline bool minlat_enabled(void)
+{
+	return static_branch_likely(&sched_minlat_enabled);
+}
+#else
+static inline bool minlat_enabled(void) { return false; }
 #endif
 
 /*

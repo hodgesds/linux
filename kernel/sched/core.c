@@ -4691,14 +4691,12 @@ int sched_fork(u64 clone_flags, struct task_struct *p)
 		p->sched_class = &ext_sched_class;
 #endif
 #ifdef CONFIG_SCHED_CLASS_MINLAT
-	} else {
+	} else if (minlat_enabled()) {
 		p->sched_class = &minlat_sched_class;
-	}
-#else
+#endif
 	} else {
 		p->sched_class = &fair_sched_class;
 	}
-#endif
 
 	init_entity_runnable_average(&p->se);
 
@@ -7383,11 +7381,11 @@ const struct sched_class *__setscheduler_class(int policy, int prio)
 #endif
 
 #ifdef CONFIG_SCHED_CLASS_MINLAT
-	/* minlat takes over all fair tasks when enabled */
-	return &minlat_sched_class;
-#else
-	return &fair_sched_class;
+	/* minlat takes over all fair tasks when enabled at runtime */
+	if (minlat_enabled())
+		return &minlat_sched_class;
 #endif
+	return &fair_sched_class;
 }
 
 #ifdef CONFIG_RT_MUTEXES

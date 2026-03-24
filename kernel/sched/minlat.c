@@ -16,6 +16,9 @@
  */
 
 #include "sched.h"
+#include <linux/sched/signal.h>
+
+DEFINE_STATIC_KEY_TRUE(sched_minlat_enabled);
 
 /* ---- weight math (private copy, fair.c's is static) ---- */
 
@@ -1894,6 +1897,235 @@ static void prio_changed_minlat(struct rq *rq, struct task_struct *p,
 		wakeup_preempt_minlat(rq, p, 0);
 }
 
+/*
+ * switching_from_minlat - called while task is still on the old class
+ * but about to switch away.  Clear the delayed flag so the entity is
+ * treated as a normal queued task by sched_change_begin()'s dequeue.
+ *
+ * We must NOT call dequeue_task() here because that triggers
+ * __block_task() which publishes p->on_rq = 0, allowing ttwu to
+ * migrate the task while sched_change_begin/end still reference it.
+ * Phase 1 of minlat_switch_all() only holds rq_lock (not pi_lock),
+ * so ttwu can proceed unblocked.  Instead, just clear the flag and
+ * let sched_change_begin()'s own dequeue (DEQUEUE_SAVE, no
+ * DEQUEUE_SLEEP) handle the rb-tree removal without __block_task.
+ */
+static void switching_from_minlat(struct rq *rq, struct task_struct *p)
+{
+	if (p->se.sched_delayed) {
+		p->se.sched_delayed = 0;
+		rq->minlat.nr_delayed--;
+	}
+}
+
+/*
+ * switched_from_minlat - called after the class pointer has changed.
+ * Clean up minlat-specific state (buddy, curr, on_rq).
+ *
+ * Clearing on_rq ensures that if the task is later switched back to
+ * minlat, enqueue_task_minlat will properly reinitialize weight and
+ * vruntime placement instead of using stale values.
+ */
+static void switched_from_minlat(struct rq *rq, struct task_struct *p)
+{
+	struct minlat_rq *minlat_rq = &rq->minlat;
+
+	if (minlat_rq->next == &p->minlat)
+		minlat_rq->next = NULL;
+	if (minlat_rq->curr == &p->minlat)
+		minlat_rq->curr = NULL;
+	p->minlat.on_rq = 0;
+}
+
+/* ==== runtime toggle ==== */
+
+/*
+ * Migrate all eligible tasks between minlat and fair in two phases:
+ *
+ * Phase 1: Per-CPU batch migration of queued/running tasks.
+ *   Lock each CPU's rq once and drain all tasks of the source class.
+ *   This is O(nr_cpus * tasks_per_cpu) with one lock per CPU.
+ *
+ * Phase 2: Sweep sleeping tasks.
+ *   Sleeping tasks aren't on any runqueue so just swap the class pointer.
+ *   The enqueue path on wakeup handles weight/load initialization.
+ */
+static void minlat_switch_all(bool to_minlat)
+{
+	int cpu;
+	struct task_struct *g, *p;
+
+	/* Phase 1: drain runqueues per-CPU */
+	for_each_online_cpu(cpu) {
+		struct rq *rq = cpu_rq(cpu);
+		struct rq_flags rf;
+
+		rq_lock_irqsave(rq, &rf);
+		update_rq_clock(rq);
+
+		if (!to_minlat) {
+			/* minlat→CFS: drain minlat runqueue */
+			while (rq->minlat.nr_running > 0) {
+				struct sched_minlat_entity *me;
+				struct sched_change_ctx *ctx;
+
+				if (rq->minlat.curr)
+					me = rq->minlat.curr;
+				else {
+					struct rb_node *nd;
+
+					nd = rb_first_cached(
+						&rq->minlat.tasks_timeline);
+					if (!nd)
+						break;
+					me = rb_entry(nd,
+						struct sched_minlat_entity,
+						run_node);
+				}
+				p = container_of(me, struct task_struct,
+						 minlat);
+
+				ctx = sched_change_begin(p,
+					DEQUEUE_SAVE | DEQUEUE_NOCLOCK |
+					DEQUEUE_CLASS | ENQUEUE_CLASS);
+				p->sched_class = &fair_sched_class;
+				sched_change_end(ctx);
+			}
+		} else {
+			/* CFS→minlat: drain CFS tasks on this rq */
+			struct sched_entity *se, *se_tmp;
+
+			list_for_each_entry_safe(se, se_tmp,
+					&rq->cfs_tasks, group_node) {
+				struct sched_change_ctx *ctx;
+
+				p = container_of(se, struct task_struct, se);
+
+				if (p->sched_class != &fair_sched_class)
+					break;
+
+				/*
+				 * Skip delayed entities — switching_from_fair()
+				 * calls dequeue_task(DEQUEUE_DELAYED) which
+				 * triggers __block_task().  Phase 1 only holds
+				 * rq_lock (not pi_lock), so ttwu could migrate
+				 * the task out from under us.  Phase 2 handles
+				 * these safely with task_rq_lock.
+				 */
+				if (p->se.sched_delayed)
+					continue;
+
+				ctx = sched_change_begin(p,
+					DEQUEUE_SAVE | DEQUEUE_NOCLOCK |
+					DEQUEUE_CLASS | ENQUEUE_CLASS);
+				p->sched_class = &minlat_sched_class;
+				sched_change_end(ctx);
+			}
+		}
+
+		rq_unlock_irqrestore(rq, &rf);
+	}
+
+	/*
+	 * Phase 2: migrate remaining tasks (sleeping + any that woke up
+	 * between Phase 1 completing their CPU and now).
+	 *
+	 * For each task still on the old class, take task_rq_lock and
+	 * use sched_change_begin/end if queued, or just swap the class
+	 * pointer if sleeping.  This avoids the race where a task wakes
+	 * up after Phase 1 processed its CPU and gets enqueued on the
+	 * old class's runqueue — Phase 2 must properly dequeue/enqueue
+	 * such tasks rather than just changing the class pointer.
+	 */
+	read_lock(&tasklist_lock);
+	for_each_process_thread(g, p) {
+		const struct sched_class *from_class = to_minlat ?
+			&fair_sched_class : &minlat_sched_class;
+		const struct sched_class *to_class = to_minlat ?
+			&minlat_sched_class : &fair_sched_class;
+
+		if (p->sched_class != from_class)
+			continue;
+		if (rt_prio(p->prio) || dl_prio(p->prio))
+			continue;
+
+		get_task_struct(p);
+		read_unlock(&tasklist_lock);
+
+		{
+			struct rq_flags rf;
+			struct rq *rq;
+
+			rq = task_rq_lock(p, &rf);
+
+			if (p->sched_class == from_class) {
+				if (task_on_rq_queued(p)) {
+					struct sched_change_ctx *ctx;
+
+					ctx = sched_change_begin(p,
+						DEQUEUE_SAVE |
+						DEQUEUE_CLASS |
+						ENQUEUE_CLASS);
+					p->sched_class = to_class;
+					sched_change_end(ctx);
+				} else {
+					p->sched_class = to_class;
+				}
+			}
+
+			task_rq_unlock(rq, p, &rf);
+		}
+
+		read_lock(&tasklist_lock);
+		put_task_struct(p);
+	}
+	read_unlock(&tasklist_lock);
+}
+
+static ssize_t minlat_enabled_write(struct file *file,
+				     const char __user *ubuf,
+				     size_t cnt, loff_t *ppos)
+{
+	bool enable;
+	int ret;
+
+	ret = kstrtobool_from_user(ubuf, cnt, &enable);
+	if (ret)
+		return ret;
+
+	if (enable == static_key_enabled(&sched_minlat_enabled.key))
+		return cnt;
+
+	if (enable) {
+		static_branch_enable(&sched_minlat_enabled);
+		minlat_switch_all(true);
+		pr_info("minlat: scheduler enabled, migrated all fair tasks\n");
+	} else {
+		minlat_switch_all(false);
+		static_branch_disable(&sched_minlat_enabled);
+		pr_info("minlat: scheduler disabled, migrated all tasks to CFS\n");
+	}
+
+	*ppos += cnt;
+	return cnt;
+}
+
+static ssize_t minlat_enabled_read(struct file *file, char __user *ubuf,
+				    size_t cnt, loff_t *ppos)
+{
+	char buf[4];
+	int len;
+
+	len = snprintf(buf, sizeof(buf), "%d\n",
+		       static_key_enabled(&sched_minlat_enabled.key));
+	return simple_read_from_buffer(ubuf, cnt, ppos, buf, len);
+}
+
+const struct file_operations minlat_enabled_fops = {
+	.read	= minlat_enabled_read,
+	.write	= minlat_enabled_write,
+};
+
 /* ==== init ==== */
 
 __init void init_sched_minlat_class(void)
@@ -1921,6 +2153,8 @@ DEFINE_SCHED_CLASS(minlat) = {
 	.task_tick		= task_tick_minlat,
 	.task_dead		= task_dead_minlat,
 
+	.switching_from		= switching_from_minlat,
+	.switched_from		= switched_from_minlat,
 	.switched_to		= switched_to_minlat,
 	.prio_changed		= prio_changed_minlat,
 
