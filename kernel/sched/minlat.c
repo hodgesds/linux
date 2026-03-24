@@ -95,6 +95,28 @@ unsigned int minlat_fork_numa_imbalance_pct = 50;
  * 0 = preempt whenever wakee has lower vruntime (aggressive).
  */
 unsigned int minlat_wakeup_preempt_thresh_ns = 1 * NSEC_PER_MSEC;
+/*
+ * Big-core preference for interactive and compute-bound tasks.
+ * Controls placement on asymmetric capacity (big.LITTLE/hybrid) systems.
+ *
+ * interactive_big_prefer:
+ *   0 = default: place interactive tasks on any idle CPU (cache-local)
+ *   1 = prefer big cores for interactive tasks. On hybrid systems,
+ *       latency-critical tasks (short burst, frequent sleep) are
+ *       routed to high-capacity cores for lowest wake-to-run latency.
+ *       Trades cache locality for raw single-thread performance.
+ *
+ * compute_big_prefer:
+ *   0 = default: place compute-bound tasks on any available CPU
+ *   1 = prefer big cores for compute-bound tasks. CPU-intensive
+ *       tasks (high utilization, long run bursts) are routed to
+ *       high-capacity cores for maximum throughput. Little cores
+ *       are used as overflow when all big cores are busy.
+ *
+ * Both are no-ops on symmetric capacity systems.
+ */
+unsigned int minlat_interactive_big_prefer;
+unsigned int minlat_compute_big_prefer;
 
 #define MINLAT_LATENCY_NS		minlat_latency_ns
 #define MINLAT_MIN_GRANULARITY_NS	minlat_min_granularity_ns
@@ -165,6 +187,41 @@ static inline bool minlat_task_fits_cpu(struct task_struct *p, int cpu)
 
 	return minlat_fits_capacity(p->minlat.util_avg,
 				    arch_scale_cpu_capacity(cpu));
+}
+
+/*
+ * Check if this task should prefer big (high-capacity) cores.
+ *
+ * Returns true if the task's placement policy calls for a big core:
+ * - interactive_big_prefer=1 AND task is interactive (short bursts)
+ * - compute_big_prefer=1 AND task is compute-bound (not interactive)
+ *
+ * When true, select_task_rq will prefer higher-capacity idle CPUs
+ * even if a lower-capacity CPU in the same LLC is available.
+ * This is a soft preference — if no big core is idle, little cores
+ * are used as fallback.
+ */
+static inline bool minlat_prefers_big(struct task_struct *p)
+{
+	if (!sched_asym_cpucap_active())
+		return false;
+
+	if (minlat_interactive_big_prefer && p->minlat.interactive)
+		return true;
+
+	if (minlat_compute_big_prefer && !p->minlat.interactive)
+		return true;
+
+	return false;
+}
+
+/*
+ * Check if a CPU is a "big" (high-capacity) core.
+ * Returns true if this CPU's capacity equals the system maximum.
+ */
+static inline bool minlat_cpu_is_big(int cpu)
+{
+	return arch_scale_cpu_capacity(cpu) >= SCHED_CAPACITY_SCALE;
 }
 
 /*
@@ -1339,8 +1396,13 @@ static int minlat_wake_affine_cpu(struct task_struct *p, int prev_cpu,
 	 * Don't pull a task to a CPU where it doesn't fit.
 	 * A compute-bound task on a big core shouldn't be pulled
 	 * to a little core just because the waker is there.
+	 *
+	 * Also respect big-core preference: if the task prefers big
+	 * and this CPU is a little core, don't affine here.
 	 */
 	if (!minlat_task_fits_cpu(p, this_cpu))
+		return -1;
+	if (minlat_prefers_big(p) && !minlat_cpu_is_big(this_cpu))
 		return -1;
 
 	/*
@@ -1613,10 +1675,20 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 		/* No valid CPUs found — fall through to general path */
 	}
 
+	/*
+	 * Check if this task has a big-core preference. If so, O(1)
+	 * fast paths on little cores are skipped — we want the scan
+	 * to find a big core instead. The scan has a little-core
+	 * fallback so we never starve.
+	 */
+	{
+	bool wants_big = minlat_prefers_big(p);
+
 	/* 1. prev_cpu if idle — fast path, no scanning */
 	if (cpu_active(prev_cpu) && cpumask_test_cpu(prev_cpu, allowed) &&
 	    minlat_cpu_effectively_idle(prev_cpu) &&
-	    minlat_task_fits_cpu(p, prev_cpu))
+	    minlat_task_fits_cpu(p, prev_cpu) &&
+	    !(wants_big && !minlat_cpu_is_big(prev_cpu)))
 		return prev_cpu;
 
 	/*
@@ -1633,7 +1705,8 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 	    cpumask_test_cpu(recent_used_cpu, allowed) &&
 	    cpus_share_cache(recent_used_cpu, prev_cpu) &&
 	    minlat_cpu_effectively_idle(recent_used_cpu) &&
-	    minlat_task_fits_cpu(p, recent_used_cpu))
+	    minlat_task_fits_cpu(p, recent_used_cpu) &&
+	    !(wants_big && !minlat_cpu_is_big(recent_used_cpu)))
 		return recent_used_cpu;
 
 	/*
@@ -1645,6 +1718,11 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 	 * doesn't fit (little cores for compute-bound tasks). Track
 	 * a fallback for the case where no fitting CPU is idle — a
 	 * little core is better than staying on an overloaded big.
+	 *
+	 * When the task prefers big cores (interactive_big_prefer or
+	 * compute_big_prefer), additionally skip little cores even
+	 * if the task fits on them. The fallback catches the case
+	 * where no big core is idle.
 	 */
 	{
 		int fallback_cpu = -1;
@@ -1661,6 +1739,13 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 				continue;
 			}
 
+			/* Soft big-core preference: skip little cores */
+			if (wants_big && !minlat_cpu_is_big(cpu)) {
+				if (fallback_cpu < 0)
+					fallback_cpu = cpu;
+				continue;
+			}
+
 			if (cpus_share_cache(cpu, prev_cpu))
 				return cpu;
 
@@ -1670,10 +1755,11 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 		if (best_cpu >= 0)
 			return best_cpu;
 
-		/* No fitting idle CPU — use a non-fitting idle one */
+		/* No preferred idle CPU — use fallback (little core) */
 		if (fallback_cpu >= 0)
 			return fallback_cpu;
 	}
+	} /* end wants_big scope */
 
 	/*
 	 * 5. No idle CPU found.

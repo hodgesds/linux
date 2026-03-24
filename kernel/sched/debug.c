@@ -657,6 +657,10 @@ static __init int sched_init_debug(void)
 				   &minlat_fork_imbalance_pct);
 		debugfs_create_u32("fork_numa_imbalance_pct", 0644, d_minlat,
 				   &minlat_fork_numa_imbalance_pct);
+		debugfs_create_u32("interactive_big_prefer", 0644, d_minlat,
+				   &minlat_interactive_big_prefer);
+		debugfs_create_u32("compute_big_prefer", 0644, d_minlat,
+				   &minlat_compute_big_prefer);
 
 		{
 			extern const struct file_operations minlat_enabled_fops;
