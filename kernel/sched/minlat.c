@@ -18,6 +18,7 @@
 #include "sched.h"
 #include <linux/sched/cputime.h>
 #include <linux/sched/signal.h>
+#include <linux/task_work.h>
 
 DEFINE_STATIC_KEY_TRUE(sched_minlat_enabled);
 
@@ -263,6 +264,55 @@ static void minlat_update_misfit_status(struct task_struct *p, struct rq *rq)
 	rq->misfit_task_load = max_t(unsigned long,
 				     scale_load_down(p->minlat.load.weight), 1);
 }
+
+/* ==== NUMA balancing ==== */
+
+#ifdef CONFIG_NUMA_BALANCING
+/*
+ * Trigger NUMA page scanning for minlat tasks.
+ *
+ * Mirrors CFS task_tick_numa() logic: periodically schedule
+ * task_numa_work (set up by init_numa_balancing on fork) to scan
+ * process pages and trigger NUMA faults. The MM layer handles
+ * page migration; task_numa_placement sets numa_preferred_nid
+ * based on fault data — both are scheduler-class agnostic.
+ *
+ * Uses sysctl_numa_balancing_scan_delay for initial period instead
+ * of CFS's task_scan_start() which depends on numa_group internals.
+ * After first scan, task_numa_placement() adapts the period.
+ */
+static void minlat_task_tick_numa(struct rq *rq, struct task_struct *curr)
+{
+	struct callback_head *work = &curr->numa_work;
+	u64 period, now;
+
+	if (!curr->mm || (curr->flags & (PF_EXITING | PF_KTHREAD)) ||
+	    work->next != work)
+		return;
+
+	/*
+	 * Use runtime rather than walltime so idle tasks don't
+	 * trigger scanning, matching CFS behavior.
+	 */
+	now = curr->se.sum_exec_runtime;
+	period = (u64)curr->numa_scan_period * NSEC_PER_MSEC;
+
+	if (now > curr->node_stamp + period) {
+		if (!curr->node_stamp)
+			curr->numa_scan_period =
+				sysctl_numa_balancing_scan_delay;
+		curr->node_stamp += period;
+
+		if (!time_before(jiffies, curr->mm->numa_next_scan))
+			task_work_add(curr, work, TWA_RESUME);
+	}
+}
+#else
+static inline void minlat_task_tick_numa(struct rq *rq,
+					 struct task_struct *curr)
+{
+}
+#endif /* CONFIG_NUMA_BALANCING */
 
 /*
  * Global count of overloaded CPUs (those with 2+ minlat tasks).
@@ -1726,6 +1776,9 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 	 */
 	{
 		int fallback_cpu = -1;
+#ifdef CONFIG_NUMA_BALANCING
+		int preferred_nid = READ_ONCE(p->numa_preferred_nid);
+#endif
 
 		for_each_cpu_wrap(cpu, cpu_active_mask, prev_cpu) {
 			if (!cpumask_test_cpu(cpu, allowed))
@@ -1749,8 +1802,21 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 			if (cpus_share_cache(cpu, prev_cpu))
 				return cpu;
 
-			if (best_cpu < 0)
+			if (best_cpu < 0) {
 				best_cpu = cpu;
+			}
+#ifdef CONFIG_NUMA_BALANCING
+			/*
+			 * NUMA preference: among off-LLC idle CPUs,
+			 * prefer one on the task's preferred NUMA
+			 * node for memory locality.
+			 */
+			else if (preferred_nid != NUMA_NO_NODE &&
+				 cpu_to_node(cpu) == preferred_nid &&
+				 cpu_to_node(best_cpu) != preferred_nid) {
+				best_cpu = cpu;
+			}
+#endif
 		}
 		if (best_cpu >= 0)
 			return best_cpu;
@@ -1859,6 +1925,10 @@ static bool minlat_migration_cooldown(struct task_struct *p,
  * Walk the rb-tree from the right (highest vruntime = most starved)
  * to find a migratable task.
  *
+ * NUMA-aware: among migratable candidates, prefer tasks whose
+ * numa_preferred_nid matches the destination node. This pulls tasks
+ * toward their memory, complementing page-fault-based NUMA migration.
+ *
  * @cross_numa: true if this is a cross-NUMA pull (enables cooldown checks)
  */
 static struct task_struct *
@@ -1866,8 +1936,11 @@ minlat_pick_pullable_task(struct rq *src_rq, int this_cpu, bool cross_numa)
 {
 	struct rb_node *node;
 	struct sched_minlat_entity *me;
-	struct task_struct *p;
+	struct task_struct *p, *fallback = NULL;
 	int scanned = 0;
+#ifdef CONFIG_NUMA_BALANCING
+	int dst_nid = cpu_to_node(this_cpu);
+#endif
 
 	for (node = rb_last(&src_rq->minlat.tasks_timeline.rb_root);
 	     node && scanned < 4; node = rb_prev(node), scanned++) {
@@ -1894,10 +1967,21 @@ minlat_pick_pullable_task(struct rq *src_rq, int this_cpu, bool cross_numa)
 		if (cross_numa && minlat_migration_cooldown(p, src_rq))
 			continue;
 
+#ifdef CONFIG_NUMA_BALANCING
+		/*
+		 * Prefer tasks whose preferred NUMA node matches dst.
+		 * Remember first fallback in case no NUMA match is found.
+		 */
+		if (p->numa_preferred_nid == dst_nid)
+			return p;
+		if (!fallback)
+			fallback = p;
+#else
 		return p;
+#endif
 	}
 
-	return NULL;
+	return fallback;
 }
 
 /*
@@ -2179,6 +2263,10 @@ static void task_tick_minlat(struct rq *rq, struct task_struct *p, int queued)
 	/* Update utilization estimate and misfit status */
 	minlat_update_util(p);
 	minlat_update_misfit_status(p, rq);
+
+	/* Drive NUMA page scanning */
+	if (static_branch_unlikely(&sched_numa_balancing))
+		minlat_task_tick_numa(rq, p);
 }
 
 static void task_dead_minlat(struct task_struct *p)
