@@ -1363,6 +1363,32 @@ static bool __maybe_unused minlat_smt_has_interactive(int cpu)
 }
 #endif
 
+/*
+ * Check if a CPU's entire physical core is idle (all SMT siblings idle).
+ * Used for SMT-aware task placement: prefer fully idle cores over idle
+ * SMT siblings to avoid sharing execution resources (~30-40% throughput
+ * loss per task when two tasks share a physical core).
+ */
+#ifdef CONFIG_SCHED_SMT
+static inline bool minlat_is_core_idle(int cpu)
+{
+	int sibling;
+
+	for_each_cpu(sibling, cpu_smt_mask(cpu)) {
+		if (sibling == cpu)
+			continue;
+		if (!idle_cpu(sibling))
+			return false;
+	}
+	return true;
+}
+#else
+static inline bool minlat_is_core_idle(int cpu)
+{
+	return true;
+}
+#endif
+
 /* ==== LLC-aware CPU selection ==== */
 
 /*
@@ -1797,6 +1823,10 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 	 */
 	{
 		int fallback_cpu = -1;
+#ifdef CONFIG_SCHED_SMT
+		int idle_smt_cpu = -1;
+		bool smt = sched_smt_active();
+#endif
 #ifdef CONFIG_NUMA_BALANCING
 		int preferred_nid = READ_ONCE(p->numa_preferred_nid);
 #endif
@@ -1820,8 +1850,23 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 				continue;
 			}
 
-			if (cpus_share_cache(cpu, prev_cpu))
+			if (cpus_share_cache(cpu, prev_cpu)) {
+#ifdef CONFIG_SCHED_SMT
+				/*
+				 * SMT-aware: prefer idle cores (all
+				 * siblings idle) over idle SMT siblings
+				 * to avoid sharing execution resources.
+				 * Two tasks on the same physical core
+				 * lose ~30-40% throughput each.
+				 */
+				if (smt && !minlat_is_core_idle(cpu)) {
+					if (idle_smt_cpu < 0)
+						idle_smt_cpu = cpu;
+					continue;
+				}
+#endif
 				return cpu;
+			}
 
 			if (best_cpu < 0) {
 				best_cpu = cpu;
@@ -1839,6 +1884,11 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 			}
 #endif
 		}
+#ifdef CONFIG_SCHED_SMT
+		/* In-LLC SMT sibling > off-LLC idle core */
+		if (idle_smt_cpu >= 0)
+			return idle_smt_cpu;
+#endif
 		if (best_cpu >= 0)
 			return best_cpu;
 
