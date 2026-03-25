@@ -780,6 +780,9 @@ struct sched_minlat_entity {
 	u64				total_run_ns;
 	unsigned int			interactive : 1; /* short-burst task */
 
+	/* LLC stickiness: runs on current LLC since last migration */
+	unsigned int			llc_runs;
+
 	/* Capacity-aware scheduling (big.LITTLE) */
 	unsigned long			util_avg;	/* EWMA utilization 0-1024 */
 };

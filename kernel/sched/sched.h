@@ -2840,6 +2840,7 @@ extern unsigned int minlat_fork_numa_imbalance_pct;
 extern unsigned int minlat_wakeup_preempt_thresh_ns;
 extern unsigned int minlat_interactive_big_prefer;
 extern unsigned int minlat_compute_big_prefer;
+extern unsigned int minlat_llc_stickiness;
 #else
 static inline bool sched_minlat_runnable(struct rq *rq)
 {

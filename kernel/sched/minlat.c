@@ -118,6 +118,16 @@ unsigned int minlat_wakeup_preempt_thresh_ns = 1 * NSEC_PER_MSEC;
  */
 unsigned int minlat_interactive_big_prefer;
 unsigned int minlat_compute_big_prefer;
+/*
+ * LLC stickiness: minimum number of times a task must run on its
+ * current LLC before it becomes eligible for cross-LLC migration.
+ * Prevents migration ping-pong that wastes cache warmth.
+ * Inspired by p2dq's min_llc_runs concept.
+ *
+ * 0 = disabled (any task can be pulled immediately)
+ * 4 = default (task must run 4 times before cross-LLC pull)
+ */
+unsigned int minlat_llc_stickiness = 4;
 
 #define MINLAT_LATENCY_NS		minlat_latency_ns
 #define MINLAT_MIN_GRANULARITY_NS	minlat_min_granularity_ns
@@ -1244,6 +1254,9 @@ set_next_task_minlat(struct rq *rq, struct task_struct *p, bool first)
 	p->se.exec_start = rq_clock_task(rq);
 	p->se.prev_sum_exec_runtime = p->se.sum_exec_runtime;
 
+	/* LLC stickiness: count runs on current LLC */
+	me->llc_runs++;
+
 	/* Update misfit status for the newly scheduled task */
 	minlat_update_misfit_status(p, rq);
 }
@@ -1938,6 +1951,7 @@ minlat_pick_pullable_task(struct rq *src_rq, int this_cpu, bool cross_numa)
 	struct sched_minlat_entity *me;
 	struct task_struct *p, *fallback = NULL;
 	int scanned = 0;
+	bool cross_llc = !cpus_share_cache(src_rq->cpu, this_cpu);
 #ifdef CONFIG_NUMA_BALANCING
 	int dst_nid = cpu_to_node(this_cpu);
 #endif
@@ -1965,6 +1979,16 @@ minlat_pick_pullable_task(struct rq *src_rq, int this_cpu, bool cross_numa)
 
 		/* Cross-NUMA cooldown only when source node is saturated */
 		if (cross_numa && minlat_migration_cooldown(p, src_rq))
+			continue;
+
+		/*
+		 * LLC stickiness: don't pull tasks across LLCs until
+		 * they've run enough times on their current LLC.
+		 * This prevents migration ping-pong that wastes cache.
+		 * Inspired by p2dq's min_llc_runs concept.
+		 */
+		if (cross_llc && minlat_llc_stickiness &&
+		    me->llc_runs < minlat_llc_stickiness)
 			continue;
 
 #ifdef CONFIG_NUMA_BALANCING
@@ -2004,6 +2028,10 @@ static bool minlat_pull_from(struct rq *this_rq, struct rq *src_rq,
 	/* Stamp migration time — used for cross-NUMA cooldown */
 	if (cross_numa)
 		p->minlat.last_migrate_ts = rq_clock_task(src_rq);
+
+	/* Reset LLC stickiness counter on cross-LLC migration */
+	if (!cpus_share_cache(src_rq->cpu, this_rq->cpu))
+		p->minlat.llc_runs = 0;
 
 	move_queued_task_locked(src_rq, this_rq, p);
 	return true;

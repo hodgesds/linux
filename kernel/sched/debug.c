@@ -661,6 +661,8 @@ static __init int sched_init_debug(void)
 				   &minlat_interactive_big_prefer);
 		debugfs_create_u32("compute_big_prefer", 0644, d_minlat,
 				   &minlat_compute_big_prefer);
+		debugfs_create_u32("llc_stickiness", 0644, d_minlat,
+				   &minlat_llc_stickiness);
 
 		{
 			extern const struct file_operations minlat_enabled_fops;
