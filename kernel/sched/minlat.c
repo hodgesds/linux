@@ -125,9 +125,9 @@ unsigned int minlat_compute_big_prefer;
  * Inspired by p2dq's min_llc_runs concept.
  *
  * 0 = disabled (any task can be pulled immediately)
- * 4 = default (task must run 4 times before cross-LLC pull)
+ * 1 = default (task must run 1 time before cross-LLC pull)
  */
-unsigned int minlat_llc_stickiness = 4;
+unsigned int minlat_llc_stickiness = 1;
 
 #define MINLAT_LATENCY_NS		minlat_latency_ns
 #define MINLAT_MIN_GRANULARITY_NS	minlat_min_granularity_ns
@@ -1072,10 +1072,14 @@ wakeup_preempt_minlat(struct rq *rq, struct task_struct *p, int flags)
 	 * Preempt if the wakee has a vruntime advantage.
 	 *
 	 * Very light load (at most 2 effective runnable tasks):
-	 * preempt immediately for best latency. No IPI storm risk
-	 * with so few tasks. This helps schbench where futex-woken
-	 * tasks (non-sync) need prompt scheduling on lightly-loaded
-	 * CPUs.
+	 * preempt immediately unless curr just started running.
+	 * Tasks that have run < min_granularity are protected from
+	 * wakeup preemption — this prevents preempting tasks in
+	 * tight syscall loops (like futex_wake batch waking pinned
+	 * threads) while still allowing prompt scheduling for
+	 * compute tasks that have been running for a while.
+	 * The woken task's buddy status ensures it runs next when
+	 * curr voluntarily sleeps (no tick wait needed).
 	 *
 	 * Heavier load: require a significant vruntime advantage
 	 * (threshold) and use resched_curr_lazy to avoid IPI
@@ -1085,9 +1089,13 @@ wakeup_preempt_minlat(struct rq *rq, struct task_struct *p, int flags)
 		unsigned int eff = minlat_rq->nr_running -
 				   minlat_rq->nr_delayed;
 
-		if (eff <= 2)
-			resched_curr(rq);
-		else if (delta > (s64)minlat_wakeup_preempt_thresh_ns)
+		if (eff <= 2) {
+			u64 ran = curr->se.sum_exec_runtime -
+				  curr->se.prev_sum_exec_runtime;
+
+			if (ran >= MINLAT_MIN_GRANULARITY_NS)
+				resched_curr(rq);
+		} else if (delta > (s64)minlat_wakeup_preempt_thresh_ns)
 			resched_curr_lazy(rq);
 	}
 }
