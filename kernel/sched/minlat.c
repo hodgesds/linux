@@ -1823,9 +1823,26 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 	 * compute_big_prefer), additionally skip little cores even
 	 * if the task fits on them. The fallback catches the case
 	 * where no big core is idle.
+	 *
+	 * SIS_UTIL-style scan depth limiting: on large machines,
+	 * scanning all CPUs for an idle one is expensive. Use
+	 * per-LLC idle tracking (sd_llc_shared->nr_busy_cpus,
+	 * maintained by the NOHZ subsystem) to decide:
+	 *
+	 * 1. If our LLC has idle CPUs, skip off-LLC scan — cheap
+	 *    local migration is available.
+	 * 2. If our LLC is fully busy, compute off-LLC scan depth
+	 *    from global utilization (quadratic curve like CFS).
+	 *
+	 * In-LLC CPUs are always fully scanned (cache-local,
+	 * small scan space) — the limit applies only to off-LLC.
 	 */
 	{
 		int fallback_cpu = -1;
+		int nr_scanned = 0;
+		int scan_limit;
+		unsigned int nr_cpus;
+		struct sched_domain_shared *sds;
 #ifdef CONFIG_SCHED_SMT
 		int idle_smt_cpu = -1;
 		bool smt = sched_smt_active();
@@ -1834,9 +1851,79 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 		int preferred_nid = READ_ONCE(p->numa_preferred_nid);
 #endif
 
+		nr_cpus = num_online_cpus();
+
+		/*
+		 * Per-LLC idle detection: sd_llc_shared->nr_busy_cpus
+		 * tracks how many CPUs in this LLC have exited NOHZ
+		 * idle. llc_size - nr_busy_cpus = idle CPUs in LLC.
+		 *
+		 * If idle CPUs exist in our LLC, focus the scan
+		 * there (scan_limit=0 skips off-LLC CPUs). If the
+		 * LLC is fully busy, fall through to compute an
+		 * off-LLC scan limit from global utilization.
+		 */
+		sds = rcu_dereference_all(per_cpu(sd_llc_shared, prev_cpu));
+		if (sds) {
+			int llc_sz = per_cpu(sd_llc_size, prev_cpu);
+			int llc_busy = atomic_read(&sds->nr_busy_cpus);
+			int llc_idle = llc_sz - llc_busy;
+
+			if (llc_idle > 0) {
+				/*
+				 * LLC has idle CPUs — stay local.
+				 * The in-LLC scan below will find them.
+				 */
+				scan_limit = 0;
+				goto do_scan;
+			}
+		}
+
+		/*
+		 * LLC fully busy (or no LLC domain). Compute off-LLC
+		 * scan depth from global utilization.
+		 *
+		 * busy_pct = nr_overloaded / nr_online
+		 * scan_frac = 1 - (busy_pct / 0.85)^2
+		 * scan_limit = nr_online * scan_frac
+		 *
+		 * Quadratic curve: at 0% busy → scan all off-LLC,
+		 * at 85% busy → scan 0. Minimum of 4 ensures we
+		 * check at least a few off-LLC CPUs under moderate
+		 * load. Small machines (<=16 CPUs) always scan all.
+		 */
+		{
+			unsigned int nr_busy = atomic_read(&minlat_nr_overloaded);
+
+			if (nr_busy * 100 >= nr_cpus * 85) {
+				scan_limit = 0;
+			} else if (nr_cpus <= 16) {
+				scan_limit = nr_cpus;
+			} else {
+				unsigned int x = nr_busy * 100;
+				unsigned int thresh = nr_cpus * 85;
+
+				scan_limit = nr_cpus -
+					(u64)x * x * nr_cpus /
+					((u64)thresh * thresh);
+				scan_limit = max(scan_limit, 4);
+			}
+		}
+do_scan:
+
 		for_each_cpu_wrap(cpu, cpu_active_mask, prev_cpu) {
 			if (!cpumask_test_cpu(cpu, allowed))
 				continue;
+
+			/*
+			 * In-LLC CPUs are always checked (cheap
+			 * migration, small scan space). Off-LLC
+			 * CPUs count against the scan limit.
+			 */
+			if (!cpus_share_cache(cpu, prev_cpu) &&
+			    ++nr_scanned > scan_limit)
+				break;
+
 			if (!minlat_cpu_effectively_idle(cpu))
 				continue;
 
@@ -1871,6 +1958,7 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 				return cpu;
 			}
 
+			/* Off-LLC idle CPU */
 			if (best_cpu < 0) {
 				best_cpu = cpu;
 			}
