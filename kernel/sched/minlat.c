@@ -211,16 +211,60 @@ static void update_minlat_load_avg(struct rq *rq, struct sched_minlat_entity *me
 }
 
 /*
- * Check if a task fits on a given CPU based on utilization vs capacity.
- * Returns true if the task's utilization can be served by this CPU.
+ * Check if a task fits on a given CPU based on utilization vs capacity,
+ * honoring uclamp min/max constraints.
+ *
+ * Returns:
+ *   1  — task fully fits (util and uclamp constraints satisfied)
+ *   0  — task doesn't fit (util exceeds capacity)
+ *  -1  — util fits but uclamp_min exceeds CPU capacity
+ *         (task can run but won't get requested minimum performance)
+ */
+static inline int minlat_util_fits_cpu(struct task_struct *p, int cpu)
+{
+	unsigned long util = READ_ONCE(p->minlat.avg.util_avg);
+	unsigned long capacity = arch_scale_cpu_capacity(cpu);
+	bool fits;
+
+	fits = minlat_fits_capacity(util, capacity);
+
+#ifdef CONFIG_UCLAMP_TASK
+	if (uclamp_is_used()) {
+		unsigned long uclamp_min = uclamp_eff_value(p, UCLAMP_MIN);
+		unsigned long uclamp_max = uclamp_eff_value(p, UCLAMP_MAX);
+
+		/*
+		 * uclamp_max caps the task — if the CPU's capacity
+		 * is at least uclamp_max, the task fits regardless
+		 * of its raw utilization.
+		 */
+		if (capacity >= uclamp_max)
+			fits = true;
+
+		/*
+		 * uclamp_min boosts the task — if the task fits by
+		 * utilization but the CPU can't provide uclamp_min
+		 * performance, return -1 (partial fit).
+		 */
+		uclamp_min = min(uclamp_min, uclamp_max);
+		if (fits && (util < uclamp_min) &&
+		    (uclamp_min > capacity))
+			return -1;
+	}
+#endif
+
+	return fits ? 1 : 0;
+}
+
+/*
+ * Simple boolean wrapper: does the task fully fit this CPU?
  */
 static inline bool minlat_task_fits_cpu(struct task_struct *p, int cpu)
 {
 	if (!sched_asym_cpucap_active())
 		return true;
 
-	return minlat_fits_capacity(READ_ONCE(p->minlat.avg.util_avg),
-				    arch_scale_cpu_capacity(cpu));
+	return (minlat_util_fits_cpu(p, cpu) > 0);
 }
 
 /*
@@ -290,12 +334,12 @@ static void minlat_update_misfit_status(struct task_struct *p, struct rq *rq)
 	}
 
 	/*
-	 * Task doesn't fit — set misfit load. Use the PELT load_avg
-	 * if available, or fall back to the task's weight.
+	 * Task doesn't fit — set misfit load from PELT load_avg,
+	 * falling back to task weight if PELT hasn't warmed up yet.
 	 * Ensure non-zero so check_misfit_status() returns true.
 	 */
 	rq->misfit_task_load = max_t(unsigned long,
-				     scale_load_down(p->minlat.load.weight), 1);
+				     READ_ONCE(p->minlat.avg.load_avg), 1);
 }
 
 /* ==== NUMA balancing ==== */
