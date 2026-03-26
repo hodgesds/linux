@@ -16,6 +16,7 @@
  */
 
 #include "sched.h"
+#include "pelt.h"
 #include <linux/sched/cputime.h>
 #include <linux/sched/signal.h>
 #include <linux/task_work.h>
@@ -146,45 +147,67 @@ static inline unsigned long minlat_capacity_of(int cpu)
 }
 
 /*
- * Utilization EWMA decay factor. Higher = more stable, slower to react.
- * 4 gives a half-life of ~2.4 ticks, fast enough to detect compute-bound
- * tasks within a few scheduling periods.
+ * PELT (Per-Entity Load Tracking) integration.
+ *
+ * Minlat uses the standard PELT infrastructure for two purposes:
+ * 1. Per-entity tracking (sched_minlat_entity.avg): tracks each task's
+ *    utilization for capacity-aware placement (big.LITTLE).
+ * 2. Per-rq tracking (minlat_rq.avg): tracks aggregate CPU utilization
+ *    from minlat tasks, driving CPU frequency scaling (schedutil).
+ *
+ * The per-entity PELT tracks:
+ *   load_sum/load_avg  - weight-scaled running time
+ *   runnable_sum/avg   - time spent runnable (waiting + running)
+ *   util_sum/util_avg  - actual running time (CPU utilization, 0-1024)
  */
-#define MINLAT_UTIL_DECAY	4
 
 /*
- * Update the task's utilization estimate. Called from put_prev_task
- * (on every context switch out) and task_tick (periodically for curr).
+ * Update per-entity PELT for a minlat task.
+ * Called from enqueue, dequeue, tick, and context switch paths.
  *
- * Uses a simple duty-cycle estimate: if the task ran for delta_exec
- * out of a period, its instantaneous utilization is:
- *   instant_util = delta_exec * SCHED_CAPACITY_SCALE / period
- *
- * For the running task at tick time, we use the tick interval as the
- * period (TICK_NSEC). For tasks switching out, we use the run duration
- * as a fraction of (run + last_sleep). This is smoothed with an EWMA.
+ * Parameters mirror CFS's __update_load_avg_se():
+ *   load    = !!on_rq (entity contributes to load when queued)
+ *   runnable = !!on_rq (flat hierarchy, no group scheduling)
+ *   running = is this entity the currently executing task?
  */
-static void minlat_update_util(struct task_struct *p)
+static int update_minlat_se_load_avg(u64 now, struct rq *rq,
+				     struct sched_minlat_entity *me)
 {
-	struct sched_minlat_entity *me = &p->minlat;
-	unsigned long instant_util;
-	u64 run_ns = me->total_run_ns;
-	u64 sleep_ns = me->total_sleep_ns;
-	u64 total;
-
 	/*
-	 * Compute duty cycle from EWMA run/sleep durations.
-	 * These are already maintained by minlat_record_sleep()
-	 * and minlat_update_interactivity().
+	 * After migration, last_update_time is 0. Sync to the
+	 * current rq clock without accumulating a stale delta.
 	 */
-	total = run_ns + sleep_ns;
-	if (total > 0)
-		instant_util = div64_ul(run_ns * SCHED_CAPACITY_SCALE, total);
-	else
-		instant_util = SCHED_CAPACITY_SCALE; /* assume busy if no data */
+	if (!me->avg.last_update_time) {
+		me->avg.last_update_time = now;
+		return 0;
+	}
 
-	me->util_avg = (me->util_avg * (MINLAT_UTIL_DECAY - 1) +
-			instant_util) / MINLAT_UTIL_DECAY;
+	if (___update_load_sum(now, &me->avg,
+			       !!me->on_rq,
+			       !!me->on_rq,
+			       rq->minlat.curr == me)) {
+		___update_load_avg(&me->avg, scale_load_down(me->load.weight));
+		return 1;
+	}
+	return 0;
+}
+
+/*
+ * Combined PELT update: entity + rq + cpufreq notification.
+ * Called from the hot scheduling paths (enqueue, dequeue, tick).
+ */
+static void update_minlat_load_avg(struct rq *rq, struct sched_minlat_entity *me)
+{
+	u64 now = rq_clock_pelt(rq);
+	int entity_decayed, rq_decayed;
+
+	entity_decayed = update_minlat_se_load_avg(now, rq, me);
+
+	rq_decayed = update_minlat_rq_load_avg(now, rq,
+				rq->minlat.curr != NULL);
+
+	if (entity_decayed || rq_decayed)
+		cpufreq_update_util(rq, 0);
 }
 
 /*
@@ -196,7 +219,7 @@ static inline bool minlat_task_fits_cpu(struct task_struct *p, int cpu)
 	if (!sched_asym_cpucap_active())
 		return true;
 
-	return minlat_fits_capacity(p->minlat.util_avg,
+	return minlat_fits_capacity(READ_ONCE(p->minlat.avg.util_avg),
 				    arch_scale_cpu_capacity(cpu));
 }
 
@@ -267,8 +290,8 @@ static void minlat_update_misfit_status(struct task_struct *p, struct rq *rq)
 	}
 
 	/*
-	 * Task doesn't fit — set misfit load. Use the task's weight as
-	 * a proxy for load since minlat doesn't track PELT load_avg.
+	 * Task doesn't fit — set misfit load. Use the PELT load_avg
+	 * if available, or fall back to the task's weight.
 	 * Ensure non-zero so check_misfit_status() returns true.
 	 */
 	rq->misfit_task_load = max_t(unsigned long,
@@ -546,6 +569,7 @@ void init_minlat_rq(struct minlat_rq *minlat_rq)
 	minlat_rq->nr_delayed = 0;
 	minlat_rq->min_vruntime = 0;
 	minlat_rq->load_weight = 0;
+	memset(&minlat_rq->avg, 0, sizeof(minlat_rq->avg));
 	minlat_rq->active_balance = 0;
 	minlat_rq->push_cpu = 0;
 	minlat_rq->next_balance = 0;
@@ -820,6 +844,8 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 		WRITE_ONCE(minlat_rq->overloaded, true);
 		atomic_inc(&minlat_nr_overloaded);
 	}
+
+	update_minlat_load_avg(rq, me);
 }
 
 bool
@@ -917,8 +943,9 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	if (flags & DEQUEUE_SLEEP) {
 		me->on_rq = 0;
 		minlat_record_sleep(p, rq);
-		minlat_update_util(p);
 	}
+
+	update_minlat_load_avg(rq, me);
 
 	/*
 	 * Clear misfit status if no minlat tasks remain — the CPU
@@ -1239,6 +1266,9 @@ put_prev_task_minlat(struct rq *rq, struct task_struct *p,
 
 	__enqueue_minlat_entity(minlat_rq, me);
 	minlat_rq->curr = NULL;
+
+	/* Update PELT: entity stopped running */
+	update_minlat_load_avg(rq, me);
 }
 
 static void
@@ -1267,6 +1297,9 @@ set_next_task_minlat(struct rq *rq, struct task_struct *p, bool first)
 
 	/* LLC stickiness: count runs on current LLC */
 	me->llc_runs++;
+
+	/* Update PELT: entity is now running */
+	update_minlat_load_avg(rq, me);
 
 	/* Update misfit status for the newly scheduled task */
 	minlat_update_misfit_status(p, rq);
@@ -2610,8 +2643,8 @@ static void task_tick_minlat(struct rq *rq, struct task_struct *p, int queued)
 	/* Deferred interactivity update — keep enqueue path fast */
 	minlat_update_interactivity(p, rq, ENQUEUE_WAKEUP);
 
-	/* Update utilization estimate and misfit status */
-	minlat_update_util(p);
+	/* Update PELT and misfit status */
+	update_minlat_load_avg(rq, &p->minlat);
 	minlat_update_misfit_status(p, rq);
 
 	/* Drive NUMA page scanning */
@@ -2633,6 +2666,16 @@ static void task_dead_minlat(struct task_struct *p)
 		minlat_tgid_ctx_put(ctx);
 		p->minlat.tgid_ctx = NULL;
 	}
+}
+
+/*
+ * Called when a task is migrated to a new CPU. Reset PELT
+ * last_update_time so the entity avg will be re-synced to
+ * the new rq's clock on the next update_minlat_load_avg().
+ */
+static void migrate_task_rq_minlat(struct task_struct *p, int new_cpu)
+{
+	p->minlat.avg.last_update_time = 0;
 }
 
 static void switched_to_minlat(struct rq *rq, struct task_struct *p)
@@ -2927,6 +2970,7 @@ DEFINE_SCHED_CLASS(minlat) = {
 
 	.balance		= balance_minlat,
 	.select_task_rq		= select_task_rq_minlat,
+	.migrate_task_rq	= migrate_task_rq_minlat,
 	.set_cpus_allowed	= set_cpus_allowed_common,
 
 	.task_tick		= task_tick_minlat,

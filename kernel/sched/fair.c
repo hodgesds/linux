@@ -8163,13 +8163,14 @@ unsigned long effective_cpu_util(int cpu, unsigned long util_cfs,
 	}
 
 	/*
-	 * Because the time spend on RT/DL tasks is visible as 'lost' time to
-	 * CFS tasks and we use the same metric to track the effective
+	 * Because the time spend on RT/DL/minlat tasks is visible as 'lost'
+	 * time to CFS tasks and we use the same metric to track the effective
 	 * utilization (PELT windows are synchronized) we can directly add them
 	 * to obtain the CPU's actual utilization.
 	 */
 	util = util_cfs + cpu_util_rt(rq);
 	util += cpu_util_dl(rq);
+	util += cpu_util_minlat(rq);
 
 	/*
 	 * The maximum hint is a soft bandwidth requirement, which can be lower

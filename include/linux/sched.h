@@ -783,8 +783,8 @@ struct sched_minlat_entity {
 	/* LLC stickiness: runs on current LLC since last migration */
 	unsigned int			llc_runs;
 
-	/* Capacity-aware scheduling (big.LITTLE) */
-	unsigned long			util_avg;	/* EWMA utilization 0-1024 */
+	/* PELT tracking for task placement and load balancing */
+	struct sched_avg		avg;
 };
 #endif
 
