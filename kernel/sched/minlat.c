@@ -2765,41 +2765,344 @@ out_unlock:
 	return 0;
 }
 
+/* ==== periodic load balancing ==== */
+
 /*
- * Tick-driven active balance check. Called from task_tick_minlat.
+ * PELT-based periodic load balancing.
  *
- * Handles the case where idle-pull failed: this CPU has 2+ tasks
- * but some CPUs are idle. This can happen when all pushable tasks
- * are cache-hot, migration-disabled, or have restrictive affinity.
+ * Runs from task_tick_minlat, using per-sched_domain intervals
+ * (sd->balance_interval * sd->busy_factor). Unlike the idle-pull
+ * path (balance_minlat), this handles imbalances between busy CPUs.
  *
- * Only targets IDLE CPUs. If all CPUs are busy, wakeup balancing
- * and natural placement distribute work without the overhead of
- * CPU stopper migrations (which disrupt producer-consumer locality).
+ * Uses the rq-level PELT load_avg (aggregate weight-scaled signal)
+ * for imbalance detection, and LLC-aware scoring for task selection.
  *
- * Rate-limited to once per ~32ms to keep tick overhead low.
+ * Design points:
+ *  - Pull-based: underloaded CPUs pull from busiest in their domain
+ *  - PELT load_avg for smooth imbalance detection (avoids noise)
+ *  - LLC-aware task selection: prefer tasks cold on current LLC,
+ *    or tasks whose preferred LLC matches the destination
+ *  - 1 task per balance: smoother convergence, less cache disruption
+ *  - Active balance fallback: CPU stopper push to idle CPUs when
+ *    pull-based balancing misses due to affinity/cache-hot filters
  */
-static void minlat_check_balance(struct rq *rq)
+
+/*
+ * Get the balance interval for a sched_domain, scaled by busy_factor
+ * when the CPU is busy. Matches CFS's get_sd_balance_interval().
+ */
+static unsigned long
+minlat_sd_balance_interval(struct sched_domain *sd, int cpu_busy)
+{
+	unsigned long interval = sd->balance_interval;
+
+	if (cpu_busy)
+		interval *= sd->busy_factor;
+
+	return msecs_to_jiffies(interval);
+}
+
+/*
+ * Read aggregate load weight for a CPU's minlat class.
+ * This is the instantaneous sum of all enqueued entities' weights
+ * (scale_load_down'd). Used for PELT-grade load comparison:
+ * the value scales linearly with nice weight, so a nice -20 task
+ * weighs ~88x more than a nice 19 task.
+ */
+static inline unsigned long minlat_cpu_load(int cpu)
+{
+	return READ_ONCE(cpu_rq(cpu)->minlat.load_weight);
+}
+
+/*
+ * Effective runnable count: nr_running minus delayed sleepers.
+ * Delayed entities are sleeping tasks kept for O(1) wakeup — they
+ * don't need CPU time and shouldn't count as real load.
+ */
+static inline unsigned int minlat_cpu_eff(int cpu)
+{
+	struct minlat_rq *mrq = &cpu_rq(cpu)->minlat;
+	unsigned int nr = mrq->nr_running;
+	unsigned int delayed = mrq->nr_delayed;
+
+	return (nr > delayed) ? (nr - delayed) : 0;
+}
+
+/*
+ * Score a task for migration suitability. Lower = better candidate.
+ *
+ * Factors:
+ * 1. LLC recency (llc_runs): tasks with fewer runs on current LLC
+ *    have less cache investment → cheaper to migrate
+ * 2. Preferred LLC: if destination is the task's preferred LLC,
+ *    this migration IMPROVES locality → strong bonus
+ * 3. PELT load match: prefer tasks whose load_avg is close to
+ *    the ideal migration amount (half the imbalance)
+ * 4. Cache hot: recently-executed tasks get a penalty
+ *
+ * Returns a score where lower = better migration candidate.
+ * Returns INT_MAX if the task can't be migrated at all.
+ */
+static int minlat_migration_score(struct task_struct *p, struct rq *src_rq,
+				  int dst_cpu, unsigned long imbalance,
+				  bool cross_llc, bool cross_numa)
+{
+	struct sched_minlat_entity *me = &p->minlat;
+	int score = 0;
+	unsigned long task_load;
+	long load_diff;
+
+	/* Hard filters — can't migrate at all */
+	if (task_current(src_rq, p))
+		return INT_MAX;
+	if (p->se.sched_delayed)
+		return INT_MAX;
+	if (is_migration_disabled(p))
+		return INT_MAX;
+	if (!cpumask_test_cpu(dst_cpu, p->cpus_ptr))
+		return INT_MAX;
+
+	/* Cache hot penalty: recently-executed tasks are costly to move */
+	if (minlat_task_cache_hot(p, src_rq))
+		score += 1000;
+
+	/* Cross-NUMA cooldown */
+	if (cross_numa && minlat_migration_cooldown(p, src_rq))
+		return INT_MAX;
+
+	/*
+	 * LLC recency: tasks with more runs on current LLC have warmer
+	 * caches. Each LLC run adds 100 to the score (capped at 8 runs).
+	 * A task that just arrived (llc_runs=0) scores 0 here.
+	 */
+	if (cross_llc)
+		score += min_t(unsigned int, me->llc_runs, 8) * 100;
+
+	/*
+	 * Preferred LLC bonus: if destination is in the task's preferred
+	 * LLC, this migration improves locality. Strong negative score.
+	 */
+	if (cross_llc && me->tgid_ctx) {
+		int dst_llc = per_cpu(sd_llc_id, dst_cpu);
+
+		if (me->tgid_ctx->preferred_llc == dst_llc)
+			score -= 800;
+	}
+
+	/*
+	 * PELT load matching: prefer tasks whose load_avg is closest
+	 * to half the imbalance. This avoids over-correcting.
+	 */
+	task_load = READ_ONCE(me->avg.load_avg);
+	if (task_load == 0)
+		task_load = scale_load_down(me->load.weight);
+	load_diff = (long)task_load - (long)(imbalance / 2);
+	if (load_diff < 0)
+		load_diff = -load_diff;
+	score += (int)(load_diff >> 4);
+
+#ifdef CONFIG_NUMA_BALANCING
+	/*
+	 * NUMA affinity bonus: prefer tasks whose preferred NUMA node
+	 * matches the destination.
+	 */
+	if (p->numa_preferred_nid == cpu_to_node(dst_cpu))
+		score -= 200;
+#endif
+
+	return score;
+}
+
+/*
+ * Pick the best task to pull from @src_rq during periodic balancing.
+ * Uses migration scoring to find the lowest-cost candidate.
+ *
+ * Walks the rb-tree from the right (highest vruntime = most starved
+ * by fairness) and scores each candidate. Returns the best one.
+ */
+static struct task_struct *
+minlat_pick_balance_task(struct rq *src_rq, int dst_cpu,
+			 unsigned long imbalance, bool cross_numa)
+{
+	struct rb_node *node;
+	struct sched_minlat_entity *me;
+	struct task_struct *p, *best = NULL;
+	int best_score = INT_MAX;
+	bool cross_llc = !cpus_share_cache(src_rq->cpu, dst_cpu);
+	int scanned = 0;
+
+	for (node = rb_last(&src_rq->minlat.tasks_timeline.rb_root);
+	     node && scanned < 8; node = rb_prev(node), scanned++) {
+		int score;
+
+		me = rb_entry(node, struct sched_minlat_entity, run_node);
+		p = container_of(me, struct task_struct, minlat);
+
+		score = minlat_migration_score(p, src_rq, dst_cpu,
+					       imbalance, cross_llc,
+					       cross_numa);
+		if (score < best_score) {
+			best_score = score;
+			best = p;
+		}
+	}
+
+	return best;
+}
+
+/*
+ * Pull a task from @src_rq using the PELT-aware task selector.
+ * Double-locks both rqs, picks the best candidate, and migrates it.
+ */
+static bool minlat_balance_pull(struct rq *this_rq, struct rq *src_rq,
+				unsigned long imbalance, bool cross_numa)
+{
+	struct task_struct *p;
+	bool pulled = false;
+
+	double_lock_balance(this_rq, src_rq);
+	update_rq_clock(this_rq);
+	update_rq_clock(src_rq);
+
+	/* Re-check: source needs at least 2 effective tasks to spare one */
+	if (minlat_cpu_eff(src_rq->cpu) < 2)
+		goto unlock;
+
+	p = minlat_pick_balance_task(src_rq, this_rq->cpu,
+				     imbalance, cross_numa);
+	if (!p)
+		goto unlock;
+
+	/* Stamp migration time for cross-NUMA cooldown */
+	if (cross_numa)
+		p->minlat.last_migrate_ts = rq_clock_task(src_rq);
+
+	/* Reset LLC stickiness on cross-LLC migration */
+	if (!cpus_share_cache(src_rq->cpu, this_rq->cpu))
+		p->minlat.llc_runs = 0;
+
+	move_queued_task_locked(src_rq, this_rq, p);
+	pulled = true;
+
+unlock:
+	double_unlock_balance(this_rq, src_rq);
+	return pulled;
+}
+
+/*
+ * Find the busiest CPU in @span by PELT load_avg.
+ * Returns NULL if no CPU is busier than this_rq.
+ */
+static struct rq *
+minlat_find_busiest_rq_pelt(struct rq *this_rq, const struct cpumask *span)
+{
+	struct rq *busiest = NULL;
+	unsigned long busiest_load = minlat_cpu_load(this_rq->cpu);
+	int cpu;
+
+	for_each_cpu(cpu, span) {
+		unsigned long load;
+
+		if (cpu == this_rq->cpu)
+			continue;
+
+		load = minlat_cpu_load(cpu);
+		if (load > busiest_load) {
+			busiest_load = load;
+			busiest = cpu_rq(cpu);
+		}
+	}
+
+	return busiest;
+}
+
+/*
+ * Balance one sched_domain level using PELT load_avg.
+ *
+ * Computes domain-average load and pulls from the busiest CPU
+ * if this CPU is underloaded. Imbalance thresholds prevent
+ * ping-pong for near-balanced states.
+ *
+ * Returns true if a task was migrated.
+ */
+static bool minlat_balance_domain(struct rq *this_rq,
+				  struct sched_domain *sd)
+{
+	const struct cpumask *span = sched_domain_span(sd);
+	bool cross_numa = sd->flags & SD_NUMA;
+	unsigned long this_load, busiest_load, domain_avg;
+	unsigned long total_load = 0, imbalance;
+	unsigned int nr_cpus = 0;
+	struct rq *busiest;
+	int cpu;
+
+	this_load = minlat_cpu_load(this_rq->cpu);
+
+	/* Compute domain average PELT load */
+	for_each_cpu(cpu, span) {
+		total_load += minlat_cpu_load(cpu);
+		nr_cpus++;
+	}
+
+	if (nr_cpus <= 1)
+		return false;
+
+	domain_avg = total_load / nr_cpus;
+
+	/* This CPU must be below domain average to pull */
+	if (this_load >= domain_avg)
+		return false;
+
+	/* Find busiest CPU by PELT load */
+	busiest = minlat_find_busiest_rq_pelt(this_rq, span);
+	if (!busiest)
+		return false;
+
+	busiest_load = minlat_cpu_load(cpu_of(busiest));
+
+	/* Compute imbalance in PELT units */
+	imbalance = busiest_load - this_load;
+
+	/*
+	 * Require meaningful imbalance before migrating.
+	 * Threshold: at least one nice-0 task's weight worth of
+	 * imbalance (1024 PELT units), scaled up for cross-NUMA.
+	 *
+	 * Also require the busiest to have 2+ effective tasks
+	 * (can't pull the only task from a CPU).
+	 */
+	if (imbalance < NICE_0_LOAD)
+		return false;
+
+	if (cross_numa && imbalance < 2 * NICE_0_LOAD)
+		return false;
+
+	if (minlat_cpu_eff(cpu_of(busiest)) < 2)
+		return false;
+
+	return minlat_balance_pull(this_rq, busiest, imbalance, cross_numa);
+}
+
+/*
+ * Active balance: push a task from this overloaded CPU to an idle CPU.
+ * Fallback for when pull-based balancing can't fix the imbalance
+ * (e.g., all underloaded CPUs are idle and didn't trigger idle-pull).
+ *
+ * Only targets idle CPUs — targeting busy CPUs causes stopper storms
+ * that destroy producer-consumer locality in bursty workloads.
+ */
+static void minlat_active_balance_push(struct rq *rq)
 {
 	struct minlat_rq *mrq = &rq->minlat;
 	int this_cpu = cpu_of(rq);
-	unsigned int this_eff;
 	struct sched_domain *sd;
 	int target_cpu = -1;
 
-	if (mrq->nr_running <= mrq->nr_delayed)
-		return;
-
-	this_eff = mrq->nr_running - mrq->nr_delayed;
-
-	if (this_eff < 2)
+	if (minlat_cpu_eff(this_cpu) < 2)
 		return;
 
 	if (mrq->active_balance)
 		return;
-
-	if (time_before(jiffies, mrq->next_balance))
-		return;
-	mrq->next_balance = jiffies + msecs_to_jiffies(32);
 
 	rcu_read_lock();
 	for_each_domain(this_cpu, sd) {
@@ -2808,10 +3111,8 @@ static void minlat_check_balance(struct rq *rq)
 		for_each_cpu(cpu, sched_domain_span(sd)) {
 			if (cpu == this_cpu)
 				continue;
-
 			if (!idle_cpu(cpu))
 				continue;
-
 			target_cpu = cpu;
 			break;
 		}
@@ -2828,6 +3129,81 @@ static void minlat_check_balance(struct rq *rq)
 	stop_one_cpu_nowait(target_cpu,
 			    minlat_active_balance_cpu_stop,
 			    rq, &mrq->active_balance_work);
+}
+
+/*
+ * Main tick-driven balance entry point.
+ *
+ * Walks the sched_domain hierarchy and rebalances at each level
+ * when the per-domain balance interval has elapsed. Uses PELT
+ * load_avg for imbalance detection and LLC-aware scoring for
+ * task selection.
+ *
+ * Falls back to active balance (stopper push) when this CPU
+ * is overloaded and some CPUs are idle.
+ */
+static void minlat_check_balance(struct rq *rq)
+{
+	struct minlat_rq *mrq = &rq->minlat;
+	int this_cpu = cpu_of(rq);
+	struct sched_domain *sd;
+	int cpu_busy;
+	bool pulled = false;
+	unsigned long next_balance = jiffies + 60 * HZ;
+
+	/* Nothing to balance if we have no effective tasks */
+	if (minlat_cpu_eff(this_cpu) == 0)
+		return;
+
+	/* Global rate limit */
+	if (time_before(jiffies, mrq->next_balance))
+		return;
+
+	cpu_busy = !idle_cpu(this_cpu);
+
+	rcu_read_lock();
+	for_each_domain(this_cpu, sd) {
+		unsigned long interval, sd_next;
+
+		interval = minlat_sd_balance_interval(sd, cpu_busy);
+		sd_next = sd->last_balance + interval;
+
+		if (time_before(jiffies, sd_next)) {
+			if (time_before(sd_next, next_balance))
+				next_balance = sd_next;
+			continue;
+		}
+
+		if (minlat_balance_domain(rq, sd)) {
+			pulled = true;
+			sd->last_balance = jiffies;
+			/*
+			 * After a successful pull, recompute interval
+			 * (now busy) and set next check time.
+			 */
+			interval = minlat_sd_balance_interval(sd, 1);
+		}
+
+		sd->last_balance = jiffies;
+		sd_next = jiffies + interval;
+		if (time_before(sd_next, next_balance))
+			next_balance = sd_next;
+
+		/* Only balance at one domain level per tick */
+		if (pulled)
+			break;
+	}
+	rcu_read_unlock();
+
+	mrq->next_balance = next_balance;
+
+	/*
+	 * If periodic balancing didn't pull anything and this CPU is
+	 * overloaded with idle CPUs available, use the CPU stopper
+	 * to push a task. Handles affinity/cache-hot edge cases.
+	 */
+	if (!pulled)
+		minlat_active_balance_push(rq);
 }
 
 /* ==== tick / lifecycle ==== */
