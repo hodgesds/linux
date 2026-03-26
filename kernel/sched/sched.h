@@ -942,6 +942,7 @@ struct minlat_rq {
 
 	/* PELT tracking for schedutil (CPU frequency scaling) */
 	struct sched_avg	avg;
+	unsigned int		util_est;
 
 	/* Active balancing: push tasks from overloaded CPUs */
 	int			active_balance;
@@ -3609,7 +3610,13 @@ static inline unsigned long cpu_util_rt(struct rq *rq)
 #ifdef CONFIG_SCHED_CLASS_MINLAT
 static inline unsigned long cpu_util_minlat(struct rq *rq)
 {
-	return READ_ONCE(rq->minlat.avg.util_avg);
+	unsigned long util = READ_ONCE(rq->minlat.avg.util_avg);
+
+	if (sched_feat(UTIL_EST))
+		util = max_t(unsigned long, util,
+			     READ_ONCE(rq->minlat.util_est));
+
+	return util;
 }
 #else
 static inline unsigned long cpu_util_minlat(struct rq *rq)

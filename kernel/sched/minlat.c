@@ -159,7 +159,142 @@ static inline unsigned long minlat_capacity_of(int cpu)
  *   load_sum/load_avg  - weight-scaled running time
  *   runnable_sum/avg   - time spent runnable (waiting + running)
  *   util_sum/util_avg  - actual running time (CPU utilization, 0-1024)
+ *   util_est           - estimated utilization across sleep/wake cycles
  */
+
+/* ==== UTIL_EST: utilization estimation across sleep/wake ==== */
+
+/*
+ * When a task sleeps, PELT decays util_avg toward 0. Without UTIL_EST,
+ * a task waking after a brief sleep gets placed on a slow CPU because
+ * the scheduler sees low util. UTIL_EST remembers a task's utilization
+ * across sleep/wake cycles:
+ *
+ * - On dequeue (sleep): update per-task EWMA of utilization
+ * - On enqueue (wake):  use max(util_avg, util_est) for placement
+ * - Per-rq util_est:    sum of enqueued tasks' util_est values
+ *
+ * The EWMA uses instant ramp-up (new > old → use new directly) and
+ * exponential smoothing on decrease (w=1/4), matching CFS behavior.
+ */
+
+#define MINLAT_UTIL_EST_MARGIN (SCHED_CAPACITY_SCALE / 100)
+
+/*
+ * Clear the UTIL_AVG_UNCHANGED flag when PELT updates util_avg.
+ * This synchronizes util_est updates with actual PELT changes —
+ * if util_avg didn't change during an activation, skip the
+ * util_est update at dequeue to avoid noise.
+ */
+static inline void minlat_se_util_change(struct sched_avg *avg)
+{
+	unsigned int enqueued;
+
+	if (!sched_feat(UTIL_EST))
+		return;
+
+	enqueued = avg->util_est;
+	if (!(enqueued & UTIL_AVG_UNCHANGED))
+		return;
+
+	enqueued &= ~UTIL_AVG_UNCHANGED;
+	WRITE_ONCE(avg->util_est, enqueued);
+}
+
+static inline unsigned long minlat_task_util_est(struct task_struct *p)
+{
+	return max(READ_ONCE(p->minlat.avg.util_avg),
+		   READ_ONCE(p->minlat.avg.util_est) & ~UTIL_AVG_UNCHANGED);
+}
+
+static inline unsigned long _minlat_task_util_est(struct task_struct *p)
+{
+	return READ_ONCE(p->minlat.avg.util_est) & ~UTIL_AVG_UNCHANGED;
+}
+
+static void minlat_util_est_enqueue(struct rq *rq, struct task_struct *p)
+{
+	unsigned int enqueued;
+
+	if (!sched_feat(UTIL_EST))
+		return;
+
+	enqueued = rq->minlat.util_est;
+	enqueued += _minlat_task_util_est(p);
+	WRITE_ONCE(rq->minlat.util_est, enqueued);
+}
+
+static void minlat_util_est_dequeue(struct rq *rq, struct task_struct *p)
+{
+	unsigned int enqueued;
+
+	if (!sched_feat(UTIL_EST))
+		return;
+
+	enqueued = rq->minlat.util_est;
+	enqueued -= min_t(unsigned int, enqueued, _minlat_task_util_est(p));
+	WRITE_ONCE(rq->minlat.util_est, enqueued);
+}
+
+static void minlat_util_est_update(struct rq *rq, struct task_struct *p,
+				   bool task_sleep)
+{
+	unsigned int ewma, dequeued, last_ewma_diff;
+
+	if (!sched_feat(UTIL_EST))
+		return;
+
+	/* Only update when the task is going to sleep */
+	if (!task_sleep)
+		return;
+
+	ewma = READ_ONCE(p->minlat.avg.util_est);
+
+	/*
+	 * If PELT values haven't changed since enqueue,
+	 * skip the update to avoid noise.
+	 */
+	if (ewma & UTIL_AVG_UNCHANGED)
+		return;
+
+	/* Get current utilization at dequeue time */
+	dequeued = READ_ONCE(p->minlat.avg.util_avg);
+
+	/*
+	 * Instant ramp-up: if utilization increased, use the new
+	 * value directly. EWMA smoothing only applies to decreases.
+	 */
+	if (ewma <= dequeued) {
+		ewma = dequeued;
+		goto done;
+	}
+
+	/*
+	 * Skip update if already within ~1% of last activation value.
+	 */
+	last_ewma_diff = ewma - dequeued;
+	if (last_ewma_diff < MINLAT_UTIL_EST_MARGIN)
+		goto done;
+
+	/*
+	 * Skip update if the task didn't get all CPU time it wanted
+	 * (runnable_avg >> util_avg means contention, not lower demand).
+	 */
+	if ((dequeued + MINLAT_UTIL_EST_MARGIN) <
+	    READ_ONCE(p->minlat.avg.runnable_avg))
+		goto done;
+
+	/*
+	 * EWMA with w=1/4: smooths utilization decreases.
+	 * ewma(t) = 1/4 * util + 3/4 * ewma(t-1)
+	 */
+	ewma <<= UTIL_EST_WEIGHT_SHIFT;
+	ewma  -= last_ewma_diff;
+	ewma >>= UTIL_EST_WEIGHT_SHIFT;
+done:
+	ewma |= UTIL_AVG_UNCHANGED;
+	WRITE_ONCE(p->minlat.avg.util_est, ewma);
+}
 
 /*
  * Update per-entity PELT for a minlat task.
@@ -187,6 +322,7 @@ static int update_minlat_se_load_avg(u64 now, struct rq *rq,
 			       !!me->on_rq,
 			       rq->minlat.curr == me)) {
 		___update_load_avg(&me->avg, scale_load_down(me->load.weight));
+		minlat_se_util_change(&me->avg);
 		return 1;
 	}
 	return 0;
@@ -222,7 +358,7 @@ static void update_minlat_load_avg(struct rq *rq, struct sched_minlat_entity *me
  */
 static inline int minlat_util_fits_cpu(struct task_struct *p, int cpu)
 {
-	unsigned long util = READ_ONCE(p->minlat.avg.util_avg);
+	unsigned long util = minlat_task_util_est(p);
 	unsigned long capacity = arch_scale_cpu_capacity(cpu);
 	bool fits;
 
@@ -614,6 +750,7 @@ void init_minlat_rq(struct minlat_rq *minlat_rq)
 	minlat_rq->min_vruntime = 0;
 	minlat_rq->load_weight = 0;
 	memset(&minlat_rq->avg, 0, sizeof(minlat_rq->avg));
+	minlat_rq->util_est = 0;
 	minlat_rq->active_balance = 0;
 	minlat_rq->push_cpu = 0;
 	minlat_rq->next_balance = 0;
@@ -847,12 +984,24 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	 * This is called from ttwu_runnable() when a task with
 	 * p->se.sched_delayed wakes up on the same CPU. O(1) wakeup!
 	 */
+	/*
+	 * ENQUEUE_DELAYED: re-enable a delayed entity that was kept on
+	 * the rq. Its util_est is already accounted in the rq sum
+	 * (never removed during delayed dequeue), so skip util_est_enqueue.
+	 */
 	if (flags & ENQUEUE_DELAYED) {
 		WARN_ON_ONCE(!p->se.sched_delayed);
 		p->se.sched_delayed = 0;
 		minlat_rq->nr_delayed--;
 		return;
 	}
+
+	/*
+	 * Add task's estimated utilization to the rq sum before
+	 * the PELT update, so schedutil sees the boost immediately.
+	 */
+	if (!p->se.sched_delayed)
+		minlat_util_est_enqueue(rq, p);
 
 	if (!me->on_rq) {
 		/*
@@ -902,6 +1051,16 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 
 	if (minlat_rq->next == me)
 		minlat_rq->next = NULL;
+
+	/*
+	 * Remove task's util_est from rq sum unless the task is being
+	 * delayed (delayed tasks stay on rq, their util_est stays too).
+	 */
+	if (!p->se.sched_delayed)
+		minlat_util_est_dequeue(rq, p);
+
+	/* Update the per-task EWMA (only meaningful when going to sleep) */
+	minlat_util_est_update(rq, p, flags & DEQUEUE_SLEEP);
 
 	/*
 	 * Delayed dequeue: keep sleeping curr on the runqueue to avoid
