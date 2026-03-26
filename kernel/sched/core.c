@@ -4439,6 +4439,7 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 	p->minlat.total_sleep_ns = 0;
 	p->minlat.total_run_ns = 0;
 	p->minlat.interactive = 0;
+	minlat_init_latency_nice(&p->minlat, p->minlat.latency_nice);
 #endif
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS

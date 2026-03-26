@@ -783,9 +783,17 @@ struct sched_minlat_entity {
 	/* LLC stickiness: runs on current LLC since last migration */
 	unsigned int			llc_runs;
 
+	/* Latency nice: -20 (latency-sensitive) to 19 (throughput) */
+	int				latency_nice;
+	unsigned int			latency_weight; /* from nice weight table */
+	u32				latency_wmult;  /* inverse weight (2^32/w) */
+
 	/* PELT tracking for task placement and load balancing */
 	struct sched_avg		avg;
 };
+
+#define MIN_LATENCY_NICE	(-20)
+#define MAX_LATENCY_NICE	19
 #endif
 
 #ifdef CONFIG_UCLAMP_TASK

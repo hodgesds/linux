@@ -133,6 +133,42 @@ unsigned int minlat_llc_stickiness = 1;
 #define MINLAT_LATENCY_NS		minlat_latency_ns
 #define MINLAT_MIN_GRANULARITY_NS	minlat_min_granularity_ns
 
+/*
+ * Latency nice: weight-based scaling helpers.
+ *
+ * latency_nice maps to the nice weight table (sched_prio_to_weight[]),
+ * giving exponential (~1.25x per step) scaling. This is load-aware
+ * since vruntime already encodes weight-based fairness.
+ *
+ * minlat_latency_thresh(): preemption/min_gran threshold scaling
+ *   result = base * 1024 / latency_weight
+ *   Uses inverse weight (wmult) to avoid division on the hot path.
+ *   -20 (weight=88761): base * 0.012  → ~12us for 1ms base
+ *     0 (weight=1024):  base * 1.0    → base unchanged
+ *    19 (weight=15):    base * 68     → ~68ms for 1ms base
+ *
+ * minlat_latency_credit(): wakeup placement credit scaling
+ *   result = base * latency_weight / 1024, capped at 2*base
+ *   -20: 2*base (capped)
+ *     0: base
+ *    19: base/68
+ */
+static __always_inline u64
+minlat_latency_thresh(u64 base, u32 wmult)
+{
+	return mul_u64_u32_shr(base, wmult, 22);
+}
+
+static __always_inline u64
+minlat_latency_credit(u64 base, unsigned int weight)
+{
+	u64 credit = ((u64)base * weight) >> 10;
+
+	return min_t(u64, credit, 2 * base);
+}
+
+/* minlat_init_latency_nice() defined in sched.h for cross-file access */
+
 /* ---- capacity helpers (big.LITTLE support) ---- */
 
 /*
@@ -839,17 +875,21 @@ static void place_minlat_entity(struct minlat_rq *minlat_rq,
 
 	if (flags & ENQUEUE_WAKEUP) {
 		/*
-		 * Give waking tasks a half-latency credit so they run
-		 * soon after wakeup. For weight 1024 (nice 0 / minlat
-		 * prio 5), thresh == LATENCY/2 directly — skip the
-		 * weighted calculation.
+		 * Give waking tasks a vruntime credit so they run soon
+		 * after wakeup. Base credit is half the latency target,
+		 * scaled by the nice weight table via latency_nice:
+		 *   -20: 2x credit (capped) → runs soonest
+		 *     0: 1x credit          → normal
+		 *    19: ~1/68 credit        → minimal boost
 		 */
+		u64 credit = minlat_latency_credit(MINLAT_LATENCY_NS / 2,
+						   me->latency_weight);
 		u64 thresh;
 
 		if (likely(me->load.weight == scale_load(1024)))
-			thresh = MINLAT_LATENCY_NS / 2;
+			thresh = credit;
 		else
-			thresh = minlat_calc_delta(MINLAT_LATENCY_NS / 2, me);
+			thresh = minlat_calc_delta(credit, me);
 
 		vruntime -= min(vruntime, thresh);
 	}
@@ -939,13 +979,24 @@ static void check_preempt_tick_minlat(struct rq *rq, struct task_struct *curr)
 
 	/*
 	 * Minimum running time protection. Don't preempt until the
-	 * task has run for at least min_granularity. This prevents
-	 * thrashing from rapid preemption while keeping latency low.
+	 * task has run for at least min_granularity. Scaled by the
+	 * current task's latency weight (from nice weight table):
+	 *   -20: min_gran ≈ 6us   → clamped to 125us (floor)
+	 *     0: min_gran = 500us → default
+	 *    19: min_gran ≈ 34ms  → clamped to 2ms (ceiling)
 	 */
 	delta_exec = curr->se.sum_exec_runtime -
 		     curr->se.prev_sum_exec_runtime;
-	if (delta_exec < MINLAT_MIN_GRANULARITY_NS)
-		return;
+	{
+		u64 min_gran = minlat_latency_thresh(
+					MINLAT_MIN_GRANULARITY_NS,
+					curr_me->latency_wmult);
+		min_gran = clamp_t(u64, min_gran,
+				   MINLAT_MIN_GRANULARITY_NS / 4,
+				   4 * MINLAT_MIN_GRANULARITY_NS);
+		if (delta_exec < min_gran)
+			return;
+	}
 
 	/*
 	 * Current entity is out of the tree — find the first
@@ -1304,32 +1355,38 @@ wakeup_preempt_minlat(struct rq *rq, struct task_struct *p, int flags)
 	/*
 	 * Preempt if the wakee has a vruntime advantage.
 	 *
-	 * Very light load (at most 2 effective runnable tasks):
-	 * preempt immediately unless curr just started running.
-	 * Tasks that have run < min_granularity are protected from
-	 * wakeup preemption — this prevents preempting tasks in
-	 * tight syscall loops (like futex_wake batch waking pinned
-	 * threads) while still allowing prompt scheduling for
-	 * compute tasks that have been running for a while.
-	 * The woken task's buddy status ensures it runs next when
-	 * curr voluntarily sleeps (no tick wait needed).
+	 * Thresholds scaled by the wakee's latency weight (from nice
+	 * weight table via latency_nice). Uses inverse weight (wmult)
+	 * for division-free hot path:
+	 *   -20 (w=88761): thresh ≈ base/87  → ~12us, always preempt
+	 *     0 (w=1024):  thresh = base     → default behavior
+	 *    19 (w=15):    thresh ≈ base*68  → ~68ms, rarely preempt
 	 *
-	 * Heavier load: require a significant vruntime advantage
-	 * (threshold) and use resched_curr_lazy to avoid IPI
-	 * storms in IPC-heavy workloads like hackbench.
+	 * Light load (eff ≤ 2): scale min_granularity by wakee weight.
+	 * Heavy load (eff > 2): scale preemption threshold + lazy resched.
 	 */
 	if (delta > 0) {
 		unsigned int eff = minlat_rq->nr_running -
 				   minlat_rq->nr_delayed;
+		u32 wmult = p->minlat.latency_wmult;
 
 		if (eff <= 2) {
 			u64 ran = curr->se.sum_exec_runtime -
 				  curr->se.prev_sum_exec_runtime;
+			u64 min_gran = minlat_latency_thresh(
+					MINLAT_MIN_GRANULARITY_NS,
+					wmult);
 
-			if (ran >= MINLAT_MIN_GRANULARITY_NS)
+			if (ran >= min_gran)
 				resched_curr(rq);
-		} else if (delta > (s64)minlat_wakeup_preempt_thresh_ns)
-			resched_curr_lazy(rq);
+		} else {
+			u64 thresh = minlat_latency_thresh(
+					minlat_wakeup_preempt_thresh_ns,
+					wmult);
+
+			if (delta > (s64)thresh)
+				resched_curr_lazy(rq);
+		}
 	}
 }
 

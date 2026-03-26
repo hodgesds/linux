@@ -259,6 +259,16 @@ static void __setscheduler_params(struct task_struct *p,
 		p->minlat.minlat_prio = attr->sched_priority;
 #endif
 
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	/* Set latency_nice for any task running under minlat */
+	if ((fair_policy(policy) && minlat_enabled()) ||
+	    minlat_policy(policy))
+		minlat_init_latency_nice(&p->minlat,
+					 clamp(attr->sched_latency_nice,
+					       MIN_LATENCY_NICE,
+					       MAX_LATENCY_NICE));
+#endif
+
 	/* rt-policy and minlat tasks do not have a timerslack */
 	if (rt_or_dl_task_policy(p) || minlat_policy(p->policy)) {
 		p->timer_slack_ns = 0;
@@ -608,6 +618,15 @@ recheck:
 			goto change;
 		if (dl_policy(policy) && dl_param_changed(p, attr))
 			goto change;
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+		if (minlat_policy(policy) &&
+		    attr->sched_priority != p->minlat.minlat_prio)
+			goto change;
+		if (((fair_policy(policy) && minlat_enabled()) ||
+		     minlat_policy(policy)) &&
+		    attr->sched_latency_nice != p->minlat.latency_nice)
+			goto change;
+#endif
 		if (attr->sched_flags & SCHED_FLAG_UTIL_CLAMP)
 			goto change;
 
@@ -916,6 +935,12 @@ static int sched_copy_attr(struct sched_attr __user *uattr, struct sched_attr *a
 	 */
 	attr->sched_nice = clamp(attr->sched_nice, MIN_NICE, MAX_NICE);
 
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	attr->sched_latency_nice = clamp(attr->sched_latency_nice,
+					 (s32)MIN_LATENCY_NICE,
+					 (s32)MAX_LATENCY_NICE);
+#endif
+
 	return 0;
 
 err_size:
@@ -937,6 +962,13 @@ static void get_params(struct task_struct *p, struct sched_attr *attr)
 		attr->sched_nice = task_nice(p);
 		attr->sched_runtime = p->se.slice;
 	}
+
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	/* Return latency_nice for any task running under minlat */
+	if ((fair_policy(p->policy) && minlat_enabled()) ||
+	    minlat_policy(p->policy))
+		attr->sched_latency_nice = p->minlat.latency_nice;
+#endif
 }
 
 /**

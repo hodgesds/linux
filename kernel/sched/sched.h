@@ -2766,6 +2766,15 @@ static inline bool minlat_enabled(void)
 {
 	return static_branch_likely(&sched_minlat_enabled);
 }
+static inline void minlat_init_latency_nice(struct sched_minlat_entity *me,
+					    int latency_nice)
+{
+	unsigned int idx = latency_nice - MIN_LATENCY_NICE;
+
+	me->latency_nice = latency_nice;
+	me->latency_weight = sched_prio_to_weight[idx];
+	me->latency_wmult = sched_prio_to_wmult[idx];
+}
 #else
 static inline bool minlat_enabled(void) { return false; }
 #endif
