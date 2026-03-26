@@ -546,6 +546,9 @@ void init_minlat_rq(struct minlat_rq *minlat_rq)
 	minlat_rq->nr_delayed = 0;
 	minlat_rq->min_vruntime = 0;
 	minlat_rq->load_weight = 0;
+	minlat_rq->active_balance = 0;
+	minlat_rq->push_cpu = 0;
+	minlat_rq->next_balance = 0;
 }
 
 /* ==== rb-tree operations ==== */
@@ -2330,6 +2333,179 @@ balance_minlat(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 	return minlat_rq->nr_running > 0;
 }
 
+/* ==== active balancing (push from overloaded CPUs) ==== */
+
+/*
+ * Pick a task from @src_rq that can be pushed to @target_cpu.
+ * Walks the rb-tree from the right (highest vruntime = most starved)
+ * to find a migratable task. Active balance is a last resort, so
+ * we skip cache-hot and LLC stickiness checks — the imbalance is
+ * more important than cache warmth.
+ */
+static struct task_struct *
+minlat_pick_pushable_task(struct rq *src_rq, int target_cpu)
+{
+	struct rb_node *node;
+	struct sched_minlat_entity *me;
+	struct task_struct *p;
+	int scanned = 0;
+
+	for (node = rb_last(&src_rq->minlat.tasks_timeline.rb_root);
+	     node && scanned < 4; node = rb_prev(node), scanned++) {
+		me = rb_entry(node, struct sched_minlat_entity, run_node);
+		p = container_of(me, struct task_struct, minlat);
+
+		if (p->se.sched_delayed)
+			continue;
+
+		if (is_migration_disabled(p))
+			continue;
+
+		if (!cpumask_test_cpu(target_cpu, p->cpus_ptr))
+			continue;
+
+		return p;
+	}
+	return NULL;
+}
+
+/*
+ * CPU stopper callback: push a task from this (overloaded) CPU
+ * to the target CPU recorded in push_cpu.
+ *
+ * Runs on the overloaded CPU via stop_one_cpu_nowait(). The stopper
+ * preempts the current task, allowing us to pick and migrate a
+ * queued task. Mirrors CFS's active_load_balance_cpu_stop().
+ */
+/*
+ * CPU stopper callback: runs on the TARGET (idle) CPU, pulls a task
+ * from the overloaded source CPU.
+ *
+ * We run the stopper on the target instead of the source to avoid a
+ * deadlock: task_tick_minlat holds the source rq lock, and calling
+ * stop_one_cpu_nowait on the same CPU would try to wake the stopper
+ * thread, which needs the rq lock → deadlock. Running on the target
+ * (different CPU) avoids this.
+ */
+static int minlat_active_balance_cpu_stop(void *data)
+{
+	struct rq *src_rq = data;
+	struct minlat_rq *src_mrq = &src_rq->minlat;
+	int src_cpu = cpu_of(src_rq);
+	int target_cpu = smp_processor_id();
+	struct rq *target_rq = cpu_rq(target_cpu);
+	struct task_struct *p = NULL;
+	struct rq_flags rf;
+
+	/* Lock the source rq to pick and detach a task */
+	rq_lock_irq(src_rq, &rf);
+
+	if (!cpu_active(src_cpu) || !cpu_active(target_cpu))
+		goto out_unlock;
+
+	if (!src_mrq->active_balance)
+		goto out_unlock;
+
+	/* Source needs at least 2 effective tasks to give one away */
+	if (src_mrq->nr_running <= src_mrq->nr_delayed ||
+	    src_mrq->nr_running - src_mrq->nr_delayed < 2)
+		goto out_unlock;
+
+	p = minlat_pick_pushable_task(src_rq, target_cpu);
+	if (!p)
+		goto out_unlock;
+
+	/* Detach: dequeue from source rq, set new CPU */
+	update_rq_clock(src_rq);
+	deactivate_task(src_rq, p, DEQUEUE_NOCLOCK);
+	set_task_cpu(p, target_cpu);
+
+	/* Reset LLC stickiness on cross-LLC migration */
+	if (!cpus_share_cache(src_cpu, target_cpu))
+		p->minlat.llc_runs = 0;
+
+out_unlock:
+	src_mrq->active_balance = 0;
+	rq_unlock(src_rq, &rf);
+
+	if (p) {
+		/* Attach: enqueue on target (this) rq */
+		rq_lock(target_rq, &rf);
+		update_rq_clock(target_rq);
+		activate_task(target_rq, p, 0);
+		wakeup_preempt(target_rq, p, 0);
+		rq_unlock(target_rq, &rf);
+	}
+
+	local_irq_enable();
+	return 0;
+}
+
+/*
+ * Tick-driven active balance check. Called from task_tick_minlat.
+ *
+ * Handles the case where idle-pull failed: this CPU has 2+ tasks
+ * but some CPUs are idle. This can happen when all pushable tasks
+ * are cache-hot, migration-disabled, or have restrictive affinity.
+ *
+ * Only targets IDLE CPUs. If all CPUs are busy, wakeup balancing
+ * and natural placement distribute work without the overhead of
+ * CPU stopper migrations (which disrupt producer-consumer locality).
+ *
+ * Rate-limited to once per ~32ms to keep tick overhead low.
+ */
+static void minlat_check_balance(struct rq *rq)
+{
+	struct minlat_rq *mrq = &rq->minlat;
+	int this_cpu = cpu_of(rq);
+	unsigned int this_eff;
+	struct sched_domain *sd;
+	int target_cpu = -1;
+
+	if (mrq->nr_running <= mrq->nr_delayed)
+		return;
+
+	this_eff = mrq->nr_running - mrq->nr_delayed;
+
+	if (this_eff < 2)
+		return;
+
+	if (mrq->active_balance)
+		return;
+
+	if (time_before(jiffies, mrq->next_balance))
+		return;
+	mrq->next_balance = jiffies + msecs_to_jiffies(32);
+
+	rcu_read_lock();
+	for_each_domain(this_cpu, sd) {
+		int cpu;
+
+		for_each_cpu(cpu, sched_domain_span(sd)) {
+			if (cpu == this_cpu)
+				continue;
+
+			if (!idle_cpu(cpu))
+				continue;
+
+			target_cpu = cpu;
+			break;
+		}
+		if (target_cpu >= 0)
+			break;
+	}
+	rcu_read_unlock();
+
+	if (target_cpu < 0)
+		return;
+
+	mrq->active_balance = 1;
+	mrq->push_cpu = target_cpu;
+	stop_one_cpu_nowait(target_cpu,
+			    minlat_active_balance_cpu_stop,
+			    rq, &mrq->active_balance_work);
+}
+
 /* ==== tick / lifecycle ==== */
 
 static void task_tick_minlat(struct rq *rq, struct task_struct *p, int queued)
@@ -2353,6 +2529,9 @@ static void task_tick_minlat(struct rq *rq, struct task_struct *p, int queued)
 	/* Drive NUMA page scanning */
 	if (static_branch_unlikely(&sched_numa_balancing))
 		minlat_task_tick_numa(rq, p);
+
+	/* Active balance: push tasks from overloaded CPUs */
+	minlat_check_balance(rq);
 }
 
 static void task_dead_minlat(struct task_struct *p)

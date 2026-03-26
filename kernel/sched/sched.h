@@ -939,6 +939,12 @@ struct minlat_rq {
 	u64			min_vruntime;
 	unsigned long		load_weight;
 	bool			overloaded;
+
+	/* Active balancing: push tasks from overloaded CPUs */
+	int			active_balance;
+	int			push_cpu;
+	struct cpu_stop_work	active_balance_work;
+	unsigned long		next_balance;
 };
 
 #endif /* CONFIG_SCHED_CLASS_MINLAT */
