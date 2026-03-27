@@ -5951,6 +5951,11 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 	 */
 	if (!sched_class_above(prev->sched_class, &minlat_sched_class) &&
 	    rq->nr_running == rq->minlat.nr_running + rq->cfs.h_nr_queued) {
+#ifdef CONFIG_CFS_BANDWIDTH
+		/* Bandwidth throttle pending — fall to slow path */
+		if (unlikely(rq->minlat.bw_needs_throttle))
+			goto restart;
+#endif
 		if (rq->minlat.nr_running) {
 			struct sched_minlat_entity *me;
 			struct rb_node *left;

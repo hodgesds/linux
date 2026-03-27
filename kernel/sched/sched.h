@@ -959,6 +959,7 @@ struct minlat_rq {
 #ifdef CONFIG_CFS_BANDWIDTH
 	struct list_head	bw_throttled_tasks;
 	int			nr_bw_throttled;
+	bool			bw_needs_throttle;
 #endif
 };
 

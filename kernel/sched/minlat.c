@@ -1255,6 +1255,45 @@ __dequeue_minlat_entity(struct minlat_rq *minlat_rq,
 #define MINLAT_BW_SLICE		(5 * NSEC_PER_MSEC)
 
 /*
+ * Check if tg is an ancestor of (or equal to) child_tg.
+ * Used for hierarchical throttle matching: when parent tg is throttled,
+ * all descendant tasks must also be throttled.
+ */
+static inline bool minlat_tg_is_descendant(struct task_group *child_tg,
+					   struct task_group *ancestor_tg)
+{
+	struct task_group *tg;
+
+	for (tg = child_tg; tg != &root_task_group; tg = tg->parent) {
+		if (tg == ancestor_tg)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Check if this task's tg or any ancestor is bandwidth-throttled
+ * on the given CPU. Uses throttle_count for O(1) check — maintained
+ * by minlat_tg_throttle_down() (increment) and tg_unthrottle_up()
+ * (decrement) during throttle/unthrottle.
+ *
+ * throttle_count > 0 means this cfs_rq's tg or some ancestor is
+ * currently throttled.
+ */
+static inline bool minlat_any_ancestor_throttled(struct task_struct *p,
+						 int cpu)
+{
+	struct task_group *tg = task_group(p);
+	struct cfs_rq *cfs_rq;
+
+	if (tg == &root_task_group)
+		return false;
+
+	cfs_rq = tg->cfs_rq[cpu];
+	return cfs_rq->throttle_count > 0;
+}
+
+/*
  * Try to borrow runtime from the global cfs_bandwidth pool.
  * Returns true if runtime_remaining > 0 after borrowing.
  */
@@ -1288,39 +1327,64 @@ static int minlat_assign_bw_runtime(struct cfs_bandwidth *cfs_b,
 
 /*
  * Account bandwidth runtime consumption in update_curr_minlat.
- * Deducts delta_exec from the per-CPU per-tg runtime. If exhausted,
- * tries to borrow more. If borrow fails, triggers a reschedule so
- * pick_task can throttle.
+ * Walks up the task group hierarchy, deducting delta_exec at every
+ * ancestor that has bandwidth configured. If any level exhausts its
+ * runtime and can't borrow more, triggers a reschedule so pick_task
+ * can throttle.
  */
 static void minlat_account_bw_runtime(struct rq *rq, struct task_struct *p,
 				      u64 delta_exec)
 {
-	struct task_group *tg;
-	struct cfs_bandwidth *cfs_b;
-	struct cfs_rq *cfs_rq;
+	struct task_group *tg = task_group(p);
+	int cpu = cpu_of(rq);
+	bool need_resched = false;
 
-	tg = task_group(p);
-	if (tg == &root_task_group)
+	/* Fast path: most tasks are in root_task_group (no bandwidth) */
+	if (likely(tg == &root_task_group))
 		return;
 
-	cfs_b = &tg->cfs_bandwidth;
-	if (cfs_b->quota == RUNTIME_INF)
-		return;
+	for (; tg != &root_task_group; tg = tg->parent) {
+		struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
+		struct cfs_rq *cfs_rq;
 
-	cfs_rq = tg->cfs_rq[cpu_of(rq)];
-	if (!cfs_rq->runtime_enabled)
-		return;
+		if (cfs_b->quota == RUNTIME_INF)
+			continue;
 
-	cfs_rq->runtime_remaining -= delta_exec;
+		cfs_rq = tg->cfs_rq[cpu];
+		if (!cfs_rq->runtime_enabled)
+			continue;
 
-	if (likely(cfs_rq->runtime_remaining > 0))
-		return;
+		cfs_rq->runtime_remaining -= delta_exec;
 
-	if (cfs_rq->throttled)
-		return;
+		if (likely(cfs_rq->runtime_remaining > 0))
+			continue;
 
-	if (!minlat_assign_bw_runtime(cfs_b, cfs_rq) && likely(rq->curr == p))
+		if (cfs_rq->throttled)
+			continue;
+
+		if (!minlat_assign_bw_runtime(cfs_b, cfs_rq))
+			need_resched = true;
+	}
+
+	if (need_resched && likely(rq->curr == p)) {
+		rq->minlat.bw_needs_throttle = true;
 		resched_curr(rq);
+	}
+}
+
+/*
+ * Increment throttle_count on descendant cfs_rqs.
+ * Pairs with tg_unthrottle_up() in unthrottle_cfs_rq() which decrements.
+ * Without this, unthrottle would decrement throttle_count that was never
+ * incremented, causing unbounded negative drift.
+ */
+static int minlat_tg_throttle_down(struct task_group *tg, void *data)
+{
+	struct rq *rq = data;
+	struct cfs_rq *cfs_rq = tg->cfs_rq[cpu_of(rq)];
+
+	cfs_rq->throttle_count++;
+	return 0;
 }
 
 /*
@@ -1355,14 +1419,19 @@ static void minlat_throttle_tg_cpu(struct rq *rq, struct task_group *tg)
 	cfs_rq->throttled = 1;
 	cfs_rq->throttled_clock = rq_clock(rq);
 
-	/* Dequeue all minlat tasks belonging to this tg */
+	/* Propagate throttle_count to descendants (pairs with tg_unthrottle_up) */
+	rcu_read_lock();
+	walk_tg_tree_from(tg, minlat_tg_throttle_down, tg_nop, (void *)rq);
+	rcu_read_unlock();
+
+	/* Dequeue all minlat tasks belonging to this tg or its descendants */
 	for (node = rb_first_cached(&minlat_rq->tasks_timeline);
 	     node; node = next) {
 		next = rb_next(node);
 		me = rb_entry(node, struct sched_minlat_entity, run_node);
 		p = container_of(me, struct task_struct, minlat);
 
-		if (task_group(p) != tg)
+		if (!minlat_tg_is_descendant(task_group(p), tg))
 			continue;
 
 		__dequeue_minlat_entity(minlat_rq, me);
@@ -1375,10 +1444,10 @@ static void minlat_throttle_tg_cpu(struct rq *rq, struct task_group *tg)
 		sub_nr_running(rq, 1);
 	}
 
-	/* Also throttle curr if it belongs to this tg (out-of-tree) */
+	/* Also throttle curr if it belongs to this tg or descendant */
 	if (minlat_rq->curr) {
 		p = container_of(minlat_rq->curr, struct task_struct, minlat);
-		if (task_group(p) == tg) {
+		if (minlat_tg_is_descendant(task_group(p), tg)) {
 			me = minlat_rq->curr;
 			minlat_rq->curr = NULL;
 			me->bw_throttled = 1;
@@ -1400,15 +1469,20 @@ static void minlat_throttle_tg_cpu(struct rq *rq, struct task_group *tg)
 }
 
 /*
- * Unthrottle minlat tasks of a task group on this CPU.
- * Called from unthrottle_cfs_rq() hook when the period timer
- * replenishes runtime.
+ * Unthrottle minlat tasks when a task group's bandwidth is replenished.
+ * Called from unthrottle_cfs_rq() hook when the period timer refills runtime.
+ *
+ * Hierarchical: only re-enqueue a task if NO ancestor of its tg is still
+ * throttled on this CPU. A task in child_tg may have been throttled because
+ * parent_tg ran out — unthrottling parent_tg allows the child's tasks to
+ * run again, but only if child_tg itself isn't also throttled.
  */
 void minlat_unthrottle_bw(struct rq *rq, struct task_group *tg)
 {
 	struct minlat_rq *minlat_rq = &rq->minlat;
 	struct sched_minlat_entity *me, *tmp;
 	struct task_struct *p;
+	int cpu = cpu_of(rq);
 
 	if (!minlat_rq->nr_bw_throttled)
 		return;
@@ -1417,7 +1491,19 @@ void minlat_unthrottle_bw(struct rq *rq, struct task_group *tg)
 				 bw_throttled_node) {
 		p = container_of(me, struct task_struct, minlat);
 
-		if (task_group(p) != tg)
+		/*
+		 * Only consider tasks that are descendants of the tg
+		 * being unthrottled (includes exact match).
+		 */
+		if (!minlat_tg_is_descendant(task_group(p), tg))
+			continue;
+
+		/*
+		 * Don't re-enqueue if any other ancestor is still throttled.
+		 * This handles the case where a parent is unthrottled but
+		 * the task's own tg is still throttled, or vice versa.
+		 */
+		if (minlat_any_ancestor_throttled(p, cpu))
 			continue;
 
 		list_del_init(&me->bw_throttled_node);
@@ -1439,52 +1525,51 @@ void minlat_unthrottle_bw(struct rq *rq, struct task_group *tg)
 }
 
 /*
- * Check if the current task's tg needs throttling.
+ * Check if the current task's tg (or any ancestor) needs throttling.
  * Called from pick_task_minlat before picking the next task.
+ * Walks up the hierarchy and throttles at the first exhausted level.
  */
 static void minlat_check_bw_throttle(struct rq *rq)
 {
 	struct task_struct *curr = rq->curr;
 	struct task_group *tg;
-	struct cfs_rq *cfs_rq;
+	int cpu = cpu_of(rq);
+
+	rq->minlat.bw_needs_throttle = false;
 
 	if (curr->sched_class != &minlat_sched_class)
 		return;
 
-	tg = task_group(curr);
-	if (tg == &root_task_group)
-		return;
+	for (tg = task_group(curr); tg != &root_task_group; tg = tg->parent) {
+		struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
+		struct cfs_rq *cfs_rq = tg->cfs_rq[cpu];
 
-	cfs_rq = tg->cfs_rq[cpu_of(rq)];
-	if (!cfs_rq->runtime_enabled || cfs_rq->throttled)
-		return;
+		if (cfs_b->quota == RUNTIME_INF)
+			continue;
 
-	if (cfs_rq->runtime_remaining > 0)
-		return;
+		if (!cfs_rq->runtime_enabled || cfs_rq->throttled)
+			continue;
 
-	/* Try one last borrow */
-	if (minlat_assign_bw_runtime(&tg->cfs_bandwidth, cfs_rq))
-		return;
+		if (cfs_rq->runtime_remaining > 0)
+			continue;
 
-	minlat_throttle_tg_cpu(rq, tg);
+		/* Try one last borrow */
+		if (minlat_assign_bw_runtime(cfs_b, cfs_rq))
+			continue;
+
+		minlat_throttle_tg_cpu(rq, tg);
+		return;
+	}
 }
 
 /*
- * Check if a task's tg is bandwidth-throttled on the given CPU.
- * Used by enqueue_task_minlat to skip tree insertion for
- * tasks waking into a throttled tg.
+ * Check if a task's tg (or any ancestor) is bandwidth-throttled
+ * on the given CPU. Used by enqueue_task_minlat to skip tree
+ * insertion for tasks waking into a throttled hierarchy.
  */
 static inline bool minlat_bw_throttled(struct task_struct *p, int cpu)
 {
-	struct task_group *tg;
-	struct cfs_rq *cfs_rq;
-
-	tg = task_group(p);
-	if (tg == &root_task_group)
-		return false;
-
-	cfs_rq = tg->cfs_rq[cpu];
-	return cfs_rq->runtime_enabled && cfs_rq->throttled;
+	return minlat_any_ancestor_throttled(p, cpu);
 }
 
 static inline void minlat_init_bw_entity(struct sched_minlat_entity *me)
@@ -1527,6 +1612,7 @@ void init_minlat_rq(struct minlat_rq *minlat_rq)
 #ifdef CONFIG_CFS_BANDWIDTH
 	INIT_LIST_HEAD(&minlat_rq->bw_throttled_tasks);
 	minlat_rq->nr_bw_throttled = 0;
+	minlat_rq->bw_needs_throttle = false;
 #endif
 }
 
