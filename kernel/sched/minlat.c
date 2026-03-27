@@ -4576,6 +4576,30 @@ static int task_is_throttled_minlat(struct task_struct *p, int cpu)
 }
 #endif
 
+#ifdef CONFIG_FAIR_GROUP_SCHED
+/*
+ * Called when a task moves between cgroups. The task's sched_task_group
+ * has already been updated by the caller. Reset PELT last_update_time
+ * so load avg re-syncs to the new context, and update CFS internal
+ * pointers (cfs_rq, parent se) needed for bandwidth tracking.
+ */
+static void task_change_group_minlat(struct task_struct *p)
+{
+	/*
+	 * A forked task that hasn't been woken yet (TASK_NEW) doesn't
+	 * have valid scheduler state — skip it (matches CFS).
+	 */
+	if (READ_ONCE(p->__state) == TASK_NEW)
+		return;
+
+	/* Reset PELT so it re-syncs to the new rq/tg context */
+	p->minlat.avg.last_update_time = 0;
+
+	/* Update CFS internal pointers for the new task_group */
+	set_task_rq(p, task_cpu(p));
+}
+#endif
+
 /* ==== class definition ==== */
 
 DEFINE_SCHED_CLASS(minlat) = {
@@ -4606,6 +4630,10 @@ DEFINE_SCHED_CLASS(minlat) = {
 	.get_rr_interval	= get_rr_interval_minlat,
 
 	.update_curr		= update_curr_minlat,
+
+#ifdef CONFIG_FAIR_GROUP_SCHED
+	.task_change_group	= task_change_group_minlat,
+#endif
 
 #ifdef CONFIG_SCHED_CORE
 	.task_is_throttled	= task_is_throttled_minlat,
