@@ -2211,6 +2211,8 @@ static __always_inline bool sched_asym_cpucap_active(void)
 	return static_branch_unlikely(&sched_asym_cpucapacity);
 }
 
+extern void set_task_max_allowed_capacity(struct task_struct *p);
+
 struct sched_group_capacity {
 	atomic_t		ref;
 	/*

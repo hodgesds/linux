@@ -4571,6 +4571,15 @@ __init void init_sched_minlat_class(void)
 	pr_info("minlat: scheduler class initialized\n");
 }
 
+/*
+ * Called on fork from the parent's context. Sets the max allowed
+ * capacity for asymmetric CPU capacity systems (big.LITTLE).
+ */
+static void task_fork_minlat(struct task_struct *p)
+{
+	set_task_max_allowed_capacity(p);
+}
+
 static unsigned int get_rr_interval_minlat(struct rq *rq,
 					   struct task_struct *task)
 {
@@ -4641,6 +4650,7 @@ DEFINE_SCHED_CLASS(minlat) = {
 	.migrate_task_rq	= migrate_task_rq_minlat,
 	.set_cpus_allowed	= set_cpus_allowed_common,
 
+	.task_fork		= task_fork_minlat,
 	.task_tick		= task_tick_minlat,
 	.task_dead		= task_dead_minlat,
 

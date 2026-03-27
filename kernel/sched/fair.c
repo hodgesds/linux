@@ -8708,7 +8708,7 @@ static void task_dead_fair(struct task_struct *p)
 /*
  * Set the max capacity the task is allowed to run at for misfit detection.
  */
-static void set_task_max_allowed_capacity(struct task_struct *p)
+void set_task_max_allowed_capacity(struct task_struct *p)
 {
 	struct asym_cap_data *entry;
 
