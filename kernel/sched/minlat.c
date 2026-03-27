@@ -4283,6 +4283,34 @@ static void prio_changed_minlat(struct rq *rq, struct task_struct *p,
 }
 
 /*
+ * Called from set_load_weight() when a queued task's priority changes
+ * (e.g. renice). Updates the minlat entity weight and rq aggregate
+ * in place, repositioning in the rb-tree if needed.
+ */
+static void reweight_task_minlat(struct rq *rq, struct task_struct *p,
+				 const struct load_weight *lw)
+{
+	struct sched_minlat_entity *me = &p->minlat;
+	struct minlat_rq *minlat_rq = &rq->minlat;
+	unsigned long old_weight = scale_load_down(me->load.weight);
+
+	me->load.weight = lw->weight;
+	me->load.inv_weight = lw->inv_weight;
+
+	if (!task_on_rq_queued(p))
+		return;
+
+	/* Update rq aggregate: remove old, add new */
+	minlat_rq->load_weight += scale_load_down(me->load.weight) - old_weight;
+
+	/* Reposition in rb-tree (skip curr — it's out of tree) */
+	if (minlat_rq->curr != me && !RB_EMPTY_NODE(&me->run_node)) {
+		__dequeue_minlat_entity(minlat_rq, me);
+		__enqueue_minlat_entity(minlat_rq, me);
+	}
+}
+
+/*
  * switching_from_minlat - called while task is still on the old class
  * but about to switch away.  Clear the delayed flag so the entity is
  * treated as a normal queued task by sched_change_begin()'s dequeue.
@@ -4573,6 +4601,7 @@ DEFINE_SCHED_CLASS(minlat) = {
 	.switched_from		= switched_from_minlat,
 	.switched_to		= switched_to_minlat,
 	.prio_changed		= prio_changed_minlat,
+	.reweight_task		= reweight_task_minlat,
 
 	.get_rr_interval	= get_rr_interval_minlat,
 
