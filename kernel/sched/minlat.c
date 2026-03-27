@@ -1227,6 +1227,9 @@ __enqueue_minlat_entity(struct minlat_rq *minlat_rq,
 static __always_inline void
 __dequeue_minlat_entity(struct minlat_rq *minlat_rq,
 			struct sched_minlat_entity *me);
+static __always_inline void
+set_next_buddy_minlat(struct minlat_rq *minlat_rq,
+		      struct sched_minlat_entity *me);
 
 /* ==== CFS bandwidth (cpu.max) throttling ==== */
 
@@ -2119,6 +2122,25 @@ static void yield_task_minlat(struct rq *rq)
 	/* Fallback: no other tasks, minor bump */
 	me->vruntime = minlat_rq->min_vruntime +
 		minlat_calc_delta(MINLAT_LATENCY_NS, me);
+}
+
+/*
+ * Yield to a specific task — used by KVM (sched_yield_to) and
+ * sys_sched_yield(SCHED_YIELD_TO). Sets the target as the wakeup
+ * buddy so pick_task prefers it, then yields current.
+ */
+static bool yield_to_task_minlat(struct rq *rq, struct task_struct *p)
+{
+	struct sched_minlat_entity *me = &p->minlat;
+
+	if (!me->on_rq)
+		return false;
+
+	set_next_buddy_minlat(&rq->minlat, me);
+
+	yield_task_minlat(rq);
+
+	return true;
 }
 
 /*
@@ -4606,6 +4628,7 @@ DEFINE_SCHED_CLASS(minlat) = {
 	.enqueue_task		= enqueue_task_minlat,
 	.dequeue_task		= dequeue_task_minlat,
 	.yield_task		= yield_task_minlat,
+	.yield_to_task		= yield_to_task_minlat,
 
 	.wakeup_preempt		= wakeup_preempt_minlat,
 
