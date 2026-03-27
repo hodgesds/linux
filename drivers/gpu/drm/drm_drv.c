@@ -260,6 +260,44 @@ void drm_minor_release(struct drm_minor *minor)
 }
 
 /**
+ * drm_dev_get_by_parent - find a DRM device by its parent struct device
+ * @parent: the parent device (e.g. &pci_dev.dev)
+ *
+ * Iterate all registered DRM minors and return the DRM device whose
+ * parent device matches @parent.  Both primary and render minors are
+ * considered so that compute-only GPUs (which only expose a render
+ * minor) are found.  The caller gets a reference via drm_dev_get();
+ * it must call drm_dev_put() when done.
+ *
+ * Context: may be called from any context; takes drm_minor_lock.
+ * Return: the DRM device with a reference held, or NULL if no match
+ * is found.
+ */
+struct drm_device *drm_dev_get_by_parent(struct device *parent)
+{
+	struct drm_minor *minor;
+	struct drm_device *dev = NULL;
+	unsigned long flags;
+	int id;
+
+	spin_lock_irqsave(&drm_minor_lock, flags);
+	idr_for_each_entry(&drm_minors_idr, minor, id) {
+		if (!minor || !minor->dev || minor->dev->dev != parent)
+			continue;
+		if (minor->type != DRM_MINOR_PRIMARY &&
+		    minor->type != DRM_MINOR_RENDER)
+			continue;
+		drm_dev_get(minor->dev);
+		dev = minor->dev;
+		break;
+	}
+	spin_unlock_irqrestore(&drm_minor_lock, flags);
+
+	return dev;
+}
+EXPORT_SYMBOL_GPL(drm_dev_get_by_parent);
+
+/**
  * DOC: driver instance overview
  *
  * A device instance for a drm driver is represented by &struct drm_device. This
