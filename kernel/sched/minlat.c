@@ -4668,6 +4668,10 @@ DEFINE_SCHED_CLASS(minlat) = {
 	.task_change_group	= task_change_group_minlat,
 #endif
 
+#ifdef CONFIG_UCLAMP_TASK
+	.uclamp_enabled		= 1,
+#endif
+
 #ifdef CONFIG_SCHED_CORE
 	.task_is_throttled	= task_is_throttled_minlat,
 #endif
