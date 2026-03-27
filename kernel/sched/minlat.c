@@ -4521,6 +4521,17 @@ __init void init_sched_minlat_class(void)
 	pr_info("minlat: scheduler class initialized\n");
 }
 
+static unsigned int get_rr_interval_minlat(struct rq *rq,
+					   struct task_struct *task)
+{
+	struct sched_minlat_entity *me = &task->minlat;
+
+	if (!rq->minlat.load_weight)
+		return 0;
+
+	return NS_TO_JIFFIES(minlat_sched_slice(&rq->minlat, me));
+}
+
 /* ==== class definition ==== */
 
 DEFINE_SCHED_CLASS(minlat) = {
@@ -4546,6 +4557,8 @@ DEFINE_SCHED_CLASS(minlat) = {
 	.switched_from		= switched_from_minlat,
 	.switched_to		= switched_to_minlat,
 	.prio_changed		= prio_changed_minlat,
+
+	.get_rr_interval	= get_rr_interval_minlat,
 
 	.update_curr		= update_curr_minlat,
 };
