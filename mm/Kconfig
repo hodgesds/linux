@@ -173,6 +173,14 @@ config ZSWAP_ZPOOL_DEFAULT_ZSMALLOC
 	select ZSMALLOC
 	help
 	  Use the zsmalloc allocator as the default allocator.
+
+config ZSWAP_ZPOOL_DEFAULT_ZVRAM
+	bool "zvram"
+	select ZVRAM
+	help
+	  Use GPU VRAM as the default zswap allocator backend.
+	  Compressed pages are stored in GPU VRAM over PCIe instead
+	  of system RAM.
 endchoice
 
 config ZSWAP_ZPOOL_DEFAULT
@@ -181,6 +189,7 @@ config ZSWAP_ZPOOL_DEFAULT
        default "zbud" if ZSWAP_ZPOOL_DEFAULT_ZBUD
        default "z3fold" if ZSWAP_ZPOOL_DEFAULT_Z3FOLD
        default "zsmalloc" if ZSWAP_ZPOOL_DEFAULT_ZSMALLOC
+       default "zvram" if ZSWAP_ZPOOL_DEFAULT_ZVRAM
        default ""
 
 config ZBUD
@@ -239,6 +248,34 @@ config ZSMALLOC_CHAIN_SIZE
 	  characteristics.
 
 	  For more information, see zsmalloc documentation.
+
+config ZVRAM
+	tristate "GPU VRAM-backed zpool allocator (zvram)"
+	depends on ZSWAP
+	depends on PCI
+	depends on ZPOOL
+	depends on 64BIT
+	help
+	  A zpool backend that stores compressed swap pages in GPU VRAM
+	  instead of system RAM.  When configured as zswap's zpool backend
+	  (zswap.zpool=zvram), compressed pages are stored in GPU VRAM
+	  over PCIe, freeing system RAM while providing ~2-5us access
+	  latency -- roughly 200x faster than NVMe for random 4K access.
+
+	  Modern GPUs have significant VRAM (8-80GB) that often sits idle.
+	  GPU VRAM accessed over PCIe 4.0/5.0 offers 32-64 GB/s bandwidth
+	  with ~500ns latency.  Combined with zswap's CPU compression,
+	  this creates a high-performance swap tier without consuming
+	  system RAM.
+
+	  When CONFIG_DRM is also enabled, zvram allocates VRAM through
+	  the GPU driver's memory manager (via DRM client dumb buffers),
+	  ensuring safe coexistence.  Without DRM, zvram falls back to
+	  direct PCI BAR mapping which may conflict with GPU driver usage.
+
+	  ReBAR (resizable BAR) is recommended for best performance.
+
+	  If unsure, say N.
 
 menu "Slab allocator options"
 
