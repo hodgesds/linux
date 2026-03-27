@@ -3,7 +3,7 @@
 #
 include ../scripts/Makefile.include
 
-TARGETS=page-types slabinfo page_owner_sort
+TARGETS=page-types slabinfo page_owner_sort bench_zvram
 
 LIB_DIR = ../lib/api
 LIBS = $(LIB_DIR)/libapi.a
@@ -22,7 +22,7 @@ $(LIBS):
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 clean:
-	$(RM) page-types slabinfo page_owner_sort
+	$(RM) page-types slabinfo page_owner_sort bench_zvram
 	make -C $(LIB_DIR) clean
 
 sbindir ?= /usr/sbin
