@@ -4532,6 +4532,22 @@ static unsigned int get_rr_interval_minlat(struct rq *rq,
 	return NS_TO_JIFFIES(minlat_sched_slice(&rq->minlat, me));
 }
 
+#ifdef CONFIG_SCHED_CORE
+static int task_is_throttled_minlat(struct task_struct *p, int cpu)
+{
+#ifdef CONFIG_CFS_BANDWIDTH
+	struct task_group *tg = task_group(p);
+
+	if (tg == &root_task_group)
+		return 0;
+
+	return tg->cfs_rq[cpu]->throttle_count > 0;
+#else
+	return 0;
+#endif
+}
+#endif
+
 /* ==== class definition ==== */
 
 DEFINE_SCHED_CLASS(minlat) = {
@@ -4561,4 +4577,8 @@ DEFINE_SCHED_CLASS(minlat) = {
 	.get_rr_interval	= get_rr_interval_minlat,
 
 	.update_curr		= update_curr_minlat,
+
+#ifdef CONFIG_SCHED_CORE
+	.task_is_throttled	= task_is_throttled_minlat,
+#endif
 };
