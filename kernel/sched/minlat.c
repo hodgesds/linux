@@ -1011,6 +1011,57 @@ static void minlat_set_load_weight(struct task_struct *p)
 		me->load.weight = scale_load(minlat_prio_to_weight[mp]);
 		me->load.inv_weight = minlat_prio_to_wmult[mp];
 	}
+
+#ifdef CONFIG_GROUP_SCHED_WEIGHT
+	/*
+	 * Apply cgroup weight (cpu.weight) scaling.
+	 *
+	 * The task group's shares represent its configured weight:
+	 *   default=NICE_0_LOAD (1024), range=[MIN_SHARES..MAX_SHARES]
+	 *
+	 * Scale the task's nice-based weight proportionally:
+	 *   effective_weight = nice_weight * tg_shares / NICE_0_LOAD
+	 *
+	 * This gives proportional CPU time across cgroups:
+	 *   - cpu.weight=200 (shares=2048): tasks get 2x their nice weight
+	 *   - cpu.weight=100 (shares=1024): no change (default)
+	 *   - cpu.weight=50  (shares=512):  tasks get 0.5x their nice weight
+	 *
+	 * For cpu.idle=1 groups, force WEIGHT_IDLEPRIO to give them
+	 * CPU time only when no other group needs it.
+	 *
+	 * Root task group (shares=NICE_0_LOAD) is skipped — no scaling.
+	 * inv_weight is cleared to force recalculation on next use.
+	 */
+	{
+		struct task_group *tg = task_group(p);
+
+		if (tg && tg != &root_task_group) {
+#ifdef CONFIG_FAIR_GROUP_SCHED
+			unsigned long shares = scale_load_down(tg->shares);
+#else
+			unsigned long shares = NICE_0_LOAD;
+#endif
+			if (tg->idle > 0) {
+				me->load.weight = scale_load(WEIGHT_IDLEPRIO);
+				me->load.inv_weight = WMULT_IDLEPRIO;
+			} else if (shares != 1024) {
+				/*
+				 * shares is in user-visible scale (1024 = nice 0).
+				 * Scale the nice-based weight proportionally.
+				 */
+				unsigned long w = scale_load_down(me->load.weight);
+
+				w = DIV_ROUND_CLOSEST_ULL(
+					(u64)w * shares, 1024);
+				w = clamp_t(unsigned long, w,
+					    MIN_SHARES, MAX_SHARES);
+				me->load.weight = scale_load(w);
+				me->load.inv_weight = 0; /* recalc on use */
+			}
+		}
+	}
+#endif
 }
 
 static __always_inline u64
@@ -1461,6 +1512,13 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 		minlat_set_load_weight(p);
 		place_minlat_entity(minlat_rq, me, flags);
 		me->on_rq = 1;
+	} else {
+		/*
+		 * Re-enqueue from sched_move_task (cgroup change) or
+		 * other dequeue+enqueue cycles that don't go through
+		 * sleep. Recompute weight in case cgroup shares changed.
+		 */
+		minlat_set_load_weight(p);
 	}
 
 	/*
@@ -3716,6 +3774,22 @@ static void task_tick_minlat(struct rq *rq, struct task_struct *p, int queued)
 		minlat_ensure_tgid_ctx(p);
 	else
 		minlat_maybe_update_llc(p);
+
+	/*
+	 * Recompute weight if cgroup shares changed while running.
+	 * Only update rq aggregate if the weight actually differs.
+	 */
+#ifdef CONFIG_GROUP_SCHED_WEIGHT
+	{
+		unsigned long old_w = scale_load_down(p->minlat.load.weight);
+
+		minlat_set_load_weight(p);
+
+		unsigned long new_w = scale_load_down(p->minlat.load.weight);
+		if (unlikely(old_w != new_w))
+			rq->minlat.load_weight += new_w - old_w;
+	}
+#endif
 
 	/* Deferred interactivity update — keep enqueue path fast */
 	minlat_update_interactivity(p, rq, ENQUEUE_WAKEUP);
