@@ -173,6 +173,7 @@ config ZSWAP_ZPOOL_DEFAULT_ZSMALLOC
 	select ZSMALLOC
 	help
 	  Use the zsmalloc allocator as the default allocator.
+
 endchoice
 
 config ZSWAP_ZPOOL_DEFAULT
@@ -239,6 +240,20 @@ config ZSMALLOC_CHAIN_SIZE
 	  characteristics.
 
 	  For more information, see zsmalloc documentation.
+
+config ZVRAM
+	tristate "GPU VRAM-backed zpool allocator (zvram)"
+	depends on ZPOOL
+	depends on DRM
+	depends on PCI
+	depends on 64BIT
+	help
+	  A zpool backend that stores compressed swap pages in GPU VRAM
+	  instead of system RAM, allocated through the GPU driver's
+	  memory manager.  Select this to make zvram available as a
+	  zswap backend (zswap.zpool=zvram).
+
+	  If unsure, say N.
 
 menu "Slab allocator options"
 

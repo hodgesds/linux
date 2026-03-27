@@ -24485,6 +24485,13 @@ F:	include/linux/zswap.h
 F:	mm/zpool.c
 F:	mm/zswap.c
 
+ZVRAM GPU VRAM-BACKED ZPOOL BACKEND
+M:	Daniel Hodges <hodgesd@meta.com>
+L:	linux-mm@kvack.org
+L:	dri-devel@lists.freedesktop.org
+S:	Maintained
+F:	mm/zvram.c
+
 THE REST
 M:	Linus Torvalds <torvalds@linux-foundation.org>
 L:	linux-kernel@vger.kernel.org
