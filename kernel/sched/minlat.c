@@ -1963,6 +1963,14 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 		list_del_init(&me->bw_throttled_node);
 		me->bw_throttled = 0;
 		minlat_rq->nr_bw_throttled--;
+		/*
+		 * util_est was added at enqueue time (before the throttle
+		 * check). Remove it here to prevent permanent inflation
+		 * of rq util_est when a task exits while throttled.
+		 */
+		if (!p->se.sched_delayed)
+			minlat_util_est_dequeue(rq, p);
+		minlat_util_est_update(rq, p, flags & DEQUEUE_SLEEP);
 		if (flags & DEQUEUE_SLEEP)
 			me->on_rq = 0;
 		update_minlat_load_avg(rq, me);
@@ -3663,14 +3671,6 @@ minlat_pick_pushable_task(struct rq *src_rq, int target_cpu)
 	return NULL;
 }
 
-/*
- * CPU stopper callback: push a task from this (overloaded) CPU
- * to the target CPU recorded in push_cpu.
- *
- * Runs on the overloaded CPU via stop_one_cpu_nowait(). The stopper
- * preempts the current task, allowing us to pick and migrate a
- * queued task. Mirrors CFS's active_load_balance_cpu_stop().
- */
 /*
  * CPU stopper callback: runs on the TARGET (idle) CPU, pulls a task
  * from the overloaded source CPU.
