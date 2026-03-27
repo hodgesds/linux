@@ -177,6 +177,11 @@ minlat_latency_credit(u64 base, unsigned int weight)
  */
 #define minlat_fits_capacity(util, cap) ((util) * 1280 < (cap) * 1024)
 
+#define lsub_positive(_ptr, _val) do {				\
+	typeof(_ptr) ptr = (_ptr);				\
+	*ptr -= min_t(typeof(*ptr), *ptr, _val);		\
+} while (0)
+
 static inline unsigned long minlat_capacity_of(int cpu)
 {
 	return cpu_rq(cpu)->cpu_capacity;
@@ -513,6 +518,398 @@ static void minlat_update_misfit_status(struct task_struct *p, struct rq *rq)
 	rq->misfit_task_load = max_t(unsigned long,
 				     READ_ONCE(p->minlat.avg.load_avg), 1);
 }
+
+/* ==== Energy Aware Scheduling (EAS) ==== */
+
+#if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
+
+#include <linux/energy_model.h>
+
+/*
+ * Energy estimation environment — tracks utilization data for
+ * computing energy across a performance domain.
+ */
+struct minlat_energy_env {
+	unsigned long task_busy_time;	/* Task's utilization contribution */
+	unsigned long pd_busy_time;	/* PD utilization without the task */
+	unsigned long cpu_cap;		/* Max CPU capacity in the PD */
+	unsigned long pd_cap;		/* Total PD capacity (nr_cpus * cpu_cap) */
+};
+
+static DEFINE_PER_CPU(cpumask_var_t, minlat_eas_mask);
+
+void __init minlat_eas_init(void)
+{
+	int i;
+
+	for_each_possible_cpu(i)
+		zalloc_cpumask_var_node(&per_cpu(minlat_eas_mask, i),
+					GFP_KERNEL, cpu_to_node(i));
+}
+
+/*
+ * Get actual CPU capacity accounting for thermal/cpufreq pressure.
+ * Mirrors fair.c's get_actual_cpu_capacity() which is static.
+ */
+static __always_inline unsigned long
+minlat_get_actual_cpu_capacity(int cpu)
+{
+	unsigned long capacity = arch_scale_cpu_capacity(cpu);
+
+	capacity -= max(hw_load_avg(cpu_rq(cpu)), cpufreq_get_pressure(cpu));
+
+	return capacity;
+}
+
+/*
+ * Compute minlat rq utilization with hypothetical task placement.
+ * Analogous to CFS's cpu_util() — adjusts the rq utilization for
+ * adding or removing task p from a CPU.
+ *
+ * @cpu: CPU whose minlat utilization to compute
+ * @p: task whose contribution to adjust, or NULL
+ * @dst_cpu: destination CPU for p (-1 = remove p from its current CPU)
+ */
+static unsigned long
+minlat_cpu_util(int cpu, struct task_struct *p, int dst_cpu)
+{
+	struct rq *rq = cpu_rq(cpu);
+	unsigned long util = READ_ONCE(rq->minlat.avg.util_avg);
+
+	if (p && task_cpu(p) == cpu && dst_cpu != cpu)
+		lsub_positive(&util, READ_ONCE(p->minlat.avg.util_avg));
+	else if (p && task_cpu(p) != cpu && dst_cpu == cpu)
+		util += READ_ONCE(p->minlat.avg.util_avg);
+
+	if (sched_feat(UTIL_EST)) {
+		unsigned long util_est = READ_ONCE(rq->minlat.util_est);
+
+		if (dst_cpu == cpu)
+			util_est += _minlat_task_util_est(p);
+		else if (p && unlikely(task_on_rq_queued(p) || current == p))
+			lsub_positive(&util_est, _minlat_task_util_est(p));
+
+		util = max(util, util_est);
+	}
+
+	return min(util, (unsigned long)arch_scale_cpu_capacity(cpu));
+}
+
+/*
+ * Compute effective CPU utilization with an explicit minlat contribution.
+ * Like effective_cpu_util() but takes the minlat util as a parameter
+ * rather than reading it from the rq. This allows energy estimation
+ * with hypothetical task placements.
+ */
+static unsigned long
+minlat_eas_effective_cpu_util(int cpu, unsigned long util_minlat,
+			      unsigned long *p_min, unsigned long *p_max)
+{
+	unsigned long util, irq, scale;
+	struct rq *rq = cpu_rq(cpu);
+
+	scale = arch_scale_cpu_capacity(cpu);
+	irq = cpu_util_irq(rq);
+
+	if (unlikely(irq >= scale)) {
+		if (p_min)
+			*p_min = scale;
+		if (p_max)
+			*p_max = scale;
+		return scale;
+	}
+
+	if (p_min) {
+		*p_min = max(irq + cpu_bw_dl(rq),
+			     uclamp_rq_get(rq, UCLAMP_MIN));
+		if (!uclamp_is_used() && rt_rq_is_runnable(&rq->rt))
+			*p_min = max(*p_min, scale);
+	}
+
+	util = cpu_util_cfs(cpu) + cpu_util_rt(rq);
+	util += cpu_util_dl(rq);
+	util += util_minlat;
+
+	if (p_max)
+		*p_max = min(scale, uclamp_rq_get(rq, UCLAMP_MAX));
+
+	if (util >= scale)
+		return scale;
+
+	util = scale_irq_capacity(util, irq, scale);
+	util += irq;
+
+	return min(scale, util);
+}
+
+/*
+ * Compute the task busy time for energy estimation.
+ * Uses IRQ scaling from prev_cpu where the task's PELT was measured.
+ */
+static void minlat_eenv_task_busy_time(struct minlat_energy_env *eenv,
+				       struct task_struct *p, int prev_cpu)
+{
+	unsigned long busy_time, max_cap = arch_scale_cpu_capacity(prev_cpu);
+	unsigned long irq = cpu_util_irq(cpu_rq(prev_cpu));
+
+	if (unlikely(irq >= max_cap))
+		busy_time = max_cap;
+	else
+		busy_time = scale_irq_capacity(minlat_task_util_est(p),
+						irq, max_cap);
+
+	eenv->task_busy_time = busy_time;
+}
+
+/*
+ * Compute perf domain busy time without task p's contribution.
+ * The task contribution is separated so it can be added to different
+ * destination CPUs for fair comparison.
+ */
+static void minlat_eenv_pd_busy_time(struct minlat_energy_env *eenv,
+				     struct cpumask *pd_cpus,
+				     struct task_struct *p)
+{
+	unsigned long busy_time = 0;
+	int cpu;
+
+	for_each_cpu(cpu, pd_cpus) {
+		unsigned long ml_util = minlat_cpu_util(cpu, p, -1);
+
+		busy_time += minlat_eas_effective_cpu_util(cpu, ml_util,
+							   NULL, NULL);
+	}
+
+	eenv->pd_busy_time = min(eenv->pd_cap, busy_time);
+}
+
+/*
+ * Compute maximum utilization across a perf domain with task p
+ * hypothetically placed on dst_cpu. This determines the required
+ * frequency for the domain.
+ */
+static unsigned long
+minlat_eenv_pd_max_util(struct minlat_energy_env *eenv, struct cpumask *pd_cpus,
+			struct task_struct *p, int dst_cpu)
+{
+	unsigned long max_util = 0;
+	int cpu;
+
+	for_each_cpu(cpu, pd_cpus) {
+		unsigned long ml_util = minlat_cpu_util(cpu, p, dst_cpu);
+		unsigned long eff_util, mn, mx;
+
+		eff_util = minlat_eas_effective_cpu_util(cpu, ml_util,
+							 &mn, &mx);
+
+		/* Apply task's uclamp constraints on destination CPU */
+		if (cpu == dst_cpu && uclamp_is_used()) {
+			mn = max(mn,
+				 (unsigned long)uclamp_eff_value(p, UCLAMP_MIN));
+			if (uclamp_rq_is_idle(cpu_rq(cpu)))
+				mx = uclamp_eff_value(p, UCLAMP_MAX);
+			else
+				mx = max(mx,
+					 (unsigned long)uclamp_eff_value(p, UCLAMP_MAX));
+		}
+
+		eff_util = sugov_effective_cpu_perf(cpu, eff_util, mn, mx);
+		max_util = max(max_util, eff_util);
+	}
+
+	return min(max_util, eenv->cpu_cap);
+}
+
+/*
+ * Estimate energy that a perf domain would consume with the given
+ * utilization landscape. When dst_cpu < 0, the task contribution
+ * is excluded (baseline).
+ */
+static unsigned long
+minlat_compute_energy(struct minlat_energy_env *eenv, struct perf_domain *pd,
+		      struct cpumask *pd_cpus, struct task_struct *p,
+		      int dst_cpu)
+{
+	unsigned long max_util = minlat_eenv_pd_max_util(eenv, pd_cpus,
+							 p, dst_cpu);
+	unsigned long busy_time = eenv->pd_busy_time;
+
+	if (dst_cpu >= 0)
+		busy_time = min(eenv->pd_cap,
+				busy_time + eenv->task_busy_time);
+
+	return em_cpu_energy(pd->em_pd, max_util, busy_time, eenv->cpu_cap);
+}
+
+/*
+ * Check if this CPU is overutilized (utilization exceeds capacity).
+ * When any CPU in the root domain is overutilized, EAS is bypassed
+ * in favor of traditional load balancing.
+ */
+static bool minlat_cpu_overutilized(int cpu)
+{
+	unsigned long util = cpu_util_minlat(cpu_rq(cpu));
+
+	return !minlat_fits_capacity(util, arch_scale_cpu_capacity(cpu));
+}
+
+static void minlat_check_update_overutilized(struct rq *rq)
+{
+	if (!sched_energy_enabled())
+		return;
+
+	if (!READ_ONCE(rq->rd->overutilized) &&
+	    minlat_cpu_overutilized(cpu_of(rq)))
+		WRITE_ONCE(rq->rd->overutilized, true);
+}
+
+/*
+ * find_energy_efficient_cpu_minlat - Energy-aware task placement.
+ *
+ * For each performance domain, find the CPU whose energy impact is
+ * minimal for placing the waking task. Compares the energy delta
+ * (energy_with_task - energy_baseline) across candidate CPUs.
+ *
+ * Returns the best CPU, or -1 if EAS cannot make a decision.
+ */
+static int
+find_energy_efficient_cpu_minlat(struct task_struct *p, int prev_cpu)
+{
+	struct cpumask *cpus = this_cpu_cpumask_var_ptr(minlat_eas_mask);
+	unsigned long prev_delta = ULONG_MAX, best_delta = ULONG_MAX;
+	unsigned long p_util_min = uclamp_is_used() ?
+		uclamp_eff_value(p, UCLAMP_MIN) : 0;
+	unsigned long p_util_max = uclamp_is_used() ?
+		uclamp_eff_value(p, UCLAMP_MAX) : 1024;
+	struct root_domain *rd = this_rq()->rd;
+	int cpu, best_energy_cpu = -1, target = -1;
+	int prev_fits = -1, best_fits = -1;
+	unsigned long best_actual_cap = 0;
+	unsigned long prev_actual_cap = 0;
+	struct sched_domain *sd;
+	struct perf_domain *pd;
+	struct minlat_energy_env eenv;
+
+	rcu_read_lock();
+	pd = rcu_dereference(rd->pd);
+	if (!pd)
+		goto unlock;
+
+	sd = rcu_dereference(*this_cpu_ptr(&sd_asym_cpucapacity));
+	while (sd && !cpumask_test_cpu(prev_cpu, sched_domain_span(sd)))
+		sd = sd->parent;
+	if (!sd)
+		goto unlock;
+
+	target = prev_cpu;
+
+	if (!minlat_task_util_est(p) && p_util_min == 0)
+		goto unlock;
+
+	minlat_eenv_task_busy_time(&eenv, p, prev_cpu);
+
+	for (; pd; pd = pd->next) {
+		unsigned long cpu_cap, cpu_actual_cap, util;
+		long prev_spare_cap = -1, max_spare_cap = -1;
+		unsigned long cur_delta, base_energy;
+		int max_spare_cap_cpu = -1;
+		int fits, max_fits = -1;
+
+		if (!cpumask_and(cpus, perf_domain_span(pd),
+				 cpu_online_mask))
+			continue;
+
+		cpu = cpumask_first(cpus);
+		cpu_actual_cap = minlat_get_actual_cpu_capacity(cpu);
+		eenv.cpu_cap = cpu_actual_cap;
+		eenv.pd_cap = 0;
+
+		for_each_cpu(cpu, cpus) {
+			eenv.pd_cap += cpu_actual_cap;
+
+			if (!cpumask_test_cpu(cpu, sched_domain_span(sd)))
+				continue;
+
+			if (!cpumask_test_cpu(cpu, p->cpus_ptr))
+				continue;
+
+			util = minlat_cpu_util(cpu, p, cpu);
+			cpu_cap = minlat_capacity_of(cpu);
+
+			fits = minlat_util_fits_cpu(p, cpu);
+			if (!fits)
+				continue;
+
+			lsub_positive(&cpu_cap, util);
+
+			if (cpu == prev_cpu) {
+				prev_spare_cap = cpu_cap;
+				prev_fits = fits;
+			} else if ((fits > max_fits) ||
+				   ((fits == max_fits) &&
+				    ((long)cpu_cap > max_spare_cap))) {
+				max_spare_cap = cpu_cap;
+				max_spare_cap_cpu = cpu;
+				max_fits = fits;
+			}
+		}
+
+		if (max_spare_cap_cpu < 0 && prev_spare_cap < 0)
+			continue;
+
+		minlat_eenv_pd_busy_time(&eenv, cpus, p);
+		base_energy = minlat_compute_energy(&eenv, pd, cpus, p, -1);
+
+		if (prev_spare_cap > -1) {
+			prev_delta = minlat_compute_energy(&eenv, pd, cpus,
+							   p, prev_cpu);
+			if (prev_delta < base_energy)
+				goto unlock;
+			prev_delta -= base_energy;
+			prev_actual_cap = cpu_actual_cap;
+			best_delta = min(best_delta, prev_delta);
+		}
+
+		if (max_spare_cap_cpu >= 0 &&
+		    max_spare_cap > prev_spare_cap) {
+			if (max_fits < best_fits)
+				continue;
+
+			if ((max_fits < 0) &&
+			    (cpu_actual_cap <= best_actual_cap))
+				continue;
+
+			cur_delta = minlat_compute_energy(&eenv, pd, cpus,
+							  p, max_spare_cap_cpu);
+			if (cur_delta < base_energy)
+				goto unlock;
+			cur_delta -= base_energy;
+
+			if ((max_fits > 0) && (best_fits > 0) &&
+			    (cur_delta >= best_delta))
+				continue;
+
+			best_delta = cur_delta;
+			best_energy_cpu = max_spare_cap_cpu;
+			best_fits = max_fits;
+			best_actual_cap = cpu_actual_cap;
+		}
+	}
+	rcu_read_unlock();
+
+	if ((best_fits > prev_fits) ||
+	    ((best_fits > 0) && (best_delta < prev_delta)) ||
+	    ((best_fits < 0) && (best_actual_cap > prev_actual_cap)))
+		target = best_energy_cpu;
+
+	return target;
+
+unlock:
+	rcu_read_unlock();
+	return target;
+}
+
+#endif /* CONFIG_ENERGY_MODEL && CONFIG_CPU_FREQ_GOV_SCHEDUTIL */
 
 /* ==== NUMA balancing ==== */
 
@@ -1090,6 +1487,10 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	}
 
 	update_minlat_load_avg(rq, me);
+
+#if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
+	minlat_check_update_overutilized(rq);
+#endif
 }
 
 bool
@@ -1881,6 +2282,26 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 		minlat_record_wakee(p);
 	if (cpu >= 0)
 		return cpu;
+
+#if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
+	/*
+	 * Energy-aware placement: on asymmetric capacity systems with
+	 * an energy model, use EM-based energy estimation to select
+	 * the most energy-efficient CPU. This is only beneficial when
+	 * the system is not overutilized — under heavy load, the
+	 * traditional idle scan / load balancing is more appropriate.
+	 *
+	 * Skip for fork (no utilization history) and for sync wakeups
+	 * (already handled by wake affinity above).
+	 */
+	if ((flags & WF_TTWU) && sched_energy_enabled() &&
+	    !READ_ONCE(this_rq()->rd->overutilized)) {
+		int eas_cpu = find_energy_efficient_cpu_minlat(p, prev_cpu);
+
+		if (eas_cpu >= 0)
+			return eas_cpu;
+	}
+#endif
 
 	/*
 	 * Fork balancing: spread new tasks across the LLC.
@@ -3254,6 +3675,26 @@ static void minlat_check_balance(struct rq *rq)
 
 	mrq->next_balance = next_balance;
 
+#if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
+	/*
+	 * Clear overutilized at the highest domain level when no CPU
+	 * in the root domain is overutilized. This re-enables EAS.
+	 */
+	if (sched_energy_enabled() && READ_ONCE(rq->rd->overutilized)) {
+		bool any_overutil = false;
+		int i;
+
+		for_each_cpu(i, cpu_active_mask) {
+			if (minlat_cpu_overutilized(i)) {
+				any_overutil = true;
+				break;
+			}
+		}
+		if (!any_overutil)
+			WRITE_ONCE(rq->rd->overutilized, false);
+	}
+#endif
+
 	/*
 	 * If periodic balancing didn't pull anything and this CPU is
 	 * overloaded with idle CPUs available, use the CPU stopper
@@ -3588,6 +4029,9 @@ const struct file_operations minlat_enabled_fops = {
 
 __init void init_sched_minlat_class(void)
 {
+#if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
+	minlat_eas_init();
+#endif
 	pr_info("minlat: scheduler class initialized\n");
 }
 
