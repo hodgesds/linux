@@ -177,7 +177,7 @@ accumulate_sum(u64 delta, struct sched_avg *sa,
  *   load_avg = u_0` + y*(u_0 + u_1*y + u_2*y^2 + ... )
  *            = u_0 + u_1*y + u_2*y^2 + ... [re-labeling u_i --> u_{i+1}]
  */
-static __always_inline int
+__always_inline int
 ___update_load_sum(u64 now, struct sched_avg *sa,
 		  unsigned long load, unsigned long runnable, int running)
 {
@@ -254,7 +254,7 @@ ___update_load_sum(u64 now, struct sched_avg *sa,
  * the period_contrib of cfs_rq when updating the sched_avg of a sched_entity
  * if it's more convenient.
  */
-static __always_inline void
+__always_inline void
 ___update_load_avg(struct sched_avg *sa, unsigned long load)
 {
 	u32 divider = get_pelt_divider(sa);

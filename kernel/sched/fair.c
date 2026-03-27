@@ -6076,9 +6076,12 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 	/* update hierarchical throttle state */
 	walk_tg_tree_from(cfs_rq->tg, tg_nop, tg_unthrottle_up, (void *)rq);
 
+	/* Re-enqueue any throttled minlat tasks for this tg */
+	minlat_unthrottle_bw(rq, cfs_rq->tg);
+
 	if (!cfs_rq->load.weight) {
 		if (!cfs_rq->on_list)
-			return;
+			goto out_resched;
 		/*
 		 * Nothing to run but something to decay (on_list)?
 		 * Complete the branch.
@@ -6091,8 +6094,9 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 
 	assert_list_leaf_cfs_rq(rq);
 
+out_resched:
 	/* Determine whether we need to wake up potentially idle CPU: */
-	if (rq->curr == rq->idle && rq->cfs.nr_queued)
+	if (rq->curr == rq->idle && (rq->cfs.nr_queued || rq->minlat.nr_running))
 		resched_curr(rq);
 }
 

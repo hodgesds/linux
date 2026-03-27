@@ -790,6 +790,11 @@ struct sched_minlat_entity {
 
 	/* PELT tracking for task placement and load balancing */
 	struct sched_avg		avg;
+
+#ifdef CONFIG_CFS_BANDWIDTH
+	unsigned int			bw_throttled;
+	struct list_head		bw_throttled_node;
+#endif
 };
 
 #define MIN_LATENCY_NICE	(-20)

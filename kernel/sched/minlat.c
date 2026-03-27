@@ -1221,6 +1221,292 @@ static void minlat_update_interactivity(struct task_struct *p,
 static void minlat_record_sleep(struct task_struct *p, struct rq *rq);
 static void minlat_maybe_update_llc(struct task_struct *p);
 static void pull_minlat_task(struct rq *this_rq);
+static __always_inline void
+__enqueue_minlat_entity(struct minlat_rq *minlat_rq,
+			struct sched_minlat_entity *me);
+static __always_inline void
+__dequeue_minlat_entity(struct minlat_rq *minlat_rq,
+			struct sched_minlat_entity *me);
+
+/* ==== CFS bandwidth (cpu.max) throttling ==== */
+
+#ifdef CONFIG_CFS_BANDWIDTH
+
+/*
+ * CFS bandwidth throttling for minlat tasks.
+ *
+ * Reuses the existing cfs_bandwidth infrastructure (global quota pool,
+ * period timer, refill mechanism) and the per-CPU cfs_rq runtime tracking
+ * fields (runtime_remaining, runtime_enabled, throttled). Since minlat
+ * replaces CFS for all fair tasks, CFS's cfs_rqs are empty — we borrow
+ * their runtime fields for minlat bandwidth tracking.
+ *
+ * When a task group's per-CPU runtime is exhausted:
+ *  1. All minlat tasks of that tg on the CPU are dequeued from the rb-tree
+ *  2. They're placed on minlat_rq->bw_throttled_tasks
+ *  3. The cfs_rq is added to cfs_b->throttled_cfs_rq
+ *
+ * The period timer fires, refills the global pool, and distribute_cfs_runtime()
+ * gives runtime to throttled cfs_rqs. unthrottle_cfs_rq() clears the CFS
+ * throttle state and calls minlat_unthrottle_bw() to re-enqueue minlat tasks.
+ */
+
+/* Borrowing slice: 5ms (matches CFS default) */
+#define MINLAT_BW_SLICE		(5 * NSEC_PER_MSEC)
+
+/*
+ * Try to borrow runtime from the global cfs_bandwidth pool.
+ * Returns true if runtime_remaining > 0 after borrowing.
+ */
+static int minlat_assign_bw_runtime(struct cfs_bandwidth *cfs_b,
+				    struct cfs_rq *cfs_rq)
+{
+	u64 min_amount, amount = 0;
+
+	raw_spin_lock(&cfs_b->lock);
+
+	/* note: this is a positive sum as runtime_remaining <= 0 */
+	min_amount = MINLAT_BW_SLICE - cfs_rq->runtime_remaining;
+
+	if (cfs_b->quota == RUNTIME_INF) {
+		amount = min_amount;
+	} else {
+		start_cfs_bandwidth(cfs_b);
+
+		if (cfs_b->runtime > 0) {
+			amount = min(cfs_b->runtime, min_amount);
+			cfs_b->runtime -= amount;
+			cfs_b->idle = 0;
+		}
+	}
+
+	cfs_rq->runtime_remaining += amount;
+	raw_spin_unlock(&cfs_b->lock);
+
+	return cfs_rq->runtime_remaining > 0;
+}
+
+/*
+ * Account bandwidth runtime consumption in update_curr_minlat.
+ * Deducts delta_exec from the per-CPU per-tg runtime. If exhausted,
+ * tries to borrow more. If borrow fails, triggers a reschedule so
+ * pick_task can throttle.
+ */
+static void minlat_account_bw_runtime(struct rq *rq, struct task_struct *p,
+				      u64 delta_exec)
+{
+	struct task_group *tg;
+	struct cfs_bandwidth *cfs_b;
+	struct cfs_rq *cfs_rq;
+
+	tg = task_group(p);
+	if (tg == &root_task_group)
+		return;
+
+	cfs_b = &tg->cfs_bandwidth;
+	if (cfs_b->quota == RUNTIME_INF)
+		return;
+
+	cfs_rq = tg->cfs_rq[cpu_of(rq)];
+	if (!cfs_rq->runtime_enabled)
+		return;
+
+	cfs_rq->runtime_remaining -= delta_exec;
+
+	if (likely(cfs_rq->runtime_remaining > 0))
+		return;
+
+	if (cfs_rq->throttled)
+		return;
+
+	if (!minlat_assign_bw_runtime(cfs_b, cfs_rq) && likely(rq->curr == p))
+		resched_curr(rq);
+}
+
+/*
+ * Throttle all minlat tasks of a task group on this CPU.
+ * Called from pick_task_minlat when runtime is exhausted.
+ */
+static void minlat_throttle_tg_cpu(struct rq *rq, struct task_group *tg)
+{
+	struct minlat_rq *minlat_rq = &rq->minlat;
+	struct cfs_rq *cfs_rq = tg->cfs_rq[cpu_of(rq)];
+	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
+	struct sched_minlat_entity *me;
+	struct rb_node *node, *next;
+	struct task_struct *p;
+
+	/* Last-chance borrow: race with period timer replenishment */
+	raw_spin_lock(&cfs_b->lock);
+	if (cfs_rq->runtime_remaining <= 0) {
+		u64 amount = min_t(u64, cfs_b->runtime, (u64)1);
+
+		cfs_b->runtime -= amount;
+		cfs_rq->runtime_remaining += amount;
+	}
+	if (cfs_rq->runtime_remaining > 0) {
+		raw_spin_unlock(&cfs_b->lock);
+		return;
+	}
+	list_add_tail_rcu(&cfs_rq->throttled_list,
+			  &cfs_b->throttled_cfs_rq);
+	raw_spin_unlock(&cfs_b->lock);
+
+	cfs_rq->throttled = 1;
+	cfs_rq->throttled_clock = rq_clock(rq);
+
+	/* Dequeue all minlat tasks belonging to this tg */
+	for (node = rb_first_cached(&minlat_rq->tasks_timeline);
+	     node; node = next) {
+		next = rb_next(node);
+		me = rb_entry(node, struct sched_minlat_entity, run_node);
+		p = container_of(me, struct task_struct, minlat);
+
+		if (task_group(p) != tg)
+			continue;
+
+		__dequeue_minlat_entity(minlat_rq, me);
+		me->bw_throttled = 1;
+		list_add_tail(&me->bw_throttled_node,
+			      &minlat_rq->bw_throttled_tasks);
+		minlat_rq->nr_bw_throttled++;
+		minlat_rq->nr_running--;
+		minlat_rq->load_weight -= scale_load_down(me->load.weight);
+		sub_nr_running(rq, 1);
+	}
+
+	/* Also throttle curr if it belongs to this tg (out-of-tree) */
+	if (minlat_rq->curr) {
+		p = container_of(minlat_rq->curr, struct task_struct, minlat);
+		if (task_group(p) == tg) {
+			me = minlat_rq->curr;
+			minlat_rq->curr = NULL;
+			me->bw_throttled = 1;
+			list_add_tail(&me->bw_throttled_node,
+				      &minlat_rq->bw_throttled_tasks);
+			minlat_rq->nr_bw_throttled++;
+			minlat_rq->nr_running--;
+			minlat_rq->load_weight -=
+				scale_load_down(me->load.weight);
+			sub_nr_running(rq, 1);
+		}
+	}
+
+	if (minlat_rq->nr_running - minlat_rq->nr_delayed < 2 &&
+	    minlat_rq->overloaded) {
+		WRITE_ONCE(minlat_rq->overloaded, false);
+		atomic_dec(&minlat_nr_overloaded);
+	}
+}
+
+/*
+ * Unthrottle minlat tasks of a task group on this CPU.
+ * Called from unthrottle_cfs_rq() hook when the period timer
+ * replenishes runtime.
+ */
+void minlat_unthrottle_bw(struct rq *rq, struct task_group *tg)
+{
+	struct minlat_rq *minlat_rq = &rq->minlat;
+	struct sched_minlat_entity *me, *tmp;
+	struct task_struct *p;
+
+	if (!minlat_rq->nr_bw_throttled)
+		return;
+
+	list_for_each_entry_safe(me, tmp, &minlat_rq->bw_throttled_tasks,
+				 bw_throttled_node) {
+		p = container_of(me, struct task_struct, minlat);
+
+		if (task_group(p) != tg)
+			continue;
+
+		list_del_init(&me->bw_throttled_node);
+		me->bw_throttled = 0;
+		minlat_rq->nr_bw_throttled--;
+
+		/* Re-enqueue into rb-tree */
+		__enqueue_minlat_entity(minlat_rq, me);
+		minlat_rq->nr_running++;
+		minlat_rq->load_weight += scale_load_down(me->load.weight);
+		add_nr_running(rq, 1);
+	}
+
+	if (minlat_rq->nr_running - minlat_rq->nr_delayed >= 2 &&
+	    !minlat_rq->overloaded) {
+		WRITE_ONCE(minlat_rq->overloaded, true);
+		atomic_inc(&minlat_nr_overloaded);
+	}
+}
+
+/*
+ * Check if the current task's tg needs throttling.
+ * Called from pick_task_minlat before picking the next task.
+ */
+static void minlat_check_bw_throttle(struct rq *rq)
+{
+	struct task_struct *curr = rq->curr;
+	struct task_group *tg;
+	struct cfs_rq *cfs_rq;
+
+	if (curr->sched_class != &minlat_sched_class)
+		return;
+
+	tg = task_group(curr);
+	if (tg == &root_task_group)
+		return;
+
+	cfs_rq = tg->cfs_rq[cpu_of(rq)];
+	if (!cfs_rq->runtime_enabled || cfs_rq->throttled)
+		return;
+
+	if (cfs_rq->runtime_remaining > 0)
+		return;
+
+	/* Try one last borrow */
+	if (minlat_assign_bw_runtime(&tg->cfs_bandwidth, cfs_rq))
+		return;
+
+	minlat_throttle_tg_cpu(rq, tg);
+}
+
+/*
+ * Check if a task's tg is bandwidth-throttled on the given CPU.
+ * Used by enqueue_task_minlat to skip tree insertion for
+ * tasks waking into a throttled tg.
+ */
+static inline bool minlat_bw_throttled(struct task_struct *p, int cpu)
+{
+	struct task_group *tg;
+	struct cfs_rq *cfs_rq;
+
+	tg = task_group(p);
+	if (tg == &root_task_group)
+		return false;
+
+	cfs_rq = tg->cfs_rq[cpu];
+	return cfs_rq->runtime_enabled && cfs_rq->throttled;
+}
+
+static inline void minlat_init_bw_entity(struct sched_minlat_entity *me)
+{
+	me->bw_throttled = 0;
+	INIT_LIST_HEAD(&me->bw_throttled_node);
+}
+
+#else /* !CONFIG_CFS_BANDWIDTH */
+
+static inline void minlat_account_bw_runtime(struct rq *rq,
+					     struct task_struct *p,
+					     u64 delta_exec) {}
+static inline void minlat_check_bw_throttle(struct rq *rq) {}
+static inline bool minlat_bw_throttled(struct task_struct *p, int cpu)
+{
+	return false;
+}
+static inline void minlat_init_bw_entity(struct sched_minlat_entity *me) {}
+void minlat_unthrottle_bw(struct rq *rq, struct task_group *tg) {}
+
+#endif /* CONFIG_CFS_BANDWIDTH */
 
 /* ==== runqueue init ==== */
 
@@ -1238,6 +1524,10 @@ void init_minlat_rq(struct minlat_rq *minlat_rq)
 	minlat_rq->active_balance = 0;
 	minlat_rq->push_cpu = 0;
 	minlat_rq->next_balance = 0;
+#ifdef CONFIG_CFS_BANDWIDTH
+	INIT_LIST_HEAD(&minlat_rq->bw_throttled_tasks);
+	minlat_rq->nr_bw_throttled = 0;
+#endif
 }
 
 /* ==== rb-tree operations ==== */
@@ -1374,6 +1664,8 @@ static __always_inline void update_curr_minlat_vruntime(struct rq *rq)
 	cgroup_account_cputime(curr, delta_exec);
 
 	me->vruntime += minlat_calc_delta(delta_exec, me);
+
+	minlat_account_bw_runtime(rq, curr, delta_exec);
 }
 
 static void update_curr_minlat(struct rq *rq)
@@ -1522,6 +1814,23 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	}
 
 	/*
+	 * If this task's tg is bandwidth-throttled on this CPU,
+	 * add to the throttle list instead of the rb-tree.
+	 * The task will be re-enqueued when the period timer
+	 * replenishes runtime and unthrottle_cfs_rq fires.
+	 */
+#ifdef CONFIG_CFS_BANDWIDTH
+	if (minlat_bw_throttled(p, cpu_of(rq))) {
+		me->bw_throttled = 1;
+		list_add_tail(&me->bw_throttled_node,
+			      &minlat_rq->bw_throttled_tasks);
+		minlat_rq->nr_bw_throttled++;
+		update_minlat_load_avg(rq, me);
+		return;
+	}
+#endif
+
+	/*
 	 * Don't insert into the tree if this entity is the currently
 	 * running task (curr is kept out-of-tree while running).
 	 */
@@ -1558,6 +1867,19 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	struct minlat_rq *minlat_rq = &rq->minlat;
 	bool was_curr = (minlat_rq->curr == me);
 	bool was_leftmost = false;
+
+#ifdef CONFIG_CFS_BANDWIDTH
+	/* If task is on the bandwidth throttle list, remove it */
+	if (me->bw_throttled) {
+		list_del_init(&me->bw_throttled_node);
+		me->bw_throttled = 0;
+		minlat_rq->nr_bw_throttled--;
+		if (flags & DEQUEUE_SLEEP)
+			me->on_rq = 0;
+		update_minlat_load_avg(rq, me);
+		return true;
+	}
+#endif
 
 	if (minlat_rq->next == me)
 		minlat_rq->next = NULL;
@@ -1872,6 +2194,9 @@ pick_task_minlat(struct rq *rq, struct rq_flags *rf)
 	struct sched_minlat_entity *me;
 	struct task_struct *p;
 
+	/* Check if current task's tg needs bandwidth throttling */
+	minlat_check_bw_throttle(rq);
+
 	/*
 	 * PICK_BUDDY: prefer the wakeup buddy if it's still queued,
 	 * eligible, and not delayed. Mirrors EEVDF's PICK_BUDDY.
@@ -1973,6 +2298,7 @@ put_prev_task_minlat(struct rq *rq, struct task_struct *p,
 		account_group_exec_runtime(p, delta_exec);
 		cgroup_account_cputime(p, delta_exec);
 		me->vruntime += minlat_calc_delta(delta_exec, me);
+		minlat_account_bw_runtime(rq, p, delta_exec);
 	}
 
 	/* Inline min_vruntime: curr vruntime is fresh, check leftmost */

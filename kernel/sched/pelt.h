@@ -50,6 +50,10 @@ update_irq_load_avg(struct rq *rq, u64 running)
 }
 #endif
 
+int ___update_load_sum(u64 now, struct sched_avg *sa,
+		      unsigned long load, unsigned long runnable, int running);
+void ___update_load_avg(struct sched_avg *sa, unsigned long load);
+
 #define PELT_MIN_DIVIDER	(LOAD_AVG_MAX - 1024)
 
 static inline u32 get_pelt_divider(struct sched_avg *avg)

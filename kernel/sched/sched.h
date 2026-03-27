@@ -599,6 +599,12 @@ extern void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b);
 extern void unthrottle_cfs_rq(struct cfs_rq *cfs_rq);
 extern bool cfs_task_bw_constrained(struct task_struct *p);
 
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+extern void minlat_unthrottle_bw(struct rq *rq, struct task_group *tg);
+#else
+static inline void minlat_unthrottle_bw(struct rq *rq, struct task_group *tg) {}
+#endif
+
 extern void init_tg_rt_entry(struct task_group *tg, struct rt_rq *rt_rq,
 		struct sched_rt_entity *rt_se, int cpu,
 		struct sched_rt_entity *parent);
@@ -949,6 +955,11 @@ struct minlat_rq {
 	int			push_cpu;
 	struct cpu_stop_work	active_balance_work;
 	unsigned long		next_balance;
+
+#ifdef CONFIG_CFS_BANDWIDTH
+	struct list_head	bw_throttled_tasks;
+	int			nr_bw_throttled;
+#endif
 };
 
 #endif /* CONFIG_SCHED_CLASS_MINLAT */
