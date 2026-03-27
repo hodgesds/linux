@@ -4631,6 +4631,13 @@ static void task_change_group_minlat(struct task_struct *p)
 }
 #endif
 
+static void set_cpus_allowed_minlat(struct task_struct *p,
+				    struct affinity_context *ctx)
+{
+	set_cpus_allowed_common(p, ctx);
+	set_task_max_allowed_capacity(p);
+}
+
 /* ==== class definition ==== */
 
 DEFINE_SCHED_CLASS(minlat) = {
@@ -4648,7 +4655,7 @@ DEFINE_SCHED_CLASS(minlat) = {
 	.balance		= balance_minlat,
 	.select_task_rq		= select_task_rq_minlat,
 	.migrate_task_rq	= migrate_task_rq_minlat,
-	.set_cpus_allowed	= set_cpus_allowed_common,
+	.set_cpus_allowed	= set_cpus_allowed_minlat,
 
 	.task_fork		= task_fork_minlat,
 	.task_tick		= task_tick_minlat,
