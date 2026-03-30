@@ -4381,6 +4381,10 @@ static void prio_changed_minlat(struct rq *rq, struct task_struct *p,
  * Called from set_load_weight() when a queued task's priority changes
  * (e.g. renice). Updates the minlat entity weight and rq aggregate
  * in place, repositioning in the rb-tree if needed.
+ *
+ * The caller passes the bare nice-based weight from core.c, but minlat
+ * has its own weight computation that applies cgroup shares scaling.
+ * Use minlat_set_load_weight() to get the correct weight.
  */
 static void reweight_task_minlat(struct rq *rq, struct task_struct *p,
 				 const struct load_weight *lw)
@@ -4389,8 +4393,7 @@ static void reweight_task_minlat(struct rq *rq, struct task_struct *p,
 	struct minlat_rq *minlat_rq = &rq->minlat;
 	unsigned long old_weight = scale_load_down(me->load.weight);
 
-	me->load.weight = lw->weight;
-	me->load.inv_weight = lw->inv_weight;
+	minlat_set_load_weight(p);
 
 	if (!task_on_rq_queued(p))
 		return;
