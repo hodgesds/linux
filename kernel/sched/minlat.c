@@ -1038,7 +1038,7 @@ static void minlat_set_load_weight(struct task_struct *p)
 
 		if (tg && tg != &root_task_group) {
 #ifdef CONFIG_FAIR_GROUP_SCHED
-			unsigned long shares = scale_load_down(tg->shares);
+			unsigned long shares = scale_load_down(READ_ONCE(tg->shares));
 #else
 			unsigned long shares = NICE_0_LOAD;
 #endif
@@ -2022,6 +2022,8 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 #ifdef CONFIG_CFS_BANDWIDTH
 	/* If task is on the bandwidth throttle list, remove it */
 	if (me->bw_throttled) {
+		if (minlat_rq->next == me)
+			minlat_rq->next = NULL;
 		list_del_init(&me->bw_throttled_node);
 		me->bw_throttled = 0;
 		minlat_rq->nr_bw_throttled--;
