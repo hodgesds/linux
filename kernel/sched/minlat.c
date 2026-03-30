@@ -1151,8 +1151,32 @@ static void minlat_ensure_tgid_ctx(struct task_struct *p)
 	}
 
 	/* Only allocate for threads, not single-threaded fork children */
-	if (leader && leader != p)
-		me->tgid_ctx = minlat_tgid_ctx_alloc(task_cpu(p));
+	if (leader && leader != p) {
+		struct minlat_tgid_ctx *new_ctx, *existing;
+
+		new_ctx = minlat_tgid_ctx_alloc(task_cpu(p));
+		if (!new_ctx)
+			return;
+
+		/*
+		 * Publish on the leader so sibling threads can share it.
+		 * Race with other children: loser adopts the winner's ctx.
+		 * Count the leader as a task so task_dead_minlat balances.
+		 */
+		existing = cmpxchg(&leader->minlat.tgid_ctx, NULL, new_ctx);
+		if (!existing) {
+			/* Won: add ref + task count for the leader */
+			minlat_tgid_ctx_get(new_ctx);
+			atomic_inc(&new_ctx->nr_tasks);
+			me->tgid_ctx = new_ctx;
+		} else {
+			/* Lost: adopt the leader's ctx, free ours */
+			minlat_tgid_ctx_put(new_ctx);
+			minlat_tgid_ctx_get(existing);
+			me->tgid_ctx = existing;
+			atomic_inc(&existing->nr_tasks);
+		}
+	}
 }
 
 /*
