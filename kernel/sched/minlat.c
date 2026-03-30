@@ -1491,6 +1491,8 @@ static void minlat_throttle_tg_cpu(struct rq *rq, struct task_group *tg)
 			      &minlat_rq->bw_throttled_tasks);
 		minlat_rq->nr_bw_throttled++;
 		minlat_rq->nr_running--;
+		if (p->se.sched_delayed)
+			minlat_rq->nr_delayed--;
 		minlat_rq->load_weight -= scale_load_down(me->load.weight);
 		sub_nr_running(rq, 1);
 	}
@@ -1506,6 +1508,8 @@ static void minlat_throttle_tg_cpu(struct rq *rq, struct task_group *tg)
 				      &minlat_rq->bw_throttled_tasks);
 			minlat_rq->nr_bw_throttled++;
 			minlat_rq->nr_running--;
+			if (p->se.sched_delayed)
+				minlat_rq->nr_delayed--;
 			minlat_rq->load_weight -=
 				scale_load_down(me->load.weight);
 			sub_nr_running(rq, 1);
@@ -1564,6 +1568,8 @@ void minlat_unthrottle_bw(struct rq *rq, struct task_group *tg)
 		/* Re-enqueue into rb-tree */
 		__enqueue_minlat_entity(minlat_rq, me);
 		minlat_rq->nr_running++;
+		if (p->se.sched_delayed)
+			minlat_rq->nr_delayed++;
 		minlat_rq->load_weight += scale_load_down(me->load.weight);
 		add_nr_running(rq, 1);
 	}
