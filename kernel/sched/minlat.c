@@ -1454,7 +1454,8 @@ static void minlat_throttle_tg_cpu(struct rq *rq, struct task_group *tg)
 	/* Last-chance borrow: race with period timer replenishment */
 	raw_spin_lock(&cfs_b->lock);
 	if (cfs_rq->runtime_remaining <= 0) {
-		u64 amount = min_t(u64, cfs_b->runtime, (u64)1);
+		s64 want = MINLAT_BW_SLICE - cfs_rq->runtime_remaining;
+		u64 amount = min_t(u64, cfs_b->runtime, want);
 
 		cfs_b->runtime -= amount;
 		cfs_rq->runtime_remaining += amount;
