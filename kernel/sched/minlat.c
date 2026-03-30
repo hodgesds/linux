@@ -2571,6 +2571,26 @@ set_next_task_minlat(struct rq *rq, struct task_struct *p, bool first)
 	sched_minlat_update_stop_tick(rq, p);
 }
 
+/*
+ * Combined put_prev + set_next for minlat-to-minlat transitions.
+ * Called from the minlat fast path in __pick_next_task() to avoid
+ * indirect vtable calls through sched_class->put_prev_task and
+ * sched_class->set_next_task. With retpoline, each indirect call
+ * costs ~20-30ns — two per context switch adds up significantly
+ * in IPC-heavy workloads like hackbench.
+ */
+void minlat_put_prev_set_next(struct rq *rq,
+			      struct task_struct *prev,
+			      struct task_struct *next)
+{
+	__put_prev_set_next_dl_server(rq, prev, next);
+
+	if (prev != next) {
+		put_prev_task_minlat(rq, prev, next);
+		set_next_task_minlat(rq, next, true);
+	}
+}
+
 /* ==== SMT-aware interactivity tracking ==== */
 
 /*

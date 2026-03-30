@@ -5982,7 +5982,7 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 						 minlat);
 				if (likely(!p->se.sched_delayed)) {
 					rq->minlat.next = NULL;
-					put_prev_set_next_task(rq, prev, p);
+					minlat_put_prev_set_next(rq, prev, p);
 					return p;
 				}
 			}
@@ -6003,7 +6003,7 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 				p = container_of(me,
 					struct task_struct, minlat);
 				if (likely(!p->se.sched_delayed)) {
-					put_prev_set_next_task(
+					minlat_put_prev_set_next(
 						rq, prev, p);
 					return p;
 				}
@@ -6019,7 +6019,7 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 						 struct task_struct, minlat);
 				if (unlikely(p->se.sched_delayed))
 					goto restart;
-				put_prev_set_next_task(rq, prev, p);
+				minlat_put_prev_set_next(rq, prev, p);
 				return p;
 			}
 
