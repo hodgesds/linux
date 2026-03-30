@@ -2483,9 +2483,9 @@ pick_task_minlat(struct rq *rq, struct rq_flags *rf)
 	return NULL;
 }
 
-static void
-put_prev_task_minlat(struct rq *rq, struct task_struct *p,
-		     struct task_struct *next)
+static __always_inline void
+__put_prev_task_minlat(struct rq *rq, struct task_struct *p,
+		       struct task_struct *next)
 {
 	struct sched_minlat_entity *me = &p->minlat;
 	struct minlat_rq *minlat_rq = &rq->minlat;
@@ -2535,7 +2535,14 @@ put_prev_task_minlat(struct rq *rq, struct task_struct *p,
 }
 
 static void
-set_next_task_minlat(struct rq *rq, struct task_struct *p, bool first)
+put_prev_task_minlat(struct rq *rq, struct task_struct *p,
+		     struct task_struct *next)
+{
+	__put_prev_task_minlat(rq, p, next);
+}
+
+static __always_inline void
+__set_next_task_minlat(struct rq *rq, struct task_struct *p, bool first)
 {
 	struct sched_minlat_entity *me = &p->minlat;
 	struct minlat_rq *minlat_rq = &rq->minlat;
@@ -2571,6 +2578,12 @@ set_next_task_minlat(struct rq *rq, struct task_struct *p, bool first)
 	sched_minlat_update_stop_tick(rq, p);
 }
 
+static void
+set_next_task_minlat(struct rq *rq, struct task_struct *p, bool first)
+{
+	__set_next_task_minlat(rq, p, first);
+}
+
 /*
  * Combined put_prev + set_next for minlat-to-minlat transitions.
  * Called from the minlat fast path in __pick_next_task() to avoid
@@ -2586,8 +2599,8 @@ void minlat_put_prev_set_next(struct rq *rq,
 	__put_prev_set_next_dl_server(rq, prev, next);
 
 	if (prev != next) {
-		put_prev_task_minlat(rq, prev, next);
-		set_next_task_minlat(rq, next, true);
+		__put_prev_task_minlat(rq, prev, next);
+		__set_next_task_minlat(rq, next, true);
 	}
 }
 
