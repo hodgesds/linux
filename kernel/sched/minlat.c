@@ -1125,6 +1125,7 @@ static void minlat_ensure_tgid_ctx(struct task_struct *p)
 {
 	struct sched_minlat_entity *me = &p->minlat;
 	struct task_struct *leader;
+	struct minlat_tgid_ctx *ctx;
 
 	if (me->tgid_ctx)
 		return;
@@ -1141,40 +1142,63 @@ static void minlat_ensure_tgid_ctx(struct task_struct *p)
 	 * overhead in fork-heavy workloads.
 	 */
 	leader = p->group_leader;
-	if (leader && leader != p && leader->minlat.tgid_ctx) {
-		struct minlat_tgid_ctx *ctx = leader->minlat.tgid_ctx;
+	if (!leader || leader == p)
+		return;
 
-		minlat_tgid_ctx_get(ctx);
+	/*
+	 * Try to inherit the leader's published ctx.  Use READ_ONCE to
+	 * prevent double-read TOCTOU and refcount_inc_not_zero to handle
+	 * concurrent task_dead_minlat freeing the ctx.
+	 */
+	ctx = READ_ONCE(leader->minlat.tgid_ctx);
+	if (ctx && refcount_inc_not_zero(&ctx->refcount)) {
 		me->tgid_ctx = ctx;
 		atomic_inc(&ctx->nr_tasks);
 		return;
 	}
 
-	/* Only allocate for threads, not single-threaded fork children */
-	if (leader && leader != p) {
-		struct minlat_tgid_ctx *new_ctx, *existing;
+	/* Allocate new ctx for this thread */
+	ctx = minlat_tgid_ctx_alloc(task_cpu(p));
+	if (!ctx)
+		return;
 
-		new_ctx = minlat_tgid_ctx_alloc(task_cpu(p));
-		if (!new_ctx)
-			return;
+	/*
+	 * Don't publish on the leader if it's exiting.  PF_EXITING is
+	 * set in do_exit() before task_dead_minlat runs, so if we see
+	 * it, task_dead may have already run and any ref we add for the
+	 * leader would never be freed.  If PF_EXITING is not yet set,
+	 * task_dead_minlat is guaranteed to run later and will clean up.
+	 */
+	if (READ_ONCE(leader->flags) & PF_EXITING) {
+		me->tgid_ctx = ctx;
+		return;
+	}
+
+	{
+		struct minlat_tgid_ctx *existing;
 
 		/*
 		 * Publish on the leader so sibling threads can share it.
 		 * Race with other children: loser adopts the winner's ctx.
 		 * Count the leader as a task so task_dead_minlat balances.
 		 */
-		existing = cmpxchg(&leader->minlat.tgid_ctx, NULL, new_ctx);
+		existing = cmpxchg(&leader->minlat.tgid_ctx, NULL, ctx);
 		if (!existing) {
 			/* Won: add ref + task count for the leader */
-			minlat_tgid_ctx_get(new_ctx);
-			atomic_inc(&new_ctx->nr_tasks);
-			me->tgid_ctx = new_ctx;
-		} else {
-			/* Lost: adopt the leader's ctx, free ours */
-			minlat_tgid_ctx_put(new_ctx);
-			minlat_tgid_ctx_get(existing);
+			minlat_tgid_ctx_get(ctx);
+			atomic_inc(&ctx->nr_tasks);
+			me->tgid_ctx = ctx;
+		} else if (refcount_inc_not_zero(&existing->refcount)) {
+			/* Lost: adopt the winner's ctx */
+			minlat_tgid_ctx_put(ctx);
 			me->tgid_ctx = existing;
 			atomic_inc(&existing->nr_tasks);
+		} else {
+			/*
+			 * Lost but winner's ctx is being freed concurrently.
+			 * Use our own without publishing.
+			 */
+			me->tgid_ctx = ctx;
 		}
 	}
 }
@@ -4276,11 +4300,16 @@ static void task_dead_minlat(struct task_struct *p)
 	struct minlat_tgid_ctx *ctx = p->minlat.tgid_ctx;
 
 	if (ctx) {
+		/*
+		 * Clear the pointer before put to prevent concurrent
+		 * readers from seeing a dangling pointer after the
+		 * refcount drops to zero and the ctx is freed.
+		 */
+		WRITE_ONCE(p->minlat.tgid_ctx, NULL);
 		if (p->minlat.prev_llc == ctx->preferred_llc)
 			atomic_dec(&ctx->nr_on_llc);
 		atomic_dec(&ctx->nr_tasks);
 		minlat_tgid_ctx_put(ctx);
-		p->minlat.tgid_ctx = NULL;
 	}
 }
 
