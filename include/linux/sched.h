@@ -762,14 +762,35 @@ struct minlat_tgid_ctx {
 };
 
 struct sched_minlat_entity {
-	struct rb_node			run_node;
+	/*
+	 * Cacheline 0: context-switch hot fields.
+	 * put_prev/set_next touch these every switch — keep together.
+	 */
+	struct rb_node			run_node;	/* 24 bytes */
 	u64				vruntime;
-	u64				min_vruntime;	/* snapshot for migration */
-	unsigned int			minlat_prio;	/* 0-7, 0 = highest */
 	unsigned int			on_rq;
-	struct load_weight		load;
+	unsigned int			sched_delayed;
+	struct load_weight		load;		/* 16 bytes */
+
+	/*
+	 * Cacheline 1: exec timing (duplicated from se for locality)
+	 * and remaining switch-path fields.
+	 */
+	u64				exec_start;
+	u64				sum_exec_runtime;
+	u64				prev_sum_exec_runtime;
+	unsigned int			llc_runs;
+	unsigned int			minlat_prio;	/* 0-7, 0 = highest */
+	u64				min_vruntime;	/* snapshot for migration */
+
+	/* Migration and placement (cold path) */
 	struct minlat_tgid_ctx		*tgid_ctx;	/* per-tgid placement */
 	int				prev_llc;	/* LLC we last ran on */
+
+	/* Latency nice: -20 (latency-sensitive) to 19 (throughput) */
+	int				latency_nice;
+	unsigned int			latency_weight; /* from nice weight table */
+	u32				latency_wmult;  /* inverse weight (2^32/w) */
 
 	/* migration stickiness: timestamp of last migration */
 	u64				last_migrate_ts;
@@ -779,14 +800,6 @@ struct sched_minlat_entity {
 	u64				total_sleep_ns;
 	u64				total_run_ns;
 	unsigned int			interactive : 1; /* short-burst task */
-
-	/* LLC stickiness: runs on current LLC since last migration */
-	unsigned int			llc_runs;
-
-	/* Latency nice: -20 (latency-sensitive) to 19 (throughput) */
-	int				latency_nice;
-	unsigned int			latency_weight; /* from nice weight table */
-	u32				latency_wmult;  /* inverse weight (2^32/w) */
 
 	/* PELT tracking for task placement and load balancing */
 	struct sched_avg		avg;

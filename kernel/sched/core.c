@@ -4412,6 +4412,13 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 	/* A delayed task cannot be in clone(). */
 	WARN_ON_ONCE(p->se.sched_delayed);
 
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	p->minlat.exec_start		= 0;
+	p->minlat.sum_exec_runtime	= 0;
+	p->minlat.prev_sum_exec_runtime	= 0;
+	p->minlat.sched_delayed		= 0;
+#endif
+
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	p->se.cfs_rq			= NULL;
 #ifdef CONFIG_CFS_BANDWIDTH
@@ -5980,7 +5987,7 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 			if (me && !RB_EMPTY_NODE(&me->run_node)) {
 				p = container_of(me, struct task_struct,
 						 minlat);
-				if (likely(!p->se.sched_delayed)) {
+				if (likely(!me->sched_delayed)) {
 					rq->minlat.next = NULL;
 					minlat_put_prev_set_next(rq, prev, p);
 					return p;
@@ -6002,7 +6009,7 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 					run_node);
 				p = container_of(me,
 					struct task_struct, minlat);
-				if (likely(!p->se.sched_delayed)) {
+				if (likely(!me->sched_delayed)) {
 					minlat_put_prev_set_next(
 						rq, prev, p);
 					return p;
@@ -6017,7 +6024,7 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 			if (rq->minlat.curr && rq->minlat.curr->on_rq) {
 				p = container_of(rq->minlat.curr,
 						 struct task_struct, minlat);
-				if (unlikely(p->se.sched_delayed))
+				if (unlikely(rq->minlat.curr->sched_delayed))
 					goto restart;
 				minlat_put_prev_set_next(rq, prev, p);
 				return p;
