@@ -1337,7 +1337,11 @@ static inline bool __need_bw_check(struct rq *rq, struct task_struct *p)
 	if (rq->nr_running != 1)
 		return false;
 
-	if (p->sched_class != &fair_sched_class)
+	if (p->sched_class != &fair_sched_class
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	    && p->sched_class != &minlat_sched_class
+#endif
+	   )
 		return false;
 
 	if (!task_on_rq_queued(p))
@@ -1374,15 +1378,20 @@ bool sched_can_stop_tick(struct rq *rq)
 		return true;
 
 	/*
-	 * If there are no DL,RR/FIFO tasks, there must only be CFS or SCX tasks
-	 * left. For CFS, if there's more than one we need the tick for
-	 * involuntary preemption. For SCX, ask.
+	 * If there are no DL,RR/FIFO tasks, there must only be CFS, minlat,
+	 * or SCX tasks left. For CFS/minlat, if there's more than one we
+	 * need the tick for involuntary preemption. For SCX, ask.
 	 */
 	if (scx_enabled() && !scx_can_stop_tick(rq))
 		return false;
 
 	if (rq->cfs.h_nr_queued > 1)
 		return false;
+
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	if (rq->minlat.nr_running > 1)
+		return false;
+#endif
 
 	/*
 	 * If there is one task and it has CFS runtime bandwidth constraints

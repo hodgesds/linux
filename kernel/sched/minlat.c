@@ -1636,6 +1636,33 @@ static inline void minlat_init_bw_entity(struct sched_minlat_entity *me)
 	INIT_LIST_HEAD(&me->bw_throttled_node);
 }
 
+#ifdef CONFIG_NO_HZ_FULL
+/*
+ * When picking a bandwidth-constrained minlat task as the sole runnable
+ * task on a nohz_full CPU, ensure the tick keeps running to enforce
+ * bandwidth limits. Without this, the tick could stop and the task
+ * would run indefinitely, violating cpu.max.
+ *
+ * Mirrors sched_fair_update_stop_tick() in fair.c.
+ */
+static void sched_minlat_update_stop_tick(struct rq *rq, struct task_struct *p)
+{
+	int cpu = cpu_of(rq);
+
+	if (!cfs_bandwidth_used())
+		return;
+
+	if (!tick_nohz_full_cpu(cpu))
+		return;
+
+	if (rq->nr_running != 1)
+		return;
+
+	if (cfs_task_bw_constrained(p))
+		tick_nohz_dep_set_cpu(cpu, TICK_DEP_BIT_SCHED);
+}
+#endif /* CONFIG_NO_HZ_FULL */
+
 #else /* !CONFIG_CFS_BANDWIDTH */
 
 static inline void minlat_account_bw_runtime(struct rq *rq,
@@ -1650,6 +1677,11 @@ static inline void minlat_init_bw_entity(struct sched_minlat_entity *me) {}
 void minlat_unthrottle_bw(struct rq *rq, struct task_group *tg) {}
 
 #endif /* CONFIG_CFS_BANDWIDTH */
+
+#if !defined(CONFIG_CFS_BANDWIDTH) || !defined(CONFIG_NO_HZ_FULL)
+static inline void sched_minlat_update_stop_tick(struct rq *rq,
+						 struct task_struct *p) {}
+#endif
 
 /* ==== runqueue init ==== */
 
@@ -2534,6 +2566,9 @@ set_next_task_minlat(struct rq *rq, struct task_struct *p, bool first)
 
 	/* Update misfit status for the newly scheduled task */
 	minlat_update_misfit_status(p, rq);
+
+	/* Ensure tick stays on for bw-constrained tasks on nohz_full CPUs */
+	sched_minlat_update_stop_tick(rq, p);
 }
 
 /* ==== SMT-aware interactivity tracking ==== */
