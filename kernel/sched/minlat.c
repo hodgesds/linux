@@ -2199,7 +2199,13 @@ static bool yield_to_task_minlat(struct rq *rq, struct task_struct *p)
 	if (!me->on_rq)
 		return false;
 
-	set_next_buddy_minlat(&rq->minlat, me);
+	/*
+	 * Set buddy on p's rq, not the yielding rq.  CFS does this
+	 * via cfs_rq_of(se)->next; we must use task_rq(p) since
+	 * p may be on a different CPU.  Both rqs are double-locked
+	 * by the caller (yield_to in syscalls.c).
+	 */
+	set_next_buddy_minlat(&task_rq(p)->minlat, me);
 
 	yield_task_minlat(rq);
 
