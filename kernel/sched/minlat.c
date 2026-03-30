@@ -1895,11 +1895,18 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 		me->on_rq = 1;
 	} else {
 		/*
-		 * Re-enqueue from sched_move_task (cgroup change) or
-		 * other dequeue+enqueue cycles that don't go through
-		 * sleep. Recompute weight in case cgroup shares changed.
+		 * Re-enqueue from migration or sched_move_task.
+		 * Recompute weight and normalize vruntime against
+		 * the (possibly new) rq's min_vruntime.
+		 *
+		 * CFS unconditionally clears se->on_rq in dequeue_entity,
+		 * so live migration always runs through place_entity() on
+		 * the destination rq. Minlat keeps on_rq=1 for non-sleep
+		 * dequeues, so we must explicitly place here to prevent
+		 * unfairness when CPUs have divergent min_vruntimes.
 		 */
 		minlat_set_load_weight(p);
+		place_minlat_entity(minlat_rq, me, flags);
 	}
 
 	/*
