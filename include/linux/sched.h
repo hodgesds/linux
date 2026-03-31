@@ -748,6 +748,101 @@ struct sched_dl_entity {
 #endif
 };
 
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+#define MINLAT_MAX_LLCS		64	/* max tracked LLC domains */
+#define MINLAT_TGID_MAX_LLCS	8	/* per-tgid LLC tracking slots */
+
+/*
+ * Per-LLC thread count for a thread group.
+ * Compact representation: 8 slots of (llc_id, count) pairs.
+ * Covers up to 8 distinct LLCs per tgid — sufficient for most
+ * workloads. If a tgid spans more, it's already well-spread.
+ */
+struct minlat_llc_count {
+	int			llc_id;		/* sd_llc_id, -1 = unused */
+	atomic_t		nr_tasks;	/* threads on this LLC */
+};
+
+struct minlat_tgid_ctx {
+	refcount_t			refcount;
+	int				preferred_node;	/* NUMA node affinity */
+	int				preferred_llc;	/* preferred LLC id */
+	cpumask_var_t			llc_cpus;	/* CPUs in preferred LLC */
+	atomic_t			nr_tasks;	/* tasks in this group */
+	atomic_t			nr_on_llc;	/* tasks on preferred LLC */
+	raw_spinlock_t			lock;
+
+	/* Per-LLC thread distribution tracking */
+	struct minlat_llc_count		llcs[MINLAT_TGID_MAX_LLCS];
+
+	struct rcu_head			rcu;
+};
+
+struct sched_minlat_entity {
+	/*
+	 * Cacheline 0: context-switch hot fields.
+	 * put_prev/set_next touch these every switch — keep together.
+	 */
+	struct rb_node			run_node;	/* 24 bytes */
+	u64				vruntime;
+	unsigned int			on_rq;
+	struct load_weight		load;		/* 16 bytes */
+
+	/*
+	 * Exec timing uses p->se.exec_start, p->se.sum_exec_runtime,
+	 * and p->se.prev_sum_exec_runtime — single source of truth.
+	 */
+	unsigned int			llc_runs;
+	unsigned int			minlat_prio;	/* 0-7, 0 = highest */
+
+	/* Migration and placement (cold path) */
+	struct minlat_tgid_ctx		*tgid_ctx;	/* per-tgid placement */
+	int				prev_llc;	/* LLC we last ran on */
+
+	/* Latency nice: -20 (latency-sensitive) to 19 (throughput) */
+	int				latency_nice;
+	unsigned int			latency_weight; /* from nice weight table */
+	u32				latency_wmult;  /* inverse weight (2^32/w) */
+
+	/* migration stickiness: timestamp of last migration */
+	u64				last_migrate_ts;
+
+	/* preempt resist: timestamp of last involuntary preemption */
+	u64				last_preempt_ts;
+
+	/* SMT-aware interactivity tracking */
+	u64				last_sleep_duration;
+	u64				total_sleep_ns;
+	u64				total_run_ns;
+	unsigned int			interactive : 1; /* short-burst task */
+
+	/*
+	 * Wake-burst spread: tracked on the WAKER side.
+	 *
+	 * When a task dispatches multiple ttwu wakeups in a tight loop
+	 * (e.g. a message thread waking N workers), the per-wake CPU
+	 * selection is stateless and tends to return the same target
+	 * for each call, piling the burst onto one runqueue. These
+	 * fields let select_task_rq_minlat detect that streak and
+	 * rotate later wakes within the same LLC.
+	 */
+	int				last_wake_target_cpu;
+	u8				wake_target_streak;
+	u64				last_wake_target_ts;
+
+	/* PELT tracking for task placement and load balancing */
+	struct sched_avg		avg;
+
+#ifdef CONFIG_CFS_BANDWIDTH
+	unsigned int			bw_throttled;
+	struct list_head		bw_throttled_node;
+#endif
+};
+
+#define MIN_LATENCY_NICE	(-20)
+#define MAX_LATENCY_NICE	19
+#endif
+
 #ifdef CONFIG_UCLAMP_TASK
 /* Number of utilization clamp buckets (shorter alias) */
 #define UCLAMP_BUCKETS CONFIG_UCLAMP_BUCKETS_COUNT
@@ -874,6 +969,9 @@ struct task_struct {
 	struct sched_dl_entity		*dl_server;
 #ifdef CONFIG_SCHED_CLASS_EXT
 	struct sched_ext_entity		scx;
+#endif
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	struct sched_minlat_entity	minlat;
 #endif
 	const struct sched_class	*sched_class;
 

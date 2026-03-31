@@ -177,7 +177,7 @@ accumulate_sum(u64 delta, struct sched_avg *sa,
  *   load_avg = u_0` + y*(u_0 + u_1*y + u_2*y^2 + ... )
  *            = u_0 + u_1*y + u_2*y^2 + ... [re-labeling u_i --> u_{i+1}]
  */
-static __always_inline int
+__always_inline int
 ___update_load_sum(u64 now, struct sched_avg *sa,
 		  unsigned long load, unsigned long runnable, int running)
 {
@@ -254,7 +254,7 @@ ___update_load_sum(u64 now, struct sched_avg *sa,
  * the period_contrib of cfs_rq when updating the sched_avg of a sched_entity
  * if it's more convenient.
  */
-static __always_inline void
+__always_inline void
 ___update_load_avg(struct sched_avg *sa, unsigned long load)
 {
 	u32 divider = get_pelt_divider(sa);
@@ -385,6 +385,37 @@ int update_dl_rq_load_avg(u64 now, struct rq *rq, int running)
 	return 0;
 }
 
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+/*
+ * minlat_rq:
+ *
+ *   Entity-aggregate signal, like CFS's __update_load_avg_cfs_rq().
+ *   The rq-level PELT tracks the sum of entity contributions:
+ *
+ *   load:     aggregate weight of all enqueued minlat entities
+ *   runnable: number of runnable minlat entities
+ *   running:  is any minlat task currently executing? (binary)
+ *
+ *   This gives schedutil a proportional utilization signal and
+ *   allows correct per-entity subtraction for migration and EAS.
+ */
+int update_minlat_rq_load_avg(u64 now, struct rq *rq, int running)
+{
+	struct minlat_rq *mrq = &rq->minlat;
+
+	if (___update_load_sum(now, &mrq->avg,
+				scale_load_down(mrq->load_weight),
+				mrq->nr_running,
+				running)) {
+
+		___update_load_avg(&mrq->avg, 1);
+		return 1;
+	}
+
+	return 0;
+}
+#endif /* CONFIG_SCHED_CLASS_MINLAT */
+
 #ifdef CONFIG_SCHED_HW_PRESSURE
 /*
  * hardware:
@@ -485,6 +516,9 @@ bool update_other_load_avgs(struct rq *rq)
 	/* hw_pressure doesn't care about invariance */
 	return update_rt_rq_load_avg(now, rq, curr_class == &rt_sched_class) |
 		update_dl_rq_load_avg(now, rq, curr_class == &dl_sched_class) |
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+		update_minlat_rq_load_avg(now, rq, curr_class == &minlat_sched_class) |
+#endif
 		update_hw_load_avg(rq_clock_task(rq), rq, hw_pressure) |
 		update_irq_load_avg(rq, 0);
 }

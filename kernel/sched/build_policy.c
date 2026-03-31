@@ -39,6 +39,8 @@
 #include <uapi/linux/sched/types.h>
 
 #include "sched.h"
+
+#include <trace/events/ipi.h>
 #include "smp.h"
 
 #include "autogroup.h"
@@ -56,6 +58,10 @@
 
 #include "cputime.c"
 #include "deadline.c"
+
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+# include "minlat.c"
+#endif
 
 #ifdef CONFIG_SCHED_CLASS_EXT
 # include "ext_internal.h"

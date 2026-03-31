@@ -225,10 +225,7 @@ void __init sched_init_granularity(void)
 	update_sysctl();
 }
 
-#define WMULT_CONST	(~0U)
-#define WMULT_SHIFT	32
-
-static void __update_inv_weight(struct load_weight *lw)
+void __update_inv_weight(struct load_weight *lw)
 {
 	unsigned long w;
 
@@ -257,7 +254,7 @@ static void __update_inv_weight(struct load_weight *lw)
  * Or, weight =< lw.weight (because lw.weight is the runqueue weight), thus
  * weight/lw.weight <= 1, and therefore our shift will also be positive.
  */
-static u64 __calc_delta(u64 delta_exec, unsigned long weight, struct load_weight *lw)
+u64 __calc_delta(u64 delta_exec, unsigned long weight, struct load_weight *lw)
 {
 	u64 fact = scale_load_down(weight);
 	u32 fact_hi = (u32)(fact >> 32);
@@ -3794,16 +3791,7 @@ account_entity_dequeue(struct cfs_rq *cfs_rq, struct sched_entity *se)
 	WRITE_ONCE(*ptr, res);                                  \
 } while (0)
 
-/*
- * Remove and clamp on negative, from a local variable.
- *
- * A variant of sub_positive(), which does not use explicit load-store
- * and is thus optimized for local variable updates.
- */
-#define lsub_positive(_ptr, _val) do {				\
-	typeof(_ptr) ptr = (_ptr);				\
-	*ptr -= min_t(typeof(*ptr), *ptr, _val);		\
-} while (0)
+/* lsub_positive is shared from sched.h */
 
 
 /*
@@ -4896,7 +4884,7 @@ static inline void util_est_dequeue(struct cfs_rq *cfs_rq,
 	trace_sched_util_est_cfs_tp(cfs_rq);
 }
 
-#define UTIL_EST_MARGIN (SCHED_CAPACITY_SCALE / 100)
+/* UTIL_EST_MARGIN is now defined in sched.h */
 
 static inline void util_est_update(struct cfs_rq *cfs_rq,
 				   struct task_struct *p,
@@ -6076,9 +6064,12 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 	/* update hierarchical throttle state */
 	walk_tg_tree_from(cfs_rq->tg, tg_nop, tg_unthrottle_up, (void *)rq);
 
+	/* Re-enqueue any throttled minlat tasks for this tg */
+	minlat_unthrottle_bw(rq, cfs_rq->tg);
+
 	if (!cfs_rq->load.weight) {
 		if (!cfs_rq->on_list)
-			return;
+			goto out_resched;
 		/*
 		 * Nothing to run but something to decay (on_list)?
 		 * Complete the branch.
@@ -6091,8 +6082,13 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 
 	assert_list_leaf_cfs_rq(rq);
 
+out_resched:
 	/* Determine whether we need to wake up potentially idle CPU: */
-	if (rq->curr == rq->idle && rq->cfs.nr_queued)
+	if (rq->curr == rq->idle && (rq->cfs.nr_queued
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	    || rq->minlat.nr_running
+#endif
+	    ))
 		resched_curr(rq);
 }
 
@@ -8163,13 +8159,14 @@ unsigned long effective_cpu_util(int cpu, unsigned long util_cfs,
 	}
 
 	/*
-	 * Because the time spend on RT/DL tasks is visible as 'lost' time to
-	 * CFS tasks and we use the same metric to track the effective
+	 * Because the time spend on RT/DL/minlat tasks is visible as 'lost'
+	 * time to CFS tasks and we use the same metric to track the effective
 	 * utilization (PELT windows are synchronized) we can directly add them
 	 * to obtain the CPU's actual utilization.
 	 */
 	util = util_cfs + cpu_util_rt(rq);
 	util += cpu_util_dl(rq);
+	util += cpu_util_minlat(rq);
 
 	/*
 	 * The maximum hint is a soft bandwidth requirement, which can be lower
@@ -8703,7 +8700,7 @@ static void task_dead_fair(struct task_struct *p)
 /*
  * Set the max capacity the task is allowed to run at for misfit detection.
  */
-static void set_task_max_allowed_capacity(struct task_struct *p)
+void set_task_max_allowed_capacity(struct task_struct *p)
 {
 	struct asym_cap_data *entry;
 
