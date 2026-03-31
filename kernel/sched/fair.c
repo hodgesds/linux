@@ -6096,7 +6096,11 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 
 out_resched:
 	/* Determine whether we need to wake up potentially idle CPU: */
-	if (rq->curr == rq->idle && (rq->cfs.nr_queued || rq->minlat.nr_running))
+	if (rq->curr == rq->idle && (rq->cfs.nr_queued
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	    || rq->minlat.nr_running
+#endif
+	    ))
 		resched_curr(rq);
 }
 
