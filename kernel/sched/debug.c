@@ -632,6 +632,46 @@ static __init int sched_init_debug(void)
 	debugfs_ext_server_init();
 #endif
 
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	{
+		struct dentry *d_minlat;
+
+		d_minlat = debugfs_create_dir("minlat", debugfs_sched);
+		debugfs_create_u32("latency_ns", 0644, d_minlat,
+				   &minlat_latency_ns);
+		debugfs_create_u32("min_granularity_ns", 0644, d_minlat,
+				   &minlat_min_granularity_ns);
+		debugfs_create_u32("cache_hot_ns", 0644, d_minlat,
+				   &minlat_cache_hot_ns);
+		debugfs_create_u32("numa_imbalance_min", 0644, d_minlat,
+				   &minlat_numa_imbalance_min);
+		debugfs_create_u32("migration_cooldown_ns", 0644, d_minlat,
+				   &minlat_migration_cooldown_ns);
+		debugfs_create_u32("numa_saturated_pct", 0644, d_minlat,
+				   &minlat_numa_saturated_pct);
+		debugfs_create_u32("wake_affine", 0644, d_minlat,
+				   &minlat_wake_affine);
+		debugfs_create_u32("wakeup_preempt_thresh_ns", 0644, d_minlat,
+				   &minlat_wakeup_preempt_thresh_ns);
+		debugfs_create_u32("fork_imbalance_pct", 0644, d_minlat,
+				   &minlat_fork_imbalance_pct);
+		debugfs_create_u32("fork_numa_imbalance_pct", 0644, d_minlat,
+				   &minlat_fork_numa_imbalance_pct);
+		debugfs_create_u32("interactive_big_prefer", 0644, d_minlat,
+				   &minlat_interactive_big_prefer);
+		debugfs_create_u32("compute_big_prefer", 0644, d_minlat,
+				   &minlat_compute_big_prefer);
+		debugfs_create_u32("llc_stickiness", 0644, d_minlat,
+				   &minlat_llc_stickiness);
+
+		{
+			extern const struct file_operations minlat_enabled_fops;
+			debugfs_create_file("enabled", 0644, d_minlat,
+					    NULL, &minlat_enabled_fops);
+		}
+	}
+#endif
+
 	return 0;
 }
 late_initcall(sched_init_debug);
@@ -899,6 +939,59 @@ static void print_rq(struct seq_file *m, struct rq *rq, int rq_cpu)
 	rcu_read_unlock();
 }
 
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+static void print_minlat_rq(struct seq_file *m, int cpu)
+{
+	struct rq *rq = cpu_rq(cpu);
+	struct minlat_rq *minlat_rq = &rq->minlat;
+	struct rb_node *leftmost;
+	s64 left_vruntime = -1;
+	unsigned long flags;
+
+	SEQ_printf(m, "\n");
+	SEQ_printf(m, "minlat_rq[%d]:\n", cpu);
+
+	raw_spin_rq_lock_irqsave(rq, flags);
+	leftmost = rb_first_cached(&minlat_rq->tasks_timeline);
+	if (leftmost) {
+		struct sched_minlat_entity *me;
+
+		me = rb_entry(leftmost, struct sched_minlat_entity, run_node);
+		left_vruntime = me->vruntime;
+	}
+	raw_spin_rq_unlock_irqrestore(rq, flags);
+
+#define P(x) \
+	SEQ_printf(m, "  .%-30s: %d\n", #x, minlat_rq->x)
+#define Pn(x) \
+	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", #x, SPLIT_NS(minlat_rq->x))
+#define Pl(x) \
+	SEQ_printf(m, "  .%-30s: %lu\n", #x, minlat_rq->x)
+
+	P(nr_running);
+	P(nr_delayed);
+	Pn(min_vruntime);
+	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "left_vruntime",
+		   SPLIT_NS(left_vruntime));
+	Pl(load_weight);
+	SEQ_printf(m, "  .%-30s: %lu\n", "util_avg",
+		   minlat_rq->avg.util_avg);
+	SEQ_printf(m, "  .%-30s: %lu\n", "load_avg",
+		   minlat_rq->avg.load_avg);
+	SEQ_printf(m, "  .%-30s: %u\n", "util_est",
+		   minlat_rq->util_est);
+	SEQ_printf(m, "  .%-30s: %d\n", "overloaded",
+		   minlat_rq->overloaded);
+#ifdef CONFIG_CFS_BANDWIDTH
+	P(nr_bw_throttled);
+#endif
+
+#undef P
+#undef Pn
+#undef Pl
+}
+#endif /* CONFIG_SCHED_CLASS_MINLAT */
+
 void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
 {
 	s64 left_vruntime = -1, zero_vruntime, right_vruntime = -1, left_deadline = -1, spread;
@@ -1075,6 +1168,9 @@ do {									\
 	}
 #undef P
 
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	print_minlat_rq(m, cpu);
+#endif
 	print_cfs_stats(m, cpu);
 	print_rt_stats(m, cpu);
 	print_dl_stats(m, cpu);
