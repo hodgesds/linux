@@ -1337,7 +1337,11 @@ static inline bool __need_bw_check(struct rq *rq, struct task_struct *p)
 	if (rq->nr_running != 1)
 		return false;
 
-	if (p->sched_class != &fair_sched_class)
+	if (p->sched_class != &fair_sched_class
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	    && p->sched_class != &minlat_sched_class
+#endif
+	   )
 		return false;
 
 	if (!task_on_rq_queued(p))
@@ -1374,15 +1378,20 @@ bool sched_can_stop_tick(struct rq *rq)
 		return true;
 
 	/*
-	 * If there are no DL,RR/FIFO tasks, there must only be CFS or SCX tasks
-	 * left. For CFS, if there's more than one we need the tick for
-	 * involuntary preemption. For SCX, ask.
+	 * If there are no DL,RR/FIFO tasks, there must only be CFS, minlat,
+	 * or SCX tasks left. For CFS/minlat, if there's more than one we
+	 * need the tick for involuntary preemption. For SCX, ask.
 	 */
 	if (scx_enabled() && !scx_can_stop_tick(rq))
 		return false;
 
 	if (rq->cfs.h_nr_queued > 1)
 		return false;
+
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	if (rq->minlat.nr_running > 1)
+		return false;
+#endif
 
 	/*
 	 * If there is one task and it has CFS runtime bandwidth constraints
@@ -4403,6 +4412,13 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 	/* A delayed task cannot be in clone(). */
 	WARN_ON_ONCE(p->se.sched_delayed);
 
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	p->minlat.exec_start		= 0;
+	p->minlat.sum_exec_runtime	= 0;
+	p->minlat.prev_sum_exec_runtime	= 0;
+	p->minlat.sched_delayed		= 0;
+#endif
+
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	p->se.cfs_rq			= NULL;
 #ifdef CONFIG_CFS_BANDWIDTH
@@ -4425,6 +4441,25 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 
 #ifdef CONFIG_SCHED_CLASS_EXT
 	init_scx_entity(&p->scx);
+#endif
+
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	RB_CLEAR_NODE(&p->minlat.run_node);
+	p->minlat.vruntime = 0;
+	p->minlat.min_vruntime = 0;
+	p->minlat.minlat_prio = 0;
+	p->minlat.on_rq = 0;
+	p->minlat.tgid_ctx = NULL;
+	p->minlat.prev_llc = -1;
+	p->minlat.last_sleep_duration = 0;
+	p->minlat.total_sleep_ns = 0;
+	p->minlat.total_run_ns = 0;
+	p->minlat.interactive = 0;
+	minlat_init_latency_nice(&p->minlat, p->minlat.latency_nice);
+#ifdef CONFIG_CFS_BANDWIDTH
+	p->minlat.bw_throttled = 0;
+	INIT_LIST_HEAD(&p->minlat.bw_throttled_node);
+#endif
 #endif
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS
@@ -4645,7 +4680,8 @@ int sched_fork(u64 clone_flags, struct task_struct *p)
 	 * Revert to default priority/policy on fork if requested.
 	 */
 	if (unlikely(p->sched_reset_on_fork)) {
-		if (task_has_dl_policy(p) || task_has_rt_policy(p)) {
+		if (task_has_dl_policy(p) || task_has_rt_policy(p) ||
+		    minlat_policy(p->policy)) {
 			p->policy = SCHED_NORMAL;
 			p->static_prio = NICE_TO_PRIO(0);
 			p->rt_priority = 0;
@@ -4674,6 +4710,10 @@ int sched_fork(u64 clone_flags, struct task_struct *p)
 #ifdef CONFIG_SCHED_CLASS_EXT
 	} else if (task_should_scx(p->policy)) {
 		p->sched_class = &ext_sched_class;
+#endif
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	} else if (minlat_enabled()) {
+		p->sched_class = &minlat_sched_class;
 #endif
 	} else {
 		p->sched_class = &fair_sched_class;
@@ -5913,6 +5953,102 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 
 	if (scx_enabled())
 		goto restart;
+
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	/*
+	 * Minlat fast path: when only minlat+CFS tasks exist and prev is
+	 * at or below minlat class, pick directly without prev_balance()
+	 * or iterating stop/dl/rt pick_task callbacks.
+	 *
+	 * Priority order:
+	 *  1. Wakeup buddy (set by sync wakeup — O(1), no tree traversal)
+	 *  2. Leftmost in rb-tree (with inline delayed entity handling)
+	 *  3. Curr out-of-tree fallback
+	 */
+	if (!sched_class_above(prev->sched_class, &minlat_sched_class) &&
+	    rq->nr_running == rq->minlat.nr_running + rq->cfs.h_nr_queued) {
+#ifdef CONFIG_CFS_BANDWIDTH
+		/* Bandwidth throttle pending — fall to slow path */
+		if (unlikely(rq->minlat.bw_needs_throttle))
+			goto restart;
+#endif
+		if (rq->minlat.nr_running) {
+			struct sched_minlat_entity *me;
+			struct rb_node *left;
+
+			/*
+			 * Buddy fast path: sync wakeups set a buddy via
+			 * wakeup_preempt. Pick it directly — the buddy
+			 * was just woken (ttwu_runnable cleared its
+			 * delayed flag), so it's always non-delayed.
+			 * Avoids tree traversal entirely for pipe/IPC.
+			 */
+			me = rq->minlat.next;
+			if (me && !RB_EMPTY_NODE(&me->run_node)) {
+				p = container_of(me, struct task_struct,
+						 minlat);
+				if (likely(!me->sched_delayed)) {
+					rq->minlat.next = NULL;
+					minlat_put_prev_set_next(rq, prev, p);
+					return p;
+				}
+			}
+
+			/*
+			 * Tree pick: check leftmost only. If delayed,
+			 * fall to restart — pick_task_minlat will
+			 * force-dequeue it (mirrors CFS approach).
+			 * Avoids O(n) scan that degrades at high
+			 * oversubscription.
+			 */
+			left = rb_first_cached(
+					&rq->minlat.tasks_timeline);
+			if (left) {
+				me = rb_entry(left,
+					struct sched_minlat_entity,
+					run_node);
+				p = container_of(me,
+					struct task_struct, minlat);
+				if (likely(!me->sched_delayed)) {
+					minlat_put_prev_set_next(
+						rq, prev, p);
+					return p;
+				}
+				goto restart;
+			}
+
+			/*
+			 * Tree empty but nr_running > 0: the only minlat
+			 * task is curr (out-of-tree). Re-pick it.
+			 */
+			if (rq->minlat.curr && rq->minlat.curr->on_rq) {
+				p = container_of(rq->minlat.curr,
+						 struct task_struct, minlat);
+				if (unlikely(rq->minlat.curr->sched_delayed))
+					goto restart;
+				minlat_put_prev_set_next(rq, prev, p);
+				return p;
+			}
+
+			/*
+			 * No minlat entities — nr_running > 0 due to
+			 * delayed entities. Fall to pick_task_minlat
+			 * for cleanup.
+			 */
+			goto restart;
+		}
+
+		/* No minlat tasks — fall through to CFS */
+		p = pick_next_task_fair(rq, prev, rf);
+		if (unlikely(p == RETRY_TASK))
+			goto restart;
+		if (!p) {
+			p = pick_task_idle(rq, rf);
+			put_prev_set_next_task(rq, prev, p);
+		}
+		return p;
+	}
+#endif
 
 	/*
 	 * Optimization: we know that if all tasks are in the fair class we can
@@ -7253,6 +7389,15 @@ const struct sched_class *__setscheduler_class(int policy, int prio)
 	if (dl_prio(prio))
 		return &dl_sched_class;
 
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	/*
+	 * minlat_policy check must come before rt_prio because minlat
+	 * tasks use RT-range priority values but belong to minlat class.
+	 */
+	if (minlat_policy(policy))
+		return &minlat_sched_class;
+#endif
+
 	if (rt_prio(prio))
 		return &rt_sched_class;
 
@@ -7261,6 +7406,11 @@ const struct sched_class *__setscheduler_class(int policy, int prio)
 		return &ext_sched_class;
 #endif
 
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	/* minlat takes over all fair tasks when enabled at runtime */
+	if (minlat_enabled())
+		return &minlat_sched_class;
+#endif
 	return &fair_sched_class;
 }
 
@@ -8603,6 +8753,10 @@ void __init sched_init(void)
 	BUG_ON(!sched_class_above(&dl_sched_class, &rt_sched_class));
 	BUG_ON(!sched_class_above(&rt_sched_class, &fair_sched_class));
 	BUG_ON(!sched_class_above(&fair_sched_class, &idle_sched_class));
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	BUG_ON(!sched_class_above(&rt_sched_class, &minlat_sched_class));
+	BUG_ON(!sched_class_above(&minlat_sched_class, &fair_sched_class));
+#endif
 #ifdef CONFIG_SCHED_CLASS_EXT
 	BUG_ON(!sched_class_above(&fair_sched_class, &ext_sched_class));
 	BUG_ON(!sched_class_above(&ext_sched_class, &idle_sched_class));
@@ -8669,6 +8823,9 @@ void __init sched_init(void)
 		init_cfs_rq(&rq->cfs);
 		init_rt_rq(&rq->rt);
 		init_dl_rq(&rq->dl);
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+		init_minlat_rq(&rq->minlat);
+#endif
 #ifdef CONFIG_FAIR_GROUP_SCHED
 		INIT_LIST_HEAD(&rq->leaf_cfs_rq_list);
 		rq->tmp_alone_branch = &rq->leaf_cfs_rq_list;
@@ -8784,6 +8941,9 @@ void __init sched_init(void)
 
 	balance_push_set(smp_processor_id(), false);
 	init_sched_fair_class();
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	init_sched_minlat_class();
+#endif
 	init_sched_ext_class();
 
 	psi_init();
