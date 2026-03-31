@@ -215,10 +215,20 @@ static inline int dl_policy(int policy)
 	return policy == SCHED_DEADLINE;
 }
 
+#define MINLAT_MAX_PRIO 8
+
+static inline int minlat_policy(int policy)
+{
+	if (!IS_ENABLED(CONFIG_SCHED_CLASS_MINLAT))
+		return false;
+	return policy == SCHED_MINLAT;
+}
+
 static inline bool valid_policy(int policy)
 {
 	return idle_policy(policy) || fair_policy(policy) ||
-		rt_policy(policy) || dl_policy(policy);
+		rt_policy(policy) || dl_policy(policy) ||
+		minlat_policy(policy);
 }
 
 static inline int task_has_idle_policy(struct task_struct *p)
@@ -589,6 +599,12 @@ extern void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b);
 extern void unthrottle_cfs_rq(struct cfs_rq *cfs_rq);
 extern bool cfs_task_bw_constrained(struct task_struct *p);
 
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+extern void minlat_unthrottle_bw(struct rq *rq, struct task_group *tg);
+#else
+static inline void minlat_unthrottle_bw(struct rq *rq, struct task_group *tg) {}
+#endif
+
 extern void init_tg_rt_entry(struct task_group *tg, struct rt_rq *rt_rq,
 		struct sched_rt_entity *rt_se, int cpu,
 		struct sched_rt_entity *parent);
@@ -918,6 +934,37 @@ struct dl_rq {
 	u64			bw_ratio;
 };
 
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+
+struct minlat_rq {
+	struct rb_root_cached	tasks_timeline;
+	struct sched_minlat_entity *curr;
+	struct sched_minlat_entity *next;	/* wakeup buddy (like CFS next) */
+	unsigned int		nr_running;
+	unsigned int		nr_delayed;	/* delayed entities on this rq */
+	u64			min_vruntime;
+	unsigned long		load_weight;
+	bool			overloaded;
+
+	/* PELT tracking for schedutil (CPU frequency scaling) */
+	struct sched_avg	avg;
+	unsigned int		util_est;
+
+	/* Active balancing: push tasks from overloaded CPUs */
+	int			active_balance;
+	int			push_cpu;
+	struct cpu_stop_work	active_balance_work;
+	unsigned long		next_balance;
+
+#ifdef CONFIG_CFS_BANDWIDTH
+	struct list_head	bw_throttled_tasks;
+	int			nr_bw_throttled;
+	bool			bw_needs_throttle;
+#endif
+};
+
+#endif /* CONFIG_SCHED_CLASS_MINLAT */
+
 #ifdef CONFIG_FAIR_GROUP_SCHED
 
 /* An entity is a task if it doesn't "own" a runqueue */
@@ -1176,6 +1223,9 @@ struct rq {
 #ifdef CONFIG_SCHED_CLASS_EXT
 	struct scx_rq		scx;
 	struct sched_dl_entity	ext_server;
+#endif
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	struct minlat_rq	minlat;
 #endif
 
 	struct sched_dl_entity	fair_server;
@@ -2161,6 +2211,8 @@ static __always_inline bool sched_asym_cpucap_active(void)
 	return static_branch_unlikely(&sched_asym_cpucapacity);
 }
 
+extern void set_task_max_allowed_capacity(struct task_struct *p);
+
 struct sched_group_capacity {
 	atomic_t		ref;
 	/*
@@ -2718,6 +2770,32 @@ extern const struct sched_class rt_sched_class;
 extern const struct sched_class fair_sched_class;
 extern const struct sched_class idle_sched_class;
 
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+extern const struct sched_class minlat_sched_class;
+extern void init_minlat_rq(struct minlat_rq *minlat_rq);
+extern void init_sched_minlat_class(void);
+extern bool dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags);
+extern void minlat_put_prev_set_next(struct rq *rq,
+				     struct task_struct *prev,
+				     struct task_struct *next);
+DECLARE_STATIC_KEY_TRUE(sched_minlat_enabled);
+static inline bool minlat_enabled(void)
+{
+	return static_branch_likely(&sched_minlat_enabled);
+}
+static inline void minlat_init_latency_nice(struct sched_minlat_entity *me,
+					    int latency_nice)
+{
+	unsigned int idx = latency_nice - MIN_LATENCY_NICE;
+
+	me->latency_nice = latency_nice;
+	me->latency_weight = sched_prio_to_weight[idx];
+	me->latency_wmult = sched_prio_to_wmult[idx];
+}
+#else
+static inline bool minlat_enabled(void) { return false; }
+#endif
+
 /*
  * Iterate only active classes. SCX can take over all fair tasks or be
  * completely disabled. If the former, skip fair. If the latter, skip SCX.
@@ -2778,6 +2856,33 @@ static inline bool sched_fair_runnable(struct rq *rq)
 {
 	return rq->cfs.nr_queued > 0;
 }
+
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+static inline bool sched_minlat_runnable(struct rq *rq)
+{
+	return rq->minlat.nr_running > 0;
+}
+
+/* debugfs-tunable load balancer parameters (defined in minlat.c) */
+extern unsigned int minlat_latency_ns;
+extern unsigned int minlat_min_granularity_ns;
+extern unsigned int minlat_cache_hot_ns;
+extern unsigned int minlat_numa_imbalance_min;
+extern unsigned int minlat_migration_cooldown_ns;
+extern unsigned int minlat_numa_saturated_pct;
+extern unsigned int minlat_wake_affine;
+extern unsigned int minlat_fork_imbalance_pct;
+extern unsigned int minlat_fork_numa_imbalance_pct;
+extern unsigned int minlat_wakeup_preempt_thresh_ns;
+extern unsigned int minlat_interactive_big_prefer;
+extern unsigned int minlat_compute_big_prefer;
+extern unsigned int minlat_llc_stickiness;
+#else
+static inline bool sched_minlat_runnable(struct rq *rq)
+{
+	return false;
+}
+#endif
 
 extern struct task_struct *pick_next_task_fair(struct rq *rq, struct task_struct *prev,
 					       struct rq_flags *rf);
@@ -3527,6 +3632,24 @@ static inline unsigned long cpu_util_rt(struct rq *rq)
 {
 	return READ_ONCE(rq->avg_rt.util_avg);
 }
+
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+static inline unsigned long cpu_util_minlat(struct rq *rq)
+{
+	unsigned long util = READ_ONCE(rq->minlat.avg.util_avg);
+
+	if (sched_feat(UTIL_EST))
+		util = max_t(unsigned long, util,
+			     READ_ONCE(rq->minlat.util_est));
+
+	return util;
+}
+#else
+static inline unsigned long cpu_util_minlat(struct rq *rq)
+{
+	return 0;
+}
+#endif
 
 #ifdef CONFIG_UCLAMP_TASK
 

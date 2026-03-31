@@ -748,6 +748,72 @@ struct sched_dl_entity {
 #endif
 };
 
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+#define MINLAT_MAX_LLCS		64	/* max tracked LLC domains */
+
+struct minlat_tgid_ctx {
+	refcount_t			refcount;
+	int				preferred_node;	/* NUMA node affinity */
+	int				preferred_llc;	/* preferred LLC id */
+	cpumask_var_t			llc_cpus;	/* CPUs in preferred LLC */
+	atomic_t			nr_tasks;	/* tasks in this group */
+	atomic_t			nr_on_llc;	/* tasks on preferred LLC */
+	raw_spinlock_t			lock;
+};
+
+struct sched_minlat_entity {
+	/*
+	 * Cacheline 0: context-switch hot fields.
+	 * put_prev/set_next touch these every switch — keep together.
+	 */
+	struct rb_node			run_node;	/* 24 bytes */
+	u64				vruntime;
+	unsigned int			on_rq;
+	unsigned int			sched_delayed;
+	struct load_weight		load;		/* 16 bytes */
+
+	/*
+	 * Cacheline 1: exec timing (duplicated from se for locality)
+	 * and remaining switch-path fields.
+	 */
+	u64				exec_start;
+	u64				sum_exec_runtime;
+	u64				prev_sum_exec_runtime;
+	unsigned int			llc_runs;
+	unsigned int			minlat_prio;	/* 0-7, 0 = highest */
+	u64				min_vruntime;	/* snapshot for migration */
+
+	/* Migration and placement (cold path) */
+	struct minlat_tgid_ctx		*tgid_ctx;	/* per-tgid placement */
+	int				prev_llc;	/* LLC we last ran on */
+
+	/* Latency nice: -20 (latency-sensitive) to 19 (throughput) */
+	int				latency_nice;
+	unsigned int			latency_weight; /* from nice weight table */
+	u32				latency_wmult;  /* inverse weight (2^32/w) */
+
+	/* migration stickiness: timestamp of last migration */
+	u64				last_migrate_ts;
+
+	/* SMT-aware interactivity tracking */
+	u64				last_sleep_duration;
+	u64				total_sleep_ns;
+	u64				total_run_ns;
+	unsigned int			interactive : 1; /* short-burst task */
+
+	/* PELT tracking for task placement and load balancing */
+	struct sched_avg		avg;
+
+#ifdef CONFIG_CFS_BANDWIDTH
+	unsigned int			bw_throttled;
+	struct list_head		bw_throttled_node;
+#endif
+};
+
+#define MIN_LATENCY_NICE	(-20)
+#define MAX_LATENCY_NICE	19
+#endif
+
 #ifdef CONFIG_UCLAMP_TASK
 /* Number of utilization clamp buckets (shorter alias) */
 #define UCLAMP_BUCKETS CONFIG_UCLAMP_BUCKETS_COUNT
@@ -874,6 +940,9 @@ struct task_struct {
 	struct sched_dl_entity		*dl_server;
 #ifdef CONFIG_SCHED_CLASS_EXT
 	struct sched_ext_entity		scx;
+#endif
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	struct sched_minlat_entity	minlat;
 #endif
 	const struct sched_class	*sched_class;
 

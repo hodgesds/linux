@@ -6076,9 +6076,12 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 	/* update hierarchical throttle state */
 	walk_tg_tree_from(cfs_rq->tg, tg_nop, tg_unthrottle_up, (void *)rq);
 
+	/* Re-enqueue any throttled minlat tasks for this tg */
+	minlat_unthrottle_bw(rq, cfs_rq->tg);
+
 	if (!cfs_rq->load.weight) {
 		if (!cfs_rq->on_list)
-			return;
+			goto out_resched;
 		/*
 		 * Nothing to run but something to decay (on_list)?
 		 * Complete the branch.
@@ -6091,8 +6094,13 @@ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
 
 	assert_list_leaf_cfs_rq(rq);
 
+out_resched:
 	/* Determine whether we need to wake up potentially idle CPU: */
-	if (rq->curr == rq->idle && rq->cfs.nr_queued)
+	if (rq->curr == rq->idle && (rq->cfs.nr_queued
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	    || rq->minlat.nr_running
+#endif
+	    ))
 		resched_curr(rq);
 }
 
@@ -8163,13 +8171,14 @@ unsigned long effective_cpu_util(int cpu, unsigned long util_cfs,
 	}
 
 	/*
-	 * Because the time spend on RT/DL tasks is visible as 'lost' time to
-	 * CFS tasks and we use the same metric to track the effective
+	 * Because the time spend on RT/DL/minlat tasks is visible as 'lost'
+	 * time to CFS tasks and we use the same metric to track the effective
 	 * utilization (PELT windows are synchronized) we can directly add them
 	 * to obtain the CPU's actual utilization.
 	 */
 	util = util_cfs + cpu_util_rt(rq);
 	util += cpu_util_dl(rq);
+	util += cpu_util_minlat(rq);
 
 	/*
 	 * The maximum hint is a soft bandwidth requirement, which can be lower
@@ -8703,7 +8712,7 @@ static void task_dead_fair(struct task_struct *p)
 /*
  * Set the max capacity the task is allowed to run at for misfit detection.
  */
-static void set_task_max_allowed_capacity(struct task_struct *p)
+void set_task_max_allowed_capacity(struct task_struct *p)
 {
 	struct asym_cap_data *entry;
 
