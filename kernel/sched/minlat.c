@@ -1883,11 +1883,8 @@ static u64 minlat_sched_slice(struct minlat_rq *minlat_rq,
 static void check_preempt_tick_minlat(struct rq *rq, struct task_struct *curr)
 {
 	struct sched_minlat_entity *curr_me = &curr->minlat;
-	struct sched_minlat_entity *next_me;
 	struct minlat_rq *minlat_rq = &rq->minlat;
-	struct rb_node *next_node;
 	u64 ideal_runtime, delta_exec;
-	s64 delta;
 
 	if (minlat_rq->nr_running <= 1)
 		return;
@@ -1916,26 +1913,19 @@ static void check_preempt_tick_minlat(struct rq *rq, struct task_struct *curr)
 	}
 
 	/*
-	 * Current entity is out of the tree — find the first
-	 * non-delayed competitor. Delayed entities have stale
-	 * vruntimes that would cause spurious preemption.
+	 * O(1) preemption check: if curr has exceeded its ideal
+	 * timeslice, request a reschedule. No tree scan needed —
+	 * pick_task_minlat will find the right next entity.
+	 *
+	 * Only preempt if there are non-delayed competitors
+	 * (delayed entities are sleeping and shouldn't cause
+	 * preemption). Use lazy resched to batch context switches.
 	 */
-	for (next_node = rb_first_cached(&minlat_rq->tasks_timeline);
-	     next_node; next_node = rb_next(next_node)) {
-		struct task_struct *next_p;
-
-		next_me = rb_entry(next_node, struct sched_minlat_entity,
-				   run_node);
-		next_p = container_of(next_me, struct task_struct, minlat);
-		if (!next_p->minlat.sched_delayed)
-			break;
-	}
-	if (!next_node)
+	if (minlat_rq->nr_running - minlat_rq->nr_delayed <= 1)
 		return;
 
-	delta = (s64)(curr_me->vruntime - next_me->vruntime);
-	if (delta > (s64)ideal_runtime)
-		resched_curr(rq);
+	if (delta_exec > ideal_runtime)
+		resched_curr_lazy(rq);
 }
 
 static void
@@ -2115,19 +2105,21 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	    me->on_rq && minlat_rq->nr_running > 1) {
 		u64 run_ns = me->sum_exec_runtime -
 			     me->prev_sum_exec_runtime;
-
 		/*
-		 * Only delay for short-running tasks (IPC pattern).
+		 * Delayed dequeue: keep sleeping curr on the runqueue
+		 * for O(1) re-wakeup via ttwu_runnable().
 		 *
-		 * Cap delayed entities to bound pick_task scan cost.
-		 * At high oversubscription (75+ tasks/CPU), unbounded
-		 * delayed entities cause O(n) scan or excessive
-		 * force-dequeue overhead. Cap at nr_running/4 (min 2)
-		 * to keep scan cost bounded while preserving
-		 * ttwu_runnable benefits for the hottest IPC tasks.
+		 * Only delay short-running tasks (IPC pattern: pipe,
+		 * futex, message passing). Compute-then-sleep tasks
+		 * benefit from migration to idle CPUs.
 		 *
-		 * Also prevent all-delayed state (nr_running -
-		 * nr_delayed > 1) so the CPU can become idle.
+		 * Cap at 2 delayed entities per CPU. Higher caps
+		 * prevent task migration at heavy oversubscription,
+		 * causing load imbalance. With cap=2, the hottest
+		 * IPC pair on each CPU stays for O(1) wakeup while
+		 * remaining tasks can migrate for parallelism.
+		 *
+		 * Also prevent all-delayed state.
 		 */
 		if (run_ns < max_t(u64, MINLAT_MIN_GRANULARITY_NS,
 				   sysctl_sched_base_slice) &&
