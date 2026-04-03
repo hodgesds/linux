@@ -356,6 +356,7 @@ enum {
 #endif
 	DECLARE_VMA_BIT(UFFD_MINOR, 41),
 	DECLARE_VMA_BIT(SEALED, 42),
+	DECLARE_VMA_BIT(NUMA_REPLICATE, 43), /* NUMA replicate read-only pages */
 	/* Flags that reuse flags above. */
 	DECLARE_VMA_BIT_ALIAS(PKEY_BIT0, HIGH_ARCH_0),
 	DECLARE_VMA_BIT_ALIAS(PKEY_BIT1, HIGH_ARCH_1),
@@ -508,6 +509,11 @@ enum {
 #define VM_DROPPABLE		INIT_VM_FLAG(DROPPABLE)
 #else
 #define VM_DROPPABLE		VM_NONE
+#endif
+#ifdef CONFIG_NUMA_PAGE_REPLICATE
+#define VM_NUMA_REPLICATE	INIT_VM_FLAG(NUMA_REPLICATE)
+#else
+#define VM_NUMA_REPLICATE	VM_NONE
 #endif
 
 /* Bits set in the VMA until the stack is in its final location */

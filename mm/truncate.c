@@ -21,6 +21,7 @@
 #include <linux/task_io_accounting_ops.h>
 #include <linux/shmem_fs.h>
 #include <linux/rmap.h>
+#include <linux/numa_replicate.h>
 #include "internal.h"
 
 static void clear_shadow_entries(struct address_space *mapping,
@@ -153,6 +154,11 @@ EXPORT_SYMBOL_GPL(folio_invalidate);
  */
 static void truncate_cleanup_folio(struct folio *folio)
 {
+#ifdef CONFIG_NUMA_PAGE_REPLICATE
+	if (folio->mapping && folio->mapping->numa_replicas)
+		numa_replica_invalidate(folio->mapping->numa_replicas,
+					folio->index);
+#endif
 	if (folio_mapped(folio))
 		unmap_mapping_folio(folio);
 
@@ -518,6 +524,11 @@ void truncate_inode_pages_final(struct address_space *mapping)
 	}
 
 	truncate_inode_pages(mapping, 0);
+
+#ifdef CONFIG_NUMA_PAGE_REPLICATE
+	numa_replica_tree_free(mapping->numa_replicas);
+	mapping->numa_replicas = NULL;
+#endif
 }
 EXPORT_SYMBOL(truncate_inode_pages_final);
 

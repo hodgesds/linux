@@ -44,6 +44,7 @@
 #include <linux/mm_inline.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/numa_balancing.h>
+#include <linux/numa_replicate.h>
 #include <linux/sched/task.h>
 #include <linux/hugetlb.h>
 #include <linux/mman.h>
@@ -5660,6 +5661,19 @@ fallback:
 	}
 
 	folio_ref_add(folio, nr_pages - 1);
+
+#ifdef CONFIG_NUMA_PAGE_REPLICATE
+	if (!is_cow && nr_pages == 1 && (vma->vm_flags & VM_NUMA_REPLICATE)) {
+		struct folio *replica = numa_replica_try_local(vma, folio,
+							      vmf->pgoff);
+		if (replica) {
+			folio_put(folio);
+			folio = replica;
+			page = &replica->page;
+		}
+	}
+#endif
+
 	set_pte_range(vmf, folio, page, nr_pages, addr);
 	type = is_cow ? MM_ANONPAGES : mm_counter_file(folio);
 	add_mm_counter(vma->vm_mm, type, nr_pages);
@@ -6092,6 +6106,22 @@ static vm_fault_t do_numa_page(struct vm_fault *vmf)
 					writable, &last_cpupid);
 	if (target_nid == NUMA_NO_NODE)
 		goto out_map;
+
+#ifdef CONFIG_NUMA_PAGE_REPLICATE
+	/*
+	 * For read-only file-backed pages with replication enabled,
+	 * skip the migration path.  Replicas are created during the
+	 * initial page fault (via filemap_map_order0_folio or
+	 * finish_fault), not during NUMA hint faults.  Migrating
+	 * shared library pages away from their canonical node would
+	 * break the replication model.
+	 */
+	if (sysctl_numa_replicate_enabled &&
+	    (vma->vm_flags & VM_NUMA_REPLICATE) &&
+	    !(vma->vm_flags & VM_WRITE) && !folio_test_large(folio))
+		goto out_map;
+#endif
+
 	if (migrate_misplaced_folio_prepare(folio, vma, target_nid)) {
 		flags |= TNF_MIGRATE_FAIL;
 		goto out_map;

@@ -32,6 +32,7 @@
 #include <linux/softirq.h>
 #include <linux/refcount_api.h>
 #include <linux/topology.h>
+#include <linux/numa_replicate.h>
 #include <linux/sched/clock.h>
 #include <linux/sched/cond_resched.h>
 #include <linux/sched/cputime.h>
@@ -3463,9 +3464,17 @@ retry_pids:
 		 * migrated as it is expected they are cache replicated. Avoid
 		 * hinting faults in read-only file-backed mappings or the vDSO
 		 * as migrating the pages will be of marginal benefit.
+		 *
+		 * Exception: when NUMA page replication is enabled, scan
+		 * read-only file VMAs so we can detect cross-node accesses
+		 * and auto-replicate pages.
 		 */
 		if (!vma->vm_mm ||
-		    (vma->vm_file && (vma->vm_flags & (VM_READ|VM_WRITE)) == (VM_READ))) {
+		    (vma->vm_file && (vma->vm_flags & (VM_READ|VM_WRITE)) == (VM_READ)
+#ifdef CONFIG_NUMA_PAGE_REPLICATE
+		     && !(sysctl_numa_replicate_enabled && sysctl_numa_replicate_auto)
+#endif
+		    )) {
 			trace_sched_skip_vma_numa(mm, vma, NUMAB_SKIP_SHARED_RO);
 			continue;
 		}

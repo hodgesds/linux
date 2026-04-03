@@ -30,6 +30,7 @@
 #include <linux/mm_inline.h>
 #include <linux/backing-dev.h>
 #include <linux/rmap.h>
+#include <linux/numa_replicate.h>
 #include <linux/topology.h>
 #include <linux/cpu.h>
 #include <linux/cpuset.h>
@@ -1354,6 +1355,19 @@ retry:
 		if (folio_mapped(folio)) {
 			enum ttu_flags flags = TTU_BATCH_FLUSH;
 			bool was_swapbacked = folio_test_swapbacked(folio);
+
+#ifdef CONFIG_NUMA_PAGE_REPLICATE
+			/*
+			 * Drop NUMA replicas before unmapping the canonical
+			 * folio.  Replicas are separate folios so rmap won't
+			 * find PTEs pointing to them when unmapping canonical.
+			 */
+			if (folio_is_file_lru(folio) && folio->mapping &&
+			    folio->mapping->numa_replicas)
+				numa_replica_invalidate(
+					folio->mapping->numa_replicas,
+					folio->index);
+#endif
 
 			if (folio_test_pmd_mappable(folio))
 				flags |= TTU_SPLIT_HUGE_PMD;

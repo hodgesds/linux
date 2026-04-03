@@ -8,6 +8,7 @@
 
 #include <linux/mman.h>
 #include <linux/pagemap.h>
+#include <linux/numa_replicate.h>
 #include <linux/syscalls.h>
 #include <linux/mempolicy.h>
 #include <linux/page-isolation.h>
@@ -1426,6 +1427,26 @@ static int madvise_vma_behavior(struct madvise_behavior *madv_behavior)
 		if (error)
 			goto out;
 		break;
+#ifdef CONFIG_NUMA_PAGE_REPLICATE
+	case MADV_NUMA_REPLICATE:
+		/* Only allow on file-backed, non-writable VMAs */
+		if (!vma->vm_file)
+			return -EINVAL;
+		if (new_flags & VM_WRITE)
+			return -EINVAL;
+		new_flags |= VM_NUMA_REPLICATE;
+		break;
+	case MADV_NUMA_NOREPLICATE:
+		new_flags &= ~VM_NUMA_REPLICATE;
+		/* Invalidate existing replicas */
+		if (vma->vm_file && vma->vm_file->f_mapping &&
+		    vma->vm_file->f_mapping->numa_replicas)
+			numa_replica_invalidate_range(
+				vma->vm_file->f_mapping->numa_replicas,
+				vma->vm_pgoff,
+				vma->vm_pgoff + vma_pages(vma) - 1);
+		break;
+#endif
 	case __MADV_SET_ANON_VMA_NAME:
 		/* Only anonymous mappings can be named */
 		if (vma->vm_file && !vma_is_anon_shmem(vma))
@@ -1554,6 +1575,10 @@ madvise_behavior_valid(int behavior)
 	case MADV_KEEPONFORK:
 	case MADV_GUARD_INSTALL:
 	case MADV_GUARD_REMOVE:
+#ifdef CONFIG_NUMA_PAGE_REPLICATE
+	case MADV_NUMA_REPLICATE:
+	case MADV_NUMA_NOREPLICATE:
+#endif
 #ifdef CONFIG_MEMORY_FAILURE
 	case MADV_SOFT_OFFLINE:
 	case MADV_HWPOISON:
@@ -1573,6 +1598,10 @@ static bool process_madvise_remote_valid(int behavior)
 	case MADV_PAGEOUT:
 	case MADV_WILLNEED:
 	case MADV_COLLAPSE:
+#ifdef CONFIG_NUMA_PAGE_REPLICATE
+	case MADV_NUMA_REPLICATE:
+	case MADV_NUMA_NOREPLICATE:
+#endif
 		return true;
 	default:
 		return false;

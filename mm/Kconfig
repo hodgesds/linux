@@ -700,6 +700,21 @@ config KSM
 	  until a program has madvised that an area is MADV_MERGEABLE, and
 	  root has set /sys/kernel/mm/ksm/run to 1 (if CONFIG_SYSFS is set).
 
+config NUMA_PAGE_REPLICATE
+	bool "NUMA page replication for read-only pages"
+	depends on NUMA && 64BIT && MMU
+	help
+	  Allow read-only file-backed pages (shared library text and rodata)
+	  to be replicated across NUMA nodes.  Each CPU maps the NUMA-local
+	  replica, reducing remote memory access latency for instruction
+	  fetches and read-only data.
+
+	  Memory overhead is bounded by sysctl vm.numa_replicate_max_per_node.
+	  Replicas are reclaimable under memory pressure unless pinned via
+	  vm.numa_replicate_pinned.
+
+	  If unsure, say N.
+
 config DEFAULT_MMAP_MIN_ADDR
 	int "Low address space to protect from user allocation"
 	depends on MMU

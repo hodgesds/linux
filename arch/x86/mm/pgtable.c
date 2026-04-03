@@ -6,6 +6,7 @@
 #include <asm/tlb.h>
 #include <asm/fixmap.h>
 #include <asm/mtrr.h>
+#include <asm/numa_text_replicate.h>
 
 #ifdef CONFIG_DYNAMIC_PHYSICAL_MASK
 phys_addr_t physical_mask __ro_after_init = (1ULL << __PHYSICAL_MASK_SHIFT) - 1;
@@ -86,6 +87,9 @@ static void pgd_ctor(struct mm_struct *mm, pgd_t *pgd)
 		clone_pgd_range(pgd + KERNEL_PGD_BOUNDARY,
 				swapper_pg_dir + KERNEL_PGD_BOUNDARY,
 				KERNEL_PGD_PTRS);
+
+	/* Install per-node kernel text mapping */
+	numa_text_replicate_pgd_init(pgd);
 
 	/* List used to sync kernel mapping updates */
 	pgd_set_mm(pgd, mm);

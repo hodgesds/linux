@@ -49,6 +49,7 @@
 #include <linux/sched/mm.h>
 #include <linux/sysctl.h>
 #include <linux/pgalloc.h>
+#include <linux/numa_replicate.h>
 
 #include <asm/tlbflush.h>
 #include "internal.h"
@@ -3857,6 +3858,19 @@ static vm_fault_t filemap_map_order0_folio(struct vm_fault *vmf,
 
 	if (vmf->address == addr)
 		ret = VM_FAULT_NOPAGE;
+
+#ifdef CONFIG_NUMA_PAGE_REPLICATE
+	if ((vmf->vma->vm_flags & VM_NUMA_REPLICATE)) {
+		struct folio *replica = numa_replica_try_local(vmf->vma,
+							      folio,
+							      folio->index);
+		if (replica) {
+			folio_ref_dec(folio);
+			folio = replica;
+			page = &replica->page;
+		}
+	}
+#endif
 
 	set_pte_range(vmf, folio, page, 1, addr);
 	(*rss)++;

@@ -41,6 +41,7 @@
 #include <asm/pgalloc.h>
 #include <asm/dma.h>
 #include <asm/fixmap.h>
+#include <asm/numa_text_replicate.h>
 #include <asm/e820/api.h>
 #include <asm/apic.h>
 #include <asm/tlb.h>
@@ -1420,6 +1421,10 @@ void mark_rodata_ro(void)
 	set_memory_nx(text_end, (all_end - text_end) >> PAGE_SHIFT);
 
 	set_ftrace_ops_ro();
+
+#ifdef CONFIG_NUMA_PAGE_REPLICATE
+	numa_replicate_kernel_text();
+#endif
 
 #ifdef CONFIG_CPA_DEBUG
 	printk(KERN_INFO "Testing CPA: undo %lx-%lx\n", start, end);
