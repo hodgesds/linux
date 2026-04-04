@@ -1010,6 +1010,131 @@ resched:
 	zswap_pool_put(pool);
 }
 
+/*********************************
+* backend-initiated drain
+**********************************/
+
+struct zswap_drain_ctx {
+	zpool_drain_filter_t	filter;
+	void			*filter_data;
+	int			drained;
+};
+
+static enum lru_status zswap_drain_cb(struct list_head *item,
+				      struct list_lru_one *l,
+				      spinlock_t *lock, void *arg)
+{
+	struct zswap_entry *entry = container_of(item, struct zswap_entry, lru);
+	struct zswap_drain_ctx *ctx = arg;
+	struct zswap_tree *tree;
+	pgoff_t swpoffset;
+	int writeback_result;
+
+	/* Only drain entries whose handle matches the filter */
+	if (!ctx->filter(entry->handle, ctx->filter_data))
+		return LRU_SKIP;
+
+	/*
+	 * Once the lru lock is dropped, the entry might get freed. Copy
+	 * swpoffset to the stack before isolating.
+	 */
+	swpoffset = swp_offset(entry->swpentry);
+	tree = zswap_trees[swp_type(entry->swpentry)];
+	list_lru_isolate(l, item);
+	spin_unlock(lock);
+
+	/* Check for invalidate() race */
+	spin_lock(&tree->lock);
+	if (entry != zswap_rb_search(&tree->rbroot, swpoffset))
+		goto unlock;
+
+	zswap_entry_get(entry);
+	spin_unlock(&tree->lock);
+
+	writeback_result = zswap_writeback_entry(entry, tree);
+
+	spin_lock(&tree->lock);
+	if (writeback_result) {
+		zswap_lru_putback(&entry->pool->list_lru, entry);
+		goto put_unlock;
+	}
+
+	ctx->drained++;
+	zswap_written_back_pages++;
+
+	if (entry->objcg)
+		count_objcg_event(entry->objcg, ZSWPWB);
+
+	count_vm_event(ZSWPWB);
+	zswap_invalidate_entry(tree, entry);
+
+put_unlock:
+	zswap_entry_put(tree, entry);
+unlock:
+	spin_unlock(&tree->lock);
+	spin_lock(lock);
+	return LRU_REMOVED_RETRY;
+}
+
+/*
+ * zswap_drain_handler - drain zswap entries from a specific backend
+ * @type:	backend type string (e.g. "zvram")
+ * @filter:	handle filter — return true to drain
+ * @filter_data: opaque data forwarded to filter
+ *
+ * Walks all zswap pools backed by @type and writes back entries whose
+ * handles pass @filter to disk swap, then frees them.  Called via
+ * zpool_request_drain() by a backend that is losing its backing store.
+ *
+ * Returns number of entries drained, or negative errno.
+ */
+static int zswap_drain_handler(const char *type,
+			       zpool_drain_filter_t filter,
+			       void *filter_data)
+{
+	struct zswap_drain_ctx ctx = {
+		.filter		= filter,
+		.filter_data	= filter_data,
+		.drained	= 0,
+	};
+	struct zswap_pool *pools[4];
+	int np = 0, i, nid;
+
+	/* Collect matching pools under RCU, then drain outside RCU */
+	rcu_read_lock();
+	{
+		struct zswap_pool *pool;
+
+		list_for_each_entry_rcu(pool, &zswap_pools, list) {
+			if (strcmp(zpool_get_type(pool->zpools[0]), type))
+				continue;
+			if (!zswap_pool_get(pool))
+				continue;
+			if (np < ARRAY_SIZE(pools))
+				pools[np++] = pool;
+			else
+				zswap_pool_put(pool);
+		}
+	}
+	rcu_read_unlock();
+
+	if (!np)
+		return -ENOENT;
+
+	for (i = 0; i < np; i++) {
+		for_each_node_state(nid, N_NORMAL_MEMORY) {
+			unsigned long nr_to_walk = ULONG_MAX;
+
+			list_lru_walk_node(&pools[i]->list_lru, nid,
+					   &zswap_drain_cb, &ctx,
+					   &nr_to_walk);
+		}
+		zswap_pool_put(pools[i]);
+	}
+
+	return ctx.drained;
+}
+
 static struct zswap_pool *zswap_pool_create(char *type, char *compressor)
 {
 	int i;
@@ -1890,6 +2015,8 @@ static int zswap_setup(void)
 	shrink_wq = create_workqueue("zswap-shrink");
 	if (!shrink_wq)
 		goto fallback_fail;
+
+	zpool_register_drain_handler(zswap_drain_handler);
 
 	if (zswap_debugfs_init())
 		pr_warn("debugfs initialization failed\n");

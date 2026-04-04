@@ -154,6 +154,7 @@ struct zvram_gpu {
 	struct work_struct	drm_work;	/* deferred DRM setup */
 #endif
 	bool			ready;
+	bool			draining;	/* accepting reads/frees only */
 	int			gpu_idx;	/* index in zvram_gpus[] */
 	int			numa_node;
 
@@ -263,7 +264,8 @@ static void zvram_rebuild_pref_map(void)
 			struct zvram_gpu *gpu = zvram_gpus[i];
 			int dist;
 
-			if (!gpu || !READ_ONCE(gpu->ready))
+			if (!gpu || !READ_ONCE(gpu->ready) ||
+			    READ_ONCE(gpu->draining))
 				continue;
 			dist = node_distance(node, gpu->numa_node);
 			if (dist < best_dist) {
@@ -519,7 +521,8 @@ static struct zvram_gpu *zvram_alloc_numa(unsigned int order,
 	pref = READ_ONCE(zvram_pref_gpu[node]);
 	if (pref >= 0) {
 		gpu = zvram_gpus[pref];
-		if (gpu && READ_ONCE(gpu->ready)) {
+		if (gpu && READ_ONCE(gpu->ready) &&
+		    !READ_ONCE(gpu->draining)) {
 			offset = zvram_buddy_alloc(gpu, order);
 			if (offset >= 0) {
 				*offset_out = offset;
@@ -533,7 +536,8 @@ static struct zvram_gpu *zvram_alloc_numa(unsigned int order,
 		if (i == pref)
 			continue;
 		gpu = zvram_gpus[i];
-		if (!gpu || !READ_ONCE(gpu->ready))
+		if (!gpu || !READ_ONCE(gpu->ready) ||
+		    READ_ONCE(gpu->draining))
 			continue;
 		offset = zvram_buddy_alloc(gpu, order);
 		if (offset >= 0) {
@@ -602,8 +606,10 @@ static void zvram_zpool_free(void *pool, unsigned long handle)
 	if (gpu_idx >= zvram_nr_gpus)
 		goto out;
 	gpu = zvram_gpus[gpu_idx];
-	if (unlikely(!gpu || !READ_ONCE(gpu->ready)))
+	if (unlikely(!gpu || !READ_ONCE(gpu->ready))) {
+		/* GPU removed — pool is destroyed, block is already gone */
 		goto out;
+	}
 	zvram_buddy_free(gpu, offset, order);
 	atomic_long_sub(ZVRAM_MIN_ALLOC_SIZE << order, &gpu->used_bytes);
 out:
@@ -644,6 +650,10 @@ static void *zvram_zpool_map(void *pool, unsigned long handle,
 	if (gpu && likely(READ_ONCE(gpu->ready))) {
 		if (mm == ZPOOL_MM_RO || mm == ZPOOL_MM_RW)
 			zvram_read_from_vram(gpu, offset, ctx->buffer, len);
+	} else {
+		WARN_ONCE(1, "zvram: GPU %d unavailable, handle %lx data lost\n",
+			  gpu_idx, handle);
+		memset(ctx->buffer, 0, len);
 	}
 
 	return ctx->buffer;
@@ -958,19 +968,48 @@ static int zvram_find_all_gpus(struct zvram_gpu_info *out, int max_gpus)
 #define ZVRAM_DRM_STRIDE	(ZVRAM_DRM_WIDTH * (ZVRAM_DRM_BPP / 8))
 #define ZVRAM_DRM_MAX_BUF	((unsigned long)(U32_MAX / ZVRAM_DRM_STRIDE) * ZVRAM_DRM_STRIDE)
 
+static bool zvram_drain_filter(unsigned long handle, void *data)
+{
+	struct zvram_gpu *gpu = data;
+
+	return zvram_handle_gpu(handle) == gpu->gpu_idx;
+}
+
 static void zvram_drm_unregister(struct drm_client_dev *client)
 {
 	struct zvram_gpu *gpu = container_of(client, struct zvram_gpu,
 					     drm_client);
+	int drained;
 
-	WRITE_ONCE(gpu->ready, false);
-	synchronize_rcu();
-	zvram_gpu_destroy_pool(gpu);
-	pr_info("GPU %d driver unloaded, VRAM released\n", gpu->gpu_idx);
-
+	/*
+	 * Phase 1: Stop new allocations to this GPU while keeping it
+	 * readable so zswap can still decompress and writeback entries.
+	 */
+	WRITE_ONCE(gpu->draining, true);
 	mutex_lock(&zvram_gpu_mutex);
 	zvram_rebuild_pref_map();
 	mutex_unlock(&zvram_gpu_mutex);
+
+	/*
+	 * Phase 2: Ask zswap to writeback all entries stored on this
+	 * GPU to disk swap.  After this, VRAM should be empty.
+	 */
+	drained = zpool_request_drain("zvram", zvram_drain_filter, gpu);
+	if (drained > 0)
+		pr_info("GPU %d: drained %d entries to swap\n",
+			gpu->gpu_idx, drained);
+	else if (drained < 0 && drained != -ENOENT && drained != -EOPNOTSUPP)
+		pr_warn("GPU %d: drain failed: %d, data may be lost\n",
+			gpu->gpu_idx, drained);
+
+	/*
+	 * Phase 3: Tear down the pool.  Any entries that failed to
+	 * drain will return zeroed data (see zvram_zpool_map).
+	 */
+	WRITE_ONCE(gpu->ready, false);
+	synchronize_rcu();
+	zvram_gpu_destroy_pool(gpu);
+	pr_info("GPU %d: driver unloaded, VRAM released\n", gpu->gpu_idx);
 
 	module_put(THIS_MODULE);
 }
@@ -1112,8 +1151,8 @@ static int zvram_drm_alloc_vram(struct zvram_gpu *gpu)
 	if (!try_module_get(THIS_MODULE)) {
 		zvram_gpu_destroy_pool(gpu);
 		mutex_unlock(&zvram_gpu_mutex);
-		ret = -ENODEV;
-		goto fail_client;
+		drm_dev_put(drm);
+		return -ENODEV;
 	}
 	smp_store_release(&gpu->ready, true);
 	zvram_rebuild_pref_map();

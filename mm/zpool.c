@@ -351,5 +351,66 @@ bool zpool_can_sleep_mapped(struct zpool *zpool)
 	return zpool->driver->sleep_mapped;
 }
 
+/*
+ * Backend-initiated drain support.
+ *
+ * A zpool backend (e.g. zvram) may need the pool owner (e.g. zswap) to
+ * writeback and free a subset of entries — for instance, when the backing
+ * store for those entries is about to disappear (GPU VRAM hotplug).
+ *
+ * The pool owner registers a drain handler at init time.  The backend
+ * calls zpool_request_drain() with a filter; the handler writes back
+ * every entry whose handle passes the filter.
+ */
+static int (*zpool_drain_fn)(const char *type, zpool_drain_filter_t filter,
+			     void *filter_data);
+static DEFINE_MUTEX(zpool_drain_lock);
+
+void zpool_register_drain_handler(
+	int (*handler)(const char *type, zpool_drain_filter_t filter,
+		       void *filter_data))
+{
+	mutex_lock(&zpool_drain_lock);
+	zpool_drain_fn = handler;
+	mutex_unlock(&zpool_drain_lock);
+}
+EXPORT_SYMBOL(zpool_register_drain_handler);
+
+void zpool_unregister_drain_handler(void)
+{
+	mutex_lock(&zpool_drain_lock);
+	zpool_drain_fn = NULL;
+	mutex_unlock(&zpool_drain_lock);
+}
+EXPORT_SYMBOL(zpool_unregister_drain_handler);
+
+/**
+ * zpool_request_drain() - ask the pool owner to drain matching entries
+ * @type:		backend driver type string (e.g. "zvram")
+ * @filter:		returns true for handles that should be drained
+ * @filter_data:	opaque argument forwarded to @filter
+ *
+ * Called by a zpool backend when it needs the pool owner to writeback
+ * entries whose handles match @filter.  The registered drain handler
+ * (typically zswap) walks its entry lists and writes back matches.
+ *
+ * Returns: number of entries drained, or negative errno.
+ */
+int zpool_request_drain(const char *type, zpool_drain_filter_t filter,
+			void *filter_data)
+{
+	int ret;
+
+	mutex_lock(&zpool_drain_lock);
+	if (!zpool_drain_fn) {
+		mutex_unlock(&zpool_drain_lock);
+		return -EOPNOTSUPP;
+	}
+	ret = zpool_drain_fn(type, filter, filter_data);
+	mutex_unlock(&zpool_drain_lock);
+	return ret;
+}
+EXPORT_SYMBOL(zpool_request_drain);
+
 MODULE_AUTHOR("Dan Streetman <ddstreet@ieee.org>");
 MODULE_DESCRIPTION("Common API for compressed memory storage");
