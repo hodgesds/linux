@@ -100,4 +100,21 @@ int zpool_unregister_driver(struct zpool_driver *driver);
 
 bool zpool_can_sleep_mapped(struct zpool *pool);
 
+/**
+ * zpool_drain_filter_t - filter function for backend-initiated drain
+ * @handle:	the zpool allocation handle to check
+ * @data:	opaque data passed through from the drain requester
+ *
+ * Returns true if the entry identified by @handle should be drained
+ * (written back and freed).
+ */
+typedef bool (*zpool_drain_filter_t)(unsigned long handle, void *data);
+
+void zpool_register_drain_handler(
+	int (*handler)(const char *type, zpool_drain_filter_t filter,
+		       void *filter_data));
+void zpool_unregister_drain_handler(void);
+int zpool_request_drain(const char *type, zpool_drain_filter_t filter,
+			void *filter_data);
+
 #endif

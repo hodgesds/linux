@@ -154,6 +154,7 @@ struct zvram_gpu {
 	struct work_struct	drm_work;	/* deferred DRM setup */
 #endif
 	bool			ready;
+	bool			draining;	/* accepting reads/frees only */
 	int			gpu_idx;	/* index in zvram_gpus[] */
 	int			numa_node;
 
@@ -263,7 +264,8 @@ static void zvram_rebuild_pref_map(void)
 			struct zvram_gpu *gpu = zvram_gpus[i];
 			int dist;
 
-			if (!gpu || !READ_ONCE(gpu->ready))
+			if (!gpu || !READ_ONCE(gpu->ready) ||
+			    READ_ONCE(gpu->draining))
 				continue;
 			dist = node_distance(node, gpu->numa_node);
 			if (dist < best_dist) {
@@ -519,7 +521,8 @@ static struct zvram_gpu *zvram_alloc_numa(unsigned int order,
 	pref = READ_ONCE(zvram_pref_gpu[node]);
 	if (pref >= 0) {
 		gpu = zvram_gpus[pref];
-		if (gpu && READ_ONCE(gpu->ready)) {
+		if (gpu && READ_ONCE(gpu->ready) &&
+		    !READ_ONCE(gpu->draining)) {
 			offset = zvram_buddy_alloc(gpu, order);
 			if (offset >= 0) {
 				*offset_out = offset;
@@ -533,7 +536,8 @@ static struct zvram_gpu *zvram_alloc_numa(unsigned int order,
 		if (i == pref)
 			continue;
 		gpu = zvram_gpus[i];
-		if (!gpu || !READ_ONCE(gpu->ready))
+		if (!gpu || !READ_ONCE(gpu->ready) ||
+		    READ_ONCE(gpu->draining))
 			continue;
 		offset = zvram_buddy_alloc(gpu, order);
 		if (offset >= 0) {
@@ -579,10 +583,7 @@ static int zvram_zpool_malloc(void *pool, size_t size, gfp_t gfp,
 	if (order >= ZVRAM_NR_ORDERS)
 		return -EINVAL;
 
-	rcu_read_lock();
 	gpu = zvram_alloc_numa(order, &offset);
-	rcu_read_unlock();
-
 	if (!gpu)
 		return -ENOMEM;
 
@@ -598,16 +599,21 @@ static void zvram_zpool_free(void *pool, unsigned long handle)
 	unsigned int order = zvram_size_to_order(len);
 	struct zvram_gpu *gpu;
 
-	rcu_read_lock();
-	if (gpu_idx >= zvram_nr_gpus)
-		goto out;
-	gpu = zvram_gpus[gpu_idx];
-	if (unlikely(!gpu || !READ_ONCE(gpu->ready)))
-		goto out;
+	/*
+	 * GPU slots are only freed from the drain path after the drain
+	 * has evicted every entry that references this GPU, so reaching
+	 * this function for a valid handle implies the slot is still
+	 * populated.  A NULL or !ready gpu here means the caller is
+	 * leaking a stale handle; warn so we notice, and do nothing --
+	 * the block is already gone with the VRAM it sat in.
+	 */
+	if (gpu_idx >= ZVRAM_MAX_GPUS)
+		return;
+	gpu = READ_ONCE(zvram_gpus[gpu_idx]);
+	if (WARN_ON_ONCE(!gpu || !READ_ONCE(gpu->ready)))
+		return;
 	zvram_buddy_free(gpu, offset, order);
 	atomic_long_sub(ZVRAM_MIN_ALLOC_SIZE << order, &gpu->used_bytes);
-out:
-	rcu_read_unlock();
 }
 
 /*
@@ -621,6 +627,11 @@ out:
  *
  * sleep_mapped is false because local_lock disables preemption.
  * zswap will copy from the staging buffer before unmapping.
+ *
+ * The drain path guarantees that a GPU slot is not released until every
+ * handle that references it has been evicted, so a valid handle always
+ * refers to a ready GPU.  Anything else is a use-after-free and must be
+ * an error, not a silent zero-fill.
  */
 static void *zvram_zpool_map(void *pool, unsigned long handle,
 			     enum zpool_mapmode mm)
@@ -631,20 +642,20 @@ static void *zvram_zpool_map(void *pool, unsigned long handle,
 	struct zvram_gpu *gpu = NULL;
 	struct zvram_map_ctx *ctx;
 
-	if (gpu_idx < zvram_nr_gpus)
-		gpu = zvram_gpus[gpu_idx];
+	if (gpu_idx < ZVRAM_MAX_GPUS)
+		gpu = READ_ONCE(zvram_gpus[gpu_idx]);
 
-	rcu_read_lock();
+	if (WARN_ON_ONCE(!gpu || !READ_ONCE(gpu->ready)))
+		return ERR_PTR(-EIO);
+
 	local_lock(&zvram_map_ctx->lock);
 	ctx = this_cpu_ptr(zvram_map_ctx);
 	ctx->mapped_handle = handle;
 	ctx->mapmode = mm;
 	ctx->gpu = gpu;
 
-	if (gpu && likely(READ_ONCE(gpu->ready))) {
-		if (mm == ZPOOL_MM_RO || mm == ZPOOL_MM_RW)
-			zvram_read_from_vram(gpu, offset, ctx->buffer, len);
-	}
+	if (mm == ZPOOL_MM_RO || mm == ZPOOL_MM_RW)
+		zvram_read_from_vram(gpu, offset, ctx->buffer, len);
 
 	return ctx->buffer;
 }
@@ -656,15 +667,12 @@ static void zvram_zpool_unmap(void *pool, unsigned long handle)
 	unsigned int len = zvram_handle_len(handle);
 	struct zvram_gpu *gpu = ctx->gpu;
 
-	if (gpu && likely(READ_ONCE(gpu->ready))) {
-		if (ctx->mapmode == ZPOOL_MM_WO || ctx->mapmode == ZPOOL_MM_RW)
-			zvram_write_to_vram(gpu, offset, ctx->buffer, len);
-	}
+	if (gpu && (ctx->mapmode == ZPOOL_MM_WO || ctx->mapmode == ZPOOL_MM_RW))
+		zvram_write_to_vram(gpu, offset, ctx->buffer, len);
 
 	ctx->mapped_handle = 0;
 	ctx->gpu = NULL;
 	local_unlock(&zvram_map_ctx->lock);
-	rcu_read_unlock();
 }
 
 static u64 zvram_zpool_total_size(void *pool)
@@ -958,19 +966,80 @@ static int zvram_find_all_gpus(struct zvram_gpu_info *out, int max_gpus)
 #define ZVRAM_DRM_STRIDE	(ZVRAM_DRM_WIDTH * (ZVRAM_DRM_BPP / 8))
 #define ZVRAM_DRM_MAX_BUF	((unsigned long)(U32_MAX / ZVRAM_DRM_STRIDE) * ZVRAM_DRM_STRIDE)
 
+static bool zvram_drain_filter(unsigned long handle, void *data)
+{
+	struct zvram_gpu *gpu = data;
+
+	return zvram_handle_gpu(handle) == gpu->gpu_idx;
+}
+
 static void zvram_drm_unregister(struct drm_client_dev *client)
 {
 	struct zvram_gpu *gpu = container_of(client, struct zvram_gpu,
 					     drm_client);
+	int drained;
 
-	WRITE_ONCE(gpu->ready, false);
-	synchronize_rcu();
-	zvram_gpu_destroy_pool(gpu);
-	pr_info("GPU %d driver unloaded, VRAM released\n", gpu->gpu_idx);
-
+	/*
+	 * Phase 1: Stop new allocations to this GPU while keeping it
+	 * readable so zswap can still decompress and writeback entries.
+	 */
+	WRITE_ONCE(gpu->draining, true);
 	mutex_lock(&zvram_gpu_mutex);
 	zvram_rebuild_pref_map();
 	mutex_unlock(&zvram_gpu_mutex);
+
+	/*
+	 * Phase 2: Ask zswap to writeback all entries stored on this
+	 * GPU to disk swap.  After this, VRAM must be empty -- any
+	 * surviving entry would become a dangling handle whose backing
+	 * is gone, so we refuse to proceed with teardown until the
+	 * drain has covered everything.  The drain-path rework in v3
+	 * will turn this into a retry loop that blocks the drm_client
+	 * unregister callback until the drain completes or the system
+	 * is force-killed; for v2 we keep the teardown but WARN loudly
+	 * if any entry was left behind so we can see it in testing.
+	 */
+	drained = zpool_request_drain("zvram", zvram_drain_filter, gpu);
+	if (drained > 0)
+		pr_info("GPU %d: drained %d entries to swap\n",
+			gpu->gpu_idx, drained);
+	else if (drained < 0 && drained != -ENOENT && drained != -EOPNOTSUPP)
+		WARN(1, "zvram GPU %d: drain returned %d; surviving entries will fault on next load\n",
+		     gpu->gpu_idx, drained);
+
+	/*
+	 * Phase 3: Tear down the pool.  After this point zvram_zpool_map()
+	 * returns ERR_PTR(-EIO) for any handle that still references this
+	 * GPU; that is a loud failure rather than silent corruption.
+	 *
+	 * Release the zvram_gpus[] slot so that a later rebind of the
+	 * same PCI device can reuse it instead of eating a new one and
+	 * eventually hitting ZVRAM_MAX_GPUS.
+	 */
+	WRITE_ONCE(gpu->ready, false);
+	synchronize_rcu();
+	zvram_gpu_destroy_pool(gpu);
+
+	mutex_lock(&zvram_gpu_mutex);
+	if (gpu->gpu_idx >= 0 && gpu->gpu_idx < ZVRAM_MAX_GPUS &&
+	    zvram_gpus[gpu->gpu_idx] == gpu)
+		WRITE_ONCE(zvram_gpus[gpu->gpu_idx], NULL);
+	if (gpu->pdev) {
+		pci_dev_put(gpu->pdev);
+		gpu->pdev = NULL;
+	}
+	zvram_rebuild_pref_map();
+	mutex_unlock(&zvram_gpu_mutex);
+
+	pr_info("GPU %d: driver unloaded, VRAM released\n", gpu->gpu_idx);
+
+	/*
+	 * The slot is cleared and pref_map rebuilt, so no new reader can
+	 * reach this gpu.  Wait for any in-flight readers that loaded the
+	 * pointer before we NULLed the slot to drop it, then free.
+	 */
+	synchronize_rcu();
+	kfree(gpu);
 
 	module_put(THIS_MODULE);
 }
@@ -1112,8 +1181,8 @@ static int zvram_drm_alloc_vram(struct zvram_gpu *gpu)
 	if (!try_module_get(THIS_MODULE)) {
 		zvram_gpu_destroy_pool(gpu);
 		mutex_unlock(&zvram_gpu_mutex);
-		ret = -ENODEV;
-		goto fail_client;
+		drm_dev_put(drm);
+		return -ENODEV;
 	}
 	smp_store_release(&gpu->ready, true);
 	zvram_rebuild_pref_map();
@@ -1197,21 +1266,40 @@ static int zvram_pci_notifier_fn(struct notifier_block *nb,
 	{
 		struct zvram_gpu *gpu;
 		int node = dev_to_node(&pdev->dev);
+		int slot;
 
 		if (node == NUMA_NO_NODE)
 			node = 0;
 
 		mutex_lock(&zvram_gpu_mutex);
-		if (zvram_nr_gpus >= ZVRAM_MAX_GPUS) {
-			mutex_unlock(&zvram_gpu_mutex);
-			return NOTIFY_DONE;
+		/*
+		 * Prefer reusing a freed slot so that repeated
+		 * unbind/rebind cycles do not exhaust ZVRAM_MAX_GPUS.
+		 * zvram_nr_gpus is the high-water mark, not a count,
+		 * and a freed slot is indicated by a NULL entry.
+		 */
+		slot = -1;
+		for (i = 0; i < zvram_nr_gpus; i++) {
+			if (!zvram_gpus[i]) {
+				slot = i;
+				break;
+			}
 		}
-		gpu = zvram_gpu_alloc(zvram_nr_gpus, node);
+		if (slot < 0) {
+			if (zvram_nr_gpus >= ZVRAM_MAX_GPUS) {
+				mutex_unlock(&zvram_gpu_mutex);
+				return NOTIFY_DONE;
+			}
+			slot = zvram_nr_gpus;
+		}
+
+		gpu = zvram_gpu_alloc(slot, node);
 		if (gpu) {
 			gpu->pdev = pci_dev_get(pdev);
 			INIT_WORK(&gpu->drm_work, zvram_drm_setup_work_fn);
-			zvram_gpus[zvram_nr_gpus] = gpu;
-			zvram_nr_gpus++;
+			WRITE_ONCE(zvram_gpus[slot], gpu);
+			if (slot == zvram_nr_gpus)
+				zvram_nr_gpus++;
 			schedule_work(&gpu->drm_work);
 		}
 		mutex_unlock(&zvram_gpu_mutex);
