@@ -750,6 +750,18 @@ struct sched_dl_entity {
 
 #ifdef CONFIG_SCHED_CLASS_MINLAT
 #define MINLAT_MAX_LLCS		64	/* max tracked LLC domains */
+#define MINLAT_TGID_MAX_LLCS	8	/* per-tgid LLC tracking slots */
+
+/*
+ * Per-LLC thread count for a thread group.
+ * Compact representation: 8 slots of (llc_id, count) pairs.
+ * Covers up to 8 distinct LLCs per tgid — sufficient for most
+ * workloads. If a tgid spans more, it's already well-spread.
+ */
+struct minlat_llc_count {
+	int			llc_id;		/* sd_llc_id, -1 = unused */
+	atomic_t		nr_tasks;	/* threads on this LLC */
+};
 
 struct minlat_tgid_ctx {
 	refcount_t			refcount;
@@ -759,6 +771,9 @@ struct minlat_tgid_ctx {
 	atomic_t			nr_tasks;	/* tasks in this group */
 	atomic_t			nr_on_llc;	/* tasks on preferred LLC */
 	raw_spinlock_t			lock;
+
+	/* Per-LLC thread distribution tracking */
+	struct minlat_llc_count		llcs[MINLAT_TGID_MAX_LLCS];
 };
 
 struct sched_minlat_entity {
@@ -794,6 +809,9 @@ struct sched_minlat_entity {
 
 	/* migration stickiness: timestamp of last migration */
 	u64				last_migrate_ts;
+
+	/* preempt resist: timestamp of last involuntary preemption */
+	u64				last_preempt_ts;
 
 	/* SMT-aware interactivity tracking */
 	u64				last_sleep_duration;
