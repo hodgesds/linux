@@ -2877,6 +2877,7 @@ extern unsigned int minlat_wakeup_preempt_thresh_ns;
 extern unsigned int minlat_interactive_big_prefer;
 extern unsigned int minlat_compute_big_prefer;
 extern unsigned int minlat_llc_stickiness;
+extern unsigned int minlat_preempt_resist_ns;
 #else
 static inline bool sched_minlat_runnable(struct rq *rq)
 {
