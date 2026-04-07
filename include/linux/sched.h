@@ -789,12 +789,9 @@ struct sched_minlat_entity {
 	struct load_weight		load;		/* 16 bytes */
 
 	/*
-	 * Cacheline 1: exec timing (duplicated from se for locality)
-	 * and remaining switch-path fields.
+	 * Exec timing uses p->se.exec_start, p->se.sum_exec_runtime,
+	 * and p->se.prev_sum_exec_runtime — single source of truth.
 	 */
-	u64				exec_start;
-	u64				sum_exec_runtime;
-	u64				prev_sum_exec_runtime;
 	unsigned int			llc_runs;
 	unsigned int			minlat_prio;	/* 0-7, 0 = highest */
 	u64				min_vruntime;	/* snapshot for migration */

@@ -4412,11 +4412,7 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 	/* A delayed task cannot be in clone(). */
 	WARN_ON_ONCE(p->se.sched_delayed);
 
-#ifdef CONFIG_SCHED_CLASS_MINLAT
-	p->minlat.exec_start		= 0;
-	p->minlat.sum_exec_runtime	= 0;
-	p->minlat.prev_sum_exec_runtime	= 0;
-#endif
+	/* minlat exec timing uses p->se fields — initialized above */
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	p->se.cfs_rq			= NULL;

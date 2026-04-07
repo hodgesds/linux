@@ -175,6 +175,97 @@ extern struct list_head asym_cap_list;
 #define NICE_0_LOAD		(1L << NICE_0_LOAD_SHIFT)
 
 /*
+ * Weight math helpers — shared between CFS and MINLAT.
+ * Defined in fair.c.
+ */
+#define WMULT_CONST	(~0U)
+#define WMULT_SHIFT	32
+
+extern void __update_inv_weight(struct load_weight *lw);
+extern u64 __calc_delta(u64 delta_exec, unsigned long weight,
+			struct load_weight *lw);
+
+/*
+ * UTIL_EST shared helpers -- used by both CFS and MINLAT.
+ * The EWMA math and flag handling are class-independent; only the
+ * sched_avg and per-rq util_est counter differ between classes.
+ *
+ * Callers must gate on sched_feat(UTIL_EST) before calling.
+ */
+#define UTIL_EST_MARGIN (SCHED_CAPACITY_SCALE / 100)
+
+static inline unsigned long __read_util_est(struct sched_avg *sa)
+{
+	return READ_ONCE(sa->util_est) & ~UTIL_AVG_UNCHANGED;
+}
+
+static inline void __se_util_est_change(struct sched_avg *sa)
+{
+	unsigned int enqueued;
+
+	enqueued = sa->util_est;
+	if (!(enqueued & UTIL_AVG_UNCHANGED))
+		return;
+
+	enqueued &= ~UTIL_AVG_UNCHANGED;
+	WRITE_ONCE(sa->util_est, enqueued);
+}
+
+static inline void __util_est_enqueue(unsigned int *rq_util_est,
+				      struct sched_avg *sa)
+{
+	unsigned int enqueued;
+
+	enqueued = *rq_util_est;
+	enqueued += __read_util_est(sa);
+	WRITE_ONCE(*rq_util_est, enqueued);
+}
+
+static inline void __util_est_dequeue(unsigned int *rq_util_est,
+				      struct sched_avg *sa)
+{
+	unsigned int enqueued;
+
+	enqueued = *rq_util_est;
+	enqueued -= min_t(unsigned int, enqueued, __read_util_est(sa));
+	WRITE_ONCE(*rq_util_est, enqueued);
+}
+
+static inline void __util_est_update(struct sched_avg *sa, bool task_sleep)
+{
+	unsigned int ewma, dequeued, last_ewma_diff;
+
+	if (!task_sleep)
+		return;
+
+	ewma = READ_ONCE(sa->util_est);
+
+	if (ewma & UTIL_AVG_UNCHANGED)
+		return;
+
+	dequeued = READ_ONCE(sa->util_avg);
+
+	if (ewma <= dequeued) {
+		ewma = dequeued;
+		goto done;
+	}
+
+	last_ewma_diff = ewma - dequeued;
+	if (last_ewma_diff < UTIL_EST_MARGIN)
+		goto done;
+
+	if ((dequeued + UTIL_EST_MARGIN) < READ_ONCE(sa->runnable_avg))
+		goto done;
+
+	ewma <<= UTIL_EST_WEIGHT_SHIFT;
+	ewma  -= last_ewma_diff;
+	ewma >>= UTIL_EST_WEIGHT_SHIFT;
+done:
+	ewma |= UTIL_AVG_UNCHANGED;
+	WRITE_ONCE(sa->util_est, ewma);
+}
+
+/*
  * Single value that decides SCHED_DEADLINE internal math precision.
  * 10 -> just above 1us
  * 9  -> just above 0.5us
@@ -2784,10 +2875,10 @@ extern bool dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 extern void minlat_put_prev_set_next(struct rq *rq,
 				     struct task_struct *prev,
 				     struct task_struct *next);
-DECLARE_STATIC_KEY_TRUE(sched_minlat_enabled);
+DECLARE_STATIC_KEY_FALSE(sched_minlat_enabled);
 static inline bool minlat_enabled(void)
 {
-	return static_branch_likely(&sched_minlat_enabled);
+	return static_branch_unlikely(&sched_minlat_enabled);
 }
 static inline void minlat_init_latency_nice(struct sched_minlat_entity *me,
 					    int latency_nice)
@@ -2813,6 +2904,10 @@ static inline const struct sched_class *next_active_class(const struct sched_cla
 	if (scx_switched_all() && class == &fair_sched_class)
 		class++;
 	if (!scx_enabled() && class == &ext_sched_class)
+		class++;
+#endif
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+	if (minlat_enabled() && class == &fair_sched_class)
 		class++;
 #endif
 	return class;
