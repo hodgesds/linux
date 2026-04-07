@@ -958,6 +958,10 @@ struct minlat_rq {
 
 	unsigned long		next_balance;
 
+	/* Deferred idle kick: resched_cpu() can't run under rq lock */
+	int			kick_cpu;
+	struct irq_work		kick_work;
+
 #ifdef CONFIG_CFS_BANDWIDTH
 	struct list_head	bw_throttled_tasks;
 	int			nr_bw_throttled;
