@@ -1252,7 +1252,7 @@ static void minlat_tgid_ctx_put(struct minlat_tgid_ctx *ctx)
 {
 	if (ctx && refcount_dec_and_test(&ctx->refcount)) {
 		free_cpumask_var(ctx->llc_cpus);
-		kfree(ctx);
+		kfree_rcu(ctx, rcu);
 	}
 }
 
@@ -1281,18 +1281,22 @@ static void minlat_ensure_tgid_ctx(struct task_struct *p)
 		return;
 
 	/*
-	 * Try to inherit the leader's published ctx.  Use READ_ONCE to
-	 * prevent double-read TOCTOU and refcount_inc_not_zero to handle
-	 * concurrent task_dead_minlat freeing the ctx.
+	 * Try to inherit the leader's published ctx.  rcu_dereference
+	 * ensures we read a valid pointer (or NULL) while kfree_rcu
+	 * defers freeing.  refcount_inc_not_zero pins the ctx so we
+	 * can use it after rcu_read_unlock.
 	 */
-	ctx = READ_ONCE(leader->minlat.tgid_ctx);
+	rcu_read_lock();
+	ctx = rcu_dereference(leader->minlat.tgid_ctx);
 	if (ctx && refcount_inc_not_zero(&ctx->refcount)) {
+		rcu_read_unlock();
 		me->tgid_ctx = ctx;
 		atomic_inc(&ctx->nr_tasks);
 		minlat_tgid_llc_inc(ctx, per_cpu(sd_llc_id, task_cpu(p)));
 		p->minlat.prev_llc = per_cpu(sd_llc_id, task_cpu(p));
 		return;
 	}
+	rcu_read_unlock();
 
 	/* Allocate new ctx for this thread */
 	ctx = minlat_tgid_ctx_alloc(task_cpu(p));
@@ -1637,7 +1641,7 @@ static void minlat_throttle_tg_cpu(struct rq *rq, struct task_group *tg)
 			      &minlat_rq->bw_throttled_tasks);
 		minlat_rq->nr_bw_throttled++;
 		minlat_rq->nr_running--;
-		if (p->minlat.sched_delayed)
+		if (p->se.sched_delayed)
 			minlat_rq->nr_delayed--;
 		minlat_rq->load_weight -= scale_load_down(me->load.weight);
 		sub_nr_running(rq, 1);
@@ -1654,7 +1658,7 @@ static void minlat_throttle_tg_cpu(struct rq *rq, struct task_group *tg)
 				      &minlat_rq->bw_throttled_tasks);
 			minlat_rq->nr_bw_throttled++;
 			minlat_rq->nr_running--;
-			if (p->minlat.sched_delayed)
+			if (p->se.sched_delayed)
 				minlat_rq->nr_delayed--;
 			minlat_rq->load_weight -=
 				scale_load_down(me->load.weight);
@@ -1714,7 +1718,7 @@ void minlat_unthrottle_bw(struct rq *rq, struct task_group *tg)
 		/* Re-enqueue into rb-tree */
 		__enqueue_minlat_entity(minlat_rq, me);
 		minlat_rq->nr_running++;
-		if (p->minlat.sched_delayed)
+		if (p->se.sched_delayed)
 			minlat_rq->nr_delayed++;
 		minlat_rq->load_weight += scale_load_down(me->load.weight);
 		add_nr_running(rq, 1);
@@ -1841,8 +1845,6 @@ void init_minlat_rq(struct minlat_rq *minlat_rq)
 	minlat_rq->load_weight = 0;
 	memset(&minlat_rq->avg, 0, sizeof(minlat_rq->avg));
 	minlat_rq->util_est = 0;
-	minlat_rq->active_balance = 0;
-	minlat_rq->push_cpu = 0;
 	minlat_rq->next_balance = 0;
 #ifdef CONFIG_CFS_BANDWIDTH
 	INIT_LIST_HEAD(&minlat_rq->bw_throttled_tasks);
@@ -2141,21 +2143,14 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	struct minlat_rq *minlat_rq = &rq->minlat;
 
 	/*
-	 * ENQUEUE_DELAYED: re-enable a delayed entity. The entity is
-	 * already in the rb-tree with correct vruntime — just clear
-	 * the delayed flag. No rb-tree operations needed.
-	 *
-	 * This is called from ttwu_runnable() when a task with
-	 * p->minlat.sched_delayed wakes up on the same CPU. O(1) wakeup!
-	 */
-	/*
 	 * ENQUEUE_DELAYED: re-enable a delayed entity that was kept on
-	 * the rq. Its util_est is already accounted in the rq sum
-	 * (never removed during delayed dequeue), so skip util_est_enqueue.
+	 * the rq. The entity is already in the rb-tree with correct
+	 * vruntime — just clear the delayed flag. O(1) re-wakeup.
+	 * Its util_est is already accounted (never removed during
+	 * delayed dequeue), so skip util_est_enqueue.
 	 */
 	if (flags & ENQUEUE_DELAYED) {
-		WARN_ON_ONCE(!p->minlat.sched_delayed);
-		p->minlat.sched_delayed = 0;
+		WARN_ON_ONCE(!p->se.sched_delayed);
 		p->se.sched_delayed = 0;
 		minlat_rq->nr_delayed--;
 		return;
@@ -2165,8 +2160,15 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	 * Add task's estimated utilization to the rq sum before
 	 * the PELT update, so schedutil sees the boost immediately.
 	 */
-	if (!p->minlat.sched_delayed)
+	if (!p->se.sched_delayed)
 		minlat_util_est_enqueue(rq, p);
+
+	/*
+	 * PELT update must happen BEFORE entity state changes (on_rq,
+	 * nr_running, tree insert) so the load tracking sees the pre-
+	 * enqueue state and correctly attributes the idle/busy time.
+	 */
+	update_minlat_load_avg(rq, me);
 
 	if (!me->on_rq) {
 		/*
@@ -2206,7 +2208,6 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 		list_add_tail(&me->bw_throttled_node,
 			      &minlat_rq->bw_throttled_tasks);
 		minlat_rq->nr_bw_throttled++;
-		update_minlat_load_avg(rq, me);
 		return;
 	}
 #endif
@@ -2233,8 +2234,6 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 		WRITE_ONCE(minlat_rq->overloaded, true);
 		atomic_inc(&minlat_nr_overloaded);
 	}
-
-	update_minlat_load_avg(rq, me);
 
 #if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
 	minlat_check_update_overutilized(rq);
@@ -2273,8 +2272,18 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 			}
 		}
 
-		if (kick_cpu >= 0)
-			resched_cpu(kick_cpu);
+		if (kick_cpu >= 0) {
+			/*
+			 * Can't use resched_cpu() here — it acquires the
+			 * remote rq lock, and we already hold the local
+			 * rq lock (enqueue_task is always rq-locked).
+			 * That creates an AB-BA deadlock if the remote
+			 * CPU is simultaneously trying to lock our rq.
+			 *
+			 * Use a lock-free IPI instead.
+			 */
+			smp_send_reschedule(kick_cpu);
+		}
 	}
 }
 
@@ -2299,12 +2308,12 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 		 * check). Remove it here to prevent permanent inflation
 		 * of rq util_est when a task exits while throttled.
 		 */
-		if (!p->minlat.sched_delayed)
+		if (!p->se.sched_delayed)
 			minlat_util_est_dequeue(rq, p);
 		minlat_util_est_update(rq, p, flags & DEQUEUE_SLEEP);
+		update_minlat_load_avg(rq, me);
 		if (flags & DEQUEUE_SLEEP)
 			me->on_rq = 0;
-		update_minlat_load_avg(rq, me);
 		return true;
 	}
 #endif
@@ -2316,11 +2325,18 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	 * Remove task's util_est from rq sum unless the task is being
 	 * delayed (delayed tasks stay on rq, their util_est stays too).
 	 */
-	if (!p->minlat.sched_delayed)
+	if (!p->se.sched_delayed)
 		minlat_util_est_dequeue(rq, p);
 
 	/* Update the per-task EWMA (only meaningful when going to sleep) */
 	minlat_util_est_update(rq, p, flags & DEQUEUE_SLEEP);
+
+	/*
+	 * PELT update must happen BEFORE entity state changes (on_rq,
+	 * nr_running, tree remove) so the load tracking sees the pre-
+	 * dequeue state and correctly attributes the busy time.
+	 */
+	update_minlat_load_avg(rq, me);
 
 	/*
 	 * Delayed dequeue: keep sleeping curr on the runqueue to avoid
@@ -2370,7 +2386,6 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 		    minlat_rq->nr_delayed <
 			    max_t(unsigned int, 2,
 				  minlat_rq->nr_running >> 2)) {
-			p->minlat.sched_delayed = 1;
 			p->se.sched_delayed = 1;
 			minlat_rq->nr_delayed++;
 			return false;
@@ -2379,7 +2394,6 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 
 	/* Clear delayed flag on force-dequeue */
 	if (flags & DEQUEUE_DELAYED) {
-		p->minlat.sched_delayed = 0;
 		p->se.sched_delayed = 0;
 		minlat_rq->nr_delayed--;
 	}
@@ -2412,8 +2426,6 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 		me->last_preempt_ts = 0;
 		minlat_record_sleep(p, rq);
 	}
-
-	update_minlat_load_avg(rq, me);
 
 	/*
 	 * Clear misfit status if no minlat tasks remain — the CPU
@@ -2679,7 +2691,7 @@ pick_task_minlat(struct rq *rq, struct rq_flags *rf)
 	    !RB_EMPTY_NODE(&minlat_rq->next->run_node) &&
 	    minlat_buddy_eligible(minlat_rq, minlat_rq->next)) {
 		p = container_of(minlat_rq->next, struct task_struct, minlat);
-		if (!p->minlat.sched_delayed) {
+		if (!p->se.sched_delayed) {
 			me = minlat_rq->next;
 			minlat_rq->next = NULL;
 			return container_of(me, struct task_struct, minlat);
@@ -2699,7 +2711,7 @@ pick_task_minlat(struct rq *rq, struct rq_flags *rf)
 	 */
 	while ((me = __pick_first_minlat_entity(minlat_rq))) {
 		p = container_of(me, struct task_struct, minlat);
-		if (!p->minlat.sched_delayed)
+		if (!p->se.sched_delayed)
 			return p;
 		dequeue_task_minlat(rq, p, DEQUEUE_SLEEP | DEQUEUE_DELAYED);
 	}
@@ -2710,7 +2722,7 @@ pick_task_minlat(struct rq *rq, struct rq_flags *rf)
 	 */
 	if (minlat_rq->curr && minlat_rq->curr->on_rq) {
 		p = container_of(minlat_rq->curr, struct task_struct, minlat);
-		if (!p->minlat.sched_delayed)
+		if (!p->se.sched_delayed)
 			return p;
 
 		dequeue_task_minlat(rq, p, DEQUEUE_SLEEP | DEQUEUE_DELAYED);
@@ -2784,7 +2796,7 @@ __put_prev_task_minlat(struct rq *rq, struct task_struct *p,
 					vruntime);
 
 	/* Preempt resist: stamp if involuntarily preempted (still runnable) */
-	if (me->on_rq && !me->sched_delayed && minlat_preempt_resist_ns)
+	if (me->on_rq && !p->se.sched_delayed && minlat_preempt_resist_ns)
 		me->last_preempt_ts = now;
 
 	__enqueue_minlat_entity(minlat_rq, me);
@@ -2907,59 +2919,7 @@ static void minlat_record_sleep(struct task_struct *p, struct rq *rq)
 	me->last_sleep_duration = me->exec_start;
 }
 
-/*
- * Check if a CPU's SMT sibling is running a task from the same tgid.
- * If so, prefer this core for cache/TLB sharing.
- */
-#ifdef CONFIG_SCHED_SMT
-static bool __maybe_unused
-minlat_smt_sibling_has_tgid(int cpu, struct task_struct *p)
-{
-	const struct cpumask *smt_mask = cpu_smt_mask(cpu);
-	int sibling;
-
-	for_each_cpu(sibling, smt_mask) {
-		struct task_struct *curr;
-
-		if (sibling == cpu)
-			continue;
-
-		curr = cpu_curr(sibling);
-		if (curr && curr->tgid == p->tgid)
-			return true;
-	}
-	return false;
-}
-
-static bool __maybe_unused minlat_smt_has_interactive(int cpu)
-{
-	const struct cpumask *smt_mask = cpu_smt_mask(cpu);
-	int sibling;
-
-	for_each_cpu(sibling, smt_mask) {
-		struct task_struct *curr;
-
-		if (sibling == cpu)
-			continue;
-
-		curr = cpu_curr(sibling);
-		if (curr && curr->sched_class == &minlat_sched_class &&
-		    curr->minlat.interactive)
-			return true;
-	}
-	return false;
-}
-#else
-static bool __maybe_unused
-minlat_smt_sibling_has_tgid(int cpu, struct task_struct *p)
-{
-	return false;
-}
-static bool __maybe_unused minlat_smt_has_interactive(int cpu)
-{
-	return false;
-}
-#endif
+/* SMT helpers removed — unused. Kept minlat_smt_sibling_same_tgid() below. */
 
 /*
  * Check if a CPU's entire physical core is idle (all SMT siblings idle).
@@ -3033,18 +2993,29 @@ static inline bool minlat_tgid_llc_overcommitted(struct task_struct *p,
 						  int cpu)
 {
 #ifdef CONFIG_SCHED_SMT
-	struct minlat_tgid_ctx *ctx = READ_ONCE(p->minlat.tgid_ctx);
+	struct minlat_tgid_ctx *ctx;
 	int llc_id, nr_on, llc_cores;
+	bool ret = false;
 
-	if (!ctx || !sched_smt_active())
+	if (!sched_smt_active())
 		return false;
+
+	rcu_read_lock();
+	ctx = rcu_dereference(p->minlat.tgid_ctx);
+	if (!ctx) {
+		rcu_read_unlock();
+		return false;
+	}
 
 	llc_id = per_cpu(sd_llc_id, cpu);
 	nr_on = minlat_tgid_llc_count(ctx, llc_id);
 	/* LLC physical cores = llc_size / 2 on SMT systems */
 	llc_cores = per_cpu(sd_llc_size, cpu) / 2;
 
-	return nr_on > llc_cores;
+	ret = nr_on > llc_cores;
+	rcu_read_unlock();
+
+	return ret;
 #else
 	return false;
 #endif
@@ -3321,7 +3292,7 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 		    minlat_tgid_llc_overcommitted(p, prev_cpu)) {
 			struct minlat_tgid_ctx *ctx;
 
-			ctx = READ_ONCE(p->minlat.tgid_ctx);
+			ctx = rcu_dereference(p->minlat.tgid_ctx);
 			if (ctx) {
 				int cur_llc = per_cpu(sd_llc_id, prev_cpu);
 				int light_llc = minlat_tgid_lightest_llc(
@@ -3980,7 +3951,8 @@ do_scan:
 		if (minlat_tgid_llc_overcommitted(p, prev_cpu)) {
 			struct minlat_tgid_ctx *ctx;
 
-			ctx = READ_ONCE(p->minlat.tgid_ctx);
+			rcu_read_lock();
+			ctx = rcu_dereference(p->minlat.tgid_ctx);
 			if (ctx) {
 				int cur_llc = per_cpu(sd_llc_id, prev_cpu);
 				int light = minlat_tgid_lightest_llc(
@@ -3989,7 +3961,6 @@ do_scan:
 				if (light >= 0) {
 					struct sched_domain *lsd;
 
-					rcu_read_lock();
 					lsd = rcu_dereference(
 						per_cpu(sd_llc, light));
 					if (lsd) {
@@ -4006,9 +3977,9 @@ do_scan:
 							}
 						}
 					}
-					rcu_read_unlock();
 				}
 			}
+			rcu_read_unlock();
 		}
 
 		/*
@@ -4165,7 +4136,7 @@ minlat_pick_pullable_task(struct rq *src_rq, int this_cpu, bool cross_numa)
 			continue;
 
 		/* Skip delayed sleepers — not actually runnable */
-		if (p->minlat.sched_delayed)
+		if (p->se.sched_delayed)
 			continue;
 
 		if (is_migration_disabled(p))
@@ -4608,7 +4579,7 @@ minlat_pick_pushable_task(struct rq *src_rq, int target_cpu)
 		me = rb_entry(node, struct sched_minlat_entity, run_node);
 		p = container_of(me, struct task_struct, minlat);
 
-		if (p->minlat.sched_delayed)
+		if (p->se.sched_delayed)
 			continue;
 
 		if (is_migration_disabled(p))
@@ -4648,7 +4619,7 @@ static int minlat_active_balance_cpu_stop(void *data)
 	if (!cpu_active(src_cpu) || !cpu_active(target_cpu))
 		goto out_unlock;
 
-	if (!src_mrq->active_balance)
+	if (!src_rq->active_balance)
 		goto out_unlock;
 
 	/* Source needs at least 2 effective tasks to give one away */
@@ -4670,7 +4641,7 @@ static int minlat_active_balance_cpu_stop(void *data)
 		p->minlat.llc_runs = 0;
 
 out_unlock:
-	src_mrq->active_balance = 0;
+	src_rq->active_balance = 0;
 	rq_unlock(src_rq, &rf);
 
 	if (p) {
@@ -4792,7 +4763,7 @@ static int minlat_migration_score(struct task_struct *p, struct rq *src_rq,
 	/* Hard filters — can't migrate at all */
 	if (task_current(src_rq, p))
 		return INT_MAX;
-	if (p->minlat.sched_delayed)
+	if (p->se.sched_delayed)
 		return INT_MAX;
 	if (is_migration_disabled(p))
 		return INT_MAX;
@@ -5057,43 +5028,32 @@ static bool minlat_balance_domain(struct rq *this_rq,
  */
 static void minlat_active_balance_push(struct rq *rq)
 {
-	struct minlat_rq *mrq = &rq->minlat;
 	int this_cpu = cpu_of(rq);
 	unsigned int this_eff = minlat_cpu_eff(this_cpu);
 	struct sched_domain *sd;
 	int target_cpu = -1;
-	int underloaded_cpu = -1;
-	unsigned int underloaded_nr = this_eff;
 
 	if (this_eff < 2)
 		return;
 
-	if (mrq->active_balance)
+	if (rq->active_balance)
 		return;
 
+	/*
+	 * Only target idle CPUs. Targeting busy CPUs causes stopper
+	 * storms that destroy producer-consumer locality and can
+	 * completely hang bursty workloads (hackbench, schbench).
+	 */
 	rcu_read_lock();
 	for_each_domain(this_cpu, sd) {
 		int cpu;
 
 		for_each_cpu(cpu, sched_domain_span(sd)) {
-			unsigned int eff;
-
 			if (cpu == this_cpu)
 				continue;
 			if (idle_cpu(cpu)) {
 				target_cpu = cpu;
 				break;
-			}
-			/*
-			 * When heavily queued (3+ tasks), also
-			 * consider pushing to a less loaded CPU.
-			 */
-			if (this_eff >= 3) {
-				eff = minlat_cpu_eff(cpu);
-				if (eff < underloaded_nr) {
-					underloaded_nr = eff;
-					underloaded_cpu = cpu;
-				}
 			}
 		}
 		if (target_cpu >= 0)
@@ -5101,19 +5061,14 @@ static void minlat_active_balance_push(struct rq *rq)
 	}
 	rcu_read_unlock();
 
-	/* Prefer idle CPU; fall back to underloaded CPU */
-	if (target_cpu < 0 && underloaded_cpu >= 0 &&
-	    underloaded_nr + 1 < this_eff)
-		target_cpu = underloaded_cpu;
-
 	if (target_cpu < 0)
 		return;
 
-	mrq->active_balance = 1;
-	mrq->push_cpu = target_cpu;
+	rq->active_balance = 1;
+	rq->push_cpu = target_cpu;
 	stop_one_cpu_nowait(target_cpu,
 			    minlat_active_balance_cpu_stop,
-			    rq, &mrq->active_balance_work);
+			    rq, &rq->active_balance_work);
 }
 
 /*
@@ -5257,15 +5212,33 @@ static void task_tick_minlat(struct rq *rq, struct task_struct *p, int queued)
 
 static void task_dead_minlat(struct task_struct *p)
 {
+	struct rq *rq = task_rq(p);
 	struct minlat_tgid_ctx *ctx = p->minlat.tgid_ctx;
+
+	/* Remove dead task's PELT contribution from the rq aggregate */
+	if (p->minlat.avg.last_update_time) {
+		lsub_positive(&rq->minlat.avg.util_avg,
+			      p->minlat.avg.util_avg);
+		lsub_positive(&rq->minlat.avg.util_sum,
+			      p->minlat.avg.util_sum);
+		lsub_positive(&rq->minlat.avg.load_avg,
+			      p->minlat.avg.load_avg);
+		lsub_positive(&rq->minlat.avg.load_sum,
+			      p->minlat.avg.load_sum);
+		lsub_positive(&rq->minlat.avg.runnable_avg,
+			      p->minlat.avg.runnable_avg);
+		lsub_positive(&rq->minlat.avg.runnable_sum,
+			      p->minlat.avg.runnable_sum);
+	}
 
 	if (ctx) {
 		/*
-		 * Clear the pointer before put to prevent concurrent
-		 * readers from seeing a dangling pointer after the
-		 * refcount drops to zero and the ctx is freed.
+		 * Clear the pointer before put.  rcu_assign_pointer
+		 * provides a release barrier so RCU readers that
+		 * observe NULL will not follow the old pointer, and
+		 * kfree_rcu defers freeing until after a grace period.
 		 */
-		WRITE_ONCE(p->minlat.tgid_ctx, NULL);
+		rcu_assign_pointer(p->minlat.tgid_ctx, NULL);
 		minlat_tgid_llc_dec(ctx, p->minlat.prev_llc);
 		if (p->minlat.prev_llc == ctx->preferred_llc)
 			atomic_dec(&ctx->nr_on_llc);
@@ -5281,6 +5254,24 @@ static void task_dead_minlat(struct task_struct *p)
  */
 static void migrate_task_rq_minlat(struct task_struct *p, int new_cpu)
 {
+	struct rq *rq = task_rq(p);
+
+	/* Remove entity's PELT contribution from source rq aggregate */
+	if (p->minlat.avg.last_update_time) {
+		lsub_positive(&rq->minlat.avg.util_avg,
+			      p->minlat.avg.util_avg);
+		lsub_positive(&rq->minlat.avg.util_sum,
+			      p->minlat.avg.util_sum);
+		lsub_positive(&rq->minlat.avg.load_avg,
+			      p->minlat.avg.load_avg);
+		lsub_positive(&rq->minlat.avg.load_sum,
+			      p->minlat.avg.load_sum);
+		lsub_positive(&rq->minlat.avg.runnable_avg,
+			      p->minlat.avg.runnable_avg);
+		lsub_positive(&rq->minlat.avg.runnable_sum,
+			      p->minlat.avg.runnable_sum);
+	}
+
 	p->minlat.avg.last_update_time = 0;
 }
 
@@ -5371,8 +5362,7 @@ static void reweight_task_minlat(struct rq *rq, struct task_struct *p,
  */
 static void switching_from_minlat(struct rq *rq, struct task_struct *p)
 {
-	if (p->minlat.sched_delayed) {
-		p->minlat.sched_delayed = 0;
+	if (p->se.sched_delayed) {
 		p->se.sched_delayed = 0;
 		rq->minlat.nr_delayed--;
 	}
@@ -5414,6 +5404,8 @@ static void minlat_switch_all(bool to_minlat)
 {
 	int cpu;
 	struct task_struct *g, *p;
+
+	cpus_read_lock();
 
 	/* Phase 1: drain runqueues per-CPU */
 	for_each_online_cpu(cpu) {
@@ -5485,6 +5477,8 @@ static void minlat_switch_all(bool to_minlat)
 
 		rq_unlock_irqrestore(rq, &rf);
 	}
+
+	cpus_read_unlock();
 
 	/*
 	 * Phase 2: migrate remaining tasks (sleeping + any that woke up

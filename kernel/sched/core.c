@@ -4416,7 +4416,6 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 	p->minlat.exec_start		= 0;
 	p->minlat.sum_exec_runtime	= 0;
 	p->minlat.prev_sum_exec_runtime	= 0;
-	p->minlat.sched_delayed		= 0;
 #endif
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -4681,8 +4680,7 @@ int sched_fork(u64 clone_flags, struct task_struct *p)
 	 * Revert to default priority/policy on fork if requested.
 	 */
 	if (unlikely(p->sched_reset_on_fork)) {
-		if (task_has_dl_policy(p) || task_has_rt_policy(p) ||
-		    minlat_policy(p->policy)) {
+		if (task_has_dl_policy(p) || task_has_rt_policy(p)) {
 			p->policy = SCHED_NORMAL;
 			p->static_prio = NICE_TO_PRIO(0);
 			p->rt_priority = 0;
@@ -5988,7 +5986,7 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 			if (me && !RB_EMPTY_NODE(&me->run_node)) {
 				p = container_of(me, struct task_struct,
 						 minlat);
-				if (likely(!me->sched_delayed)) {
+				if (likely(!p->se.sched_delayed)) {
 					rq->minlat.next = NULL;
 					minlat_put_prev_set_next(rq, prev, p);
 					return p;
@@ -6010,7 +6008,7 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 					run_node);
 				p = container_of(me,
 					struct task_struct, minlat);
-				if (likely(!me->sched_delayed)) {
+				if (likely(!p->se.sched_delayed)) {
 					minlat_put_prev_set_next(
 						rq, prev, p);
 					return p;
@@ -6025,7 +6023,7 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 			if (rq->minlat.curr && rq->minlat.curr->on_rq) {
 				p = container_of(rq->minlat.curr,
 						 struct task_struct, minlat);
-				if (unlikely(rq->minlat.curr->sched_delayed))
+				if (unlikely(p->se.sched_delayed))
 					goto restart;
 				minlat_put_prev_set_next(rq, prev, p);
 				return p;
@@ -7389,15 +7387,6 @@ const struct sched_class *__setscheduler_class(int policy, int prio)
 {
 	if (dl_prio(prio))
 		return &dl_sched_class;
-
-#ifdef CONFIG_SCHED_CLASS_MINLAT
-	/*
-	 * minlat_policy check must come before rt_prio because minlat
-	 * tasks use RT-range priority values but belong to minlat class.
-	 */
-	if (minlat_policy(policy))
-		return &minlat_sched_class;
-#endif
 
 	if (rt_prio(prio))
 		return &rt_sched_class;

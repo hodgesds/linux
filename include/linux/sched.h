@@ -774,6 +774,8 @@ struct minlat_tgid_ctx {
 
 	/* Per-LLC thread distribution tracking */
 	struct minlat_llc_count		llcs[MINLAT_TGID_MAX_LLCS];
+
+	struct rcu_head			rcu;
 };
 
 struct sched_minlat_entity {
@@ -784,7 +786,6 @@ struct sched_minlat_entity {
 	struct rb_node			run_node;	/* 24 bytes */
 	u64				vruntime;
 	unsigned int			on_rq;
-	unsigned int			sched_delayed;
 	struct load_weight		load;		/* 16 bytes */
 
 	/*

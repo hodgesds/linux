@@ -39,6 +39,8 @@
 #include <uapi/linux/sched/types.h>
 
 #include "sched.h"
+
+#include <trace/events/ipi.h>
 #include "smp.h"
 
 #include "autogroup.h"
