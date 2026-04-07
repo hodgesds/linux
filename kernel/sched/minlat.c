@@ -892,10 +892,6 @@ static bool sched_minlat_llc_overloaded(int cpu)
 				    per_cpu(sd_llc_id, cpu))) > 0;
 }
 
-/* Removed sched_minlat_any_overloaded() — use sched_minlat_llc_overloaded()
- * directly. The old wrapper name implied system-wide scope but only
- * checked the local LLC after the per-LLC conversion. */
-
 /* ---- priority/weight tables ---- */
 
 static const int minlat_prio_to_weight[MINLAT_MAX_PRIO] = {
