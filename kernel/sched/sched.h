@@ -215,6 +215,12 @@ static inline int dl_policy(int policy)
 	return policy == SCHED_DEADLINE;
 }
 
+/*
+ * SCHED_MINLAT is an internal policy number -- not exported to UAPI.
+ * Userspace cannot request it via sched_setscheduler(); all fair tasks
+ * are transparently routed to the minlat class when it is enabled.
+ */
+#define SCHED_MINLAT		8
 #define MINLAT_MAX_PRIO 8
 
 static inline int minlat_policy(int policy)
@@ -950,10 +956,6 @@ struct minlat_rq {
 	struct sched_avg	avg;
 	unsigned int		util_est;
 
-	/* Active balancing: push tasks from overloaded CPUs */
-	int			active_balance;
-	int			push_cpu;
-	struct cpu_stop_work	active_balance_work;
 	unsigned long		next_balance;
 
 #ifdef CONFIG_CFS_BANDWIDTH
