@@ -4441,7 +4441,6 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 #ifdef CONFIG_SCHED_CLASS_MINLAT
 	RB_CLEAR_NODE(&p->minlat.run_node);
 	p->minlat.vruntime = 0;
-	p->minlat.min_vruntime = 0;
 	p->minlat.minlat_prio = 0;
 	p->minlat.on_rq = 0;
 	p->minlat.tgid_ctx = NULL;

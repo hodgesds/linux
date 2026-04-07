@@ -389,21 +389,26 @@ int update_dl_rq_load_avg(u64 now, struct rq *rq, int running)
 /*
  * minlat_rq:
  *
- *   Like RT/DL, tracks a binary "is minlat class running?" signal.
- *   This drives CPU frequency scaling (schedutil) so that CPUs
- *   running minlat tasks get appropriate frequency.
+ *   Entity-aggregate signal, like CFS's __update_load_avg_cfs_rq().
+ *   The rq-level PELT tracks the sum of entity contributions:
  *
- *   util_sum = cpu_scale * load_sum
- *   runnable_sum = util_sum
+ *   load:     aggregate weight of all enqueued minlat entities
+ *   runnable: number of runnable minlat entities
+ *   running:  is any minlat task currently executing? (binary)
+ *
+ *   This gives schedutil a proportional utilization signal and
+ *   allows correct per-entity subtraction for migration and EAS.
  */
 int update_minlat_rq_load_avg(u64 now, struct rq *rq, int running)
 {
-	if (___update_load_sum(now, &rq->minlat.avg,
-				running,
-				running,
+	struct minlat_rq *mrq = &rq->minlat;
+
+	if (___update_load_sum(now, &mrq->avg,
+				scale_load_down(mrq->load_weight),
+				mrq->nr_running,
 				running)) {
 
-		___update_load_avg(&rq->minlat.avg, 1);
+		___update_load_avg(&mrq->avg, 1);
 		return 1;
 	}
 

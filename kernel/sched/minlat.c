@@ -156,10 +156,7 @@ minlat_latency_credit(u64 base, unsigned int weight)
  */
 #define minlat_fits_capacity(util, cap) ((util) * 1280 < (cap) * 1024)
 
-#define lsub_positive(_ptr, _val) do {				\
-	typeof(_ptr) ptr = (_ptr);				\
-	*ptr -= min_t(typeof(*ptr), *ptr, _val);		\
-} while (0)
+/* lsub_positive is shared from sched.h */
 
 static inline unsigned long minlat_capacity_of(int cpu)
 {
@@ -172,8 +169,13 @@ static inline unsigned long minlat_capacity_of(int cpu)
  * Minlat uses the standard PELT infrastructure for two purposes:
  * 1. Per-entity tracking (sched_minlat_entity.avg): tracks each task's
  *    utilization for capacity-aware placement (big.LITTLE).
- * 2. Per-rq tracking (minlat_rq.avg): tracks aggregate CPU utilization
- *    from minlat tasks, driving CPU frequency scaling (schedutil).
+ * 2. Per-rq tracking (minlat_rq.avg): entity-aggregate signal like CFS's
+ *    cfs_rq->avg. Tracks the sum of entity contributions for:
+ *      - load_avg:     weight-scaled aggregate (drives load balancing)
+ *      - runnable_avg: entity-count-scaled (runnable pressure)
+ *      - util_avg:     combined duty cycle (drives schedutil/cpufreq)
+ *    Entity contributions are subtracted on migration/death to keep
+ *    the aggregate accurate.
  *
  * The per-entity PELT tracks:
  *   load_sum/load_avg  - weight-scaled running time
@@ -418,23 +420,12 @@ static void minlat_update_misfit_status(struct task_struct *p, struct rq *rq)
 #include <linux/energy_model.h>
 
 /*
- * TODO: This struct and the EAS helper functions below duplicate
- * fair.c's energy_env and compute_energy(). The duplication exists
- * because the rq/entity types differ (minlat_rq vs cfs_rq). A shared
- * EAS helper layer parameterized by a "get CPU utilization" callback
- * would eliminate this. For now, keep in sync with fair.c manually.
- */
-
-/*
- * Energy estimation environment — tracks utilization data for
- * computing energy across a performance domain.
- */
-/*
- * TODO: share a common EAS helper layer with fair.c.  The algorithmic
+ * TODO: share a common EAS helper layer with fair.c. The algorithmic
  * structure (compute_energy, eenv_pd_busy_time, eenv_pd_max_util, and
  * find_energy_efficient_cpu) is identical -- only the "read utilization
- * for CPU X" primitive differs.  A parameterized helper taking a
+ * for CPU X" primitive differs. A parameterized helper taking a
  * cpu_util callback would eliminate ~300 lines of duplication.
+ * For now, keep in sync with fair.c manually.
  */
 struct energy_env {
 	unsigned long task_busy_time;	/* Task's utilization contribution */
@@ -901,10 +892,9 @@ static bool sched_minlat_llc_overloaded(int cpu)
 				    per_cpu(sd_llc_id, cpu))) > 0;
 }
 
-static bool sched_minlat_any_overloaded(struct rq *this_rq)
-{
-	return sched_minlat_llc_overloaded(cpu_of(this_rq));
-}
+/* Removed sched_minlat_any_overloaded() — use sched_minlat_llc_overloaded()
+ * directly. The old wrapper name implied system-wide scope but only
+ * checked the local LLC after the per-LLC conversion. */
 
 /* ---- priority/weight tables ---- */
 
@@ -1108,14 +1098,14 @@ static int minlat_tgid_lightest_llc(struct minlat_tgid_ctx *ctx,
 	return best_llc;
 }
 
-static struct minlat_tgid_ctx *minlat_tgid_ctx_alloc(int cpu)
+static struct minlat_tgid_ctx *minlat_tgid_ctx_alloc(int cpu, gfp_t gfp)
 {
 	struct minlat_tgid_ctx *ctx;
 	int llc_id = per_cpu(sd_llc_id, cpu);
 	struct sched_domain *sd;
 	int i;
 
-	ctx = kzalloc(sizeof(*ctx), GFP_ATOMIC);
+	ctx = kzalloc(sizeof(*ctx), gfp);
 	if (!ctx)
 		return NULL;
 
@@ -1134,7 +1124,7 @@ static struct minlat_tgid_ctx *minlat_tgid_ctx_alloc(int cpu)
 	ctx->llcs[0].llc_id = llc_id;
 	atomic_set(&ctx->llcs[0].nr_tasks, 1);
 
-	if (!zalloc_cpumask_var(&ctx->llc_cpus, GFP_ATOMIC)) {
+	if (!zalloc_cpumask_var(&ctx->llc_cpus, gfp)) {
 		kfree(ctx);
 		return NULL;
 	}
@@ -1164,7 +1154,7 @@ static void minlat_tgid_ctx_put(struct minlat_tgid_ctx *ctx)
 	}
 }
 
-static void minlat_ensure_tgid_ctx(struct task_struct *p)
+static void minlat_ensure_tgid_ctx(struct task_struct *p, gfp_t gfp)
 {
 	struct sched_minlat_entity *me = &p->minlat;
 	struct task_struct *leader;
@@ -1207,7 +1197,7 @@ static void minlat_ensure_tgid_ctx(struct task_struct *p)
 	rcu_read_unlock();
 
 	/* Allocate new ctx for this thread */
-	ctx = minlat_tgid_ctx_alloc(task_cpu(p));
+	ctx = minlat_tgid_ctx_alloc(task_cpu(p), gfp);
 	if (!ctx)
 		return;
 
@@ -1326,7 +1316,6 @@ static void minlat_maybe_update_llc(struct task_struct *p)
 static void minlat_update_interactivity(struct task_struct *p,
 					struct rq *rq, int flags);
 static void minlat_record_sleep(struct task_struct *p, struct rq *rq);
-static void minlat_maybe_update_llc(struct task_struct *p);
 static void pull_minlat_task(struct rq *this_rq);
 static inline unsigned int minlat_cpu_eff(int cpu);
 static __always_inline void
@@ -2041,16 +2030,17 @@ static void check_preempt_tick_minlat(struct rq *rq, struct task_struct *curr)
 		 *
 		 * Disabled when:
 		 *  - CPU is contended (3+ effective tasks)
-		 *  - System has idle CPUs while this CPU is
-		 *    overloaded — tasks should migrate, and resist
-		 *    just delays the queued task further
+		 *  - Local LLC has overloaded CPUs — tasks should
+		 *    migrate to idle CPUs in this LLC. Only checks
+		 *    the local LLC: cross-socket migration cost makes
+		 *    remote idle CPUs a poor reason to disable resist
 		 *
 		 * Under these conditions, fast preemption reduces
 		 * tail latency for queued tasks.
 		 */
 		if (eff < 3 &&
 		    !(eff >= 2 &&
-		      sched_minlat_any_overloaded(rq)) &&
+		      sched_minlat_llc_overloaded(cpu_of(rq))) &&
 		    minlat_preempt_resisted(curr_me, rq) &&
 		    delta_exec <= 2 * ideal_runtime)
 			return;
@@ -2658,7 +2648,7 @@ pick_task_minlat(struct rq *rq, struct rq_flags *rf)
 	 * Skip the pull if no CPU is overloaded — avoids expensive
 	 * cross-CPU scanning when the system is balanced.
 	 */
-	if (rf && sched_minlat_any_overloaded(rq)) {
+	if (rf && sched_minlat_llc_overloaded(cpu_of(rq))) {
 		rq_unpin_lock(rq, rf);
 		pull_minlat_task(rq);
 		rq_repin_lock(rq, rf);
@@ -3113,72 +3103,290 @@ static int minlat_wake_affine_cpu(struct task_struct *p, int prev_cpu,
 }
 
 /*
- * CPU selection for wakeup. Optimized for low latency.
+ * Shared idle CPU scan for select_task_rq_minlat.
  *
- * O(1) checks (no scanning):
- *  0. Wake affinity: waker's CPU for sync wakeups (futex, pipe)
- *  1. prev_cpu if idle (cache warm, zero cost)
- *  2. recent_used_cpu if idle and same LLC (cache warm)
+ * Scans for idle CPUs using SIS_UTIL-style depth limiting.
+ * In-LLC CPUs are always fully scanned; off-LLC CPUs are
+ * depth-limited based on remote LLC idle counts.
  *
- * Single scan (starting from prev_cpu for distribution):
- *  3. Any idle CPU in same LLC → immediate return
- *  4. First idle CPU outside LLC → remember as fallback
- *
- * Fully loaded fallback:
- *  5. Least-loaded CPU
+ * Returns: idle CPU, or -1 if none found.
+ * Side effect: fills *llc_fb_cpu / *llc_fb_nr with the
+ * least-loaded LLC-local CPU for no-idle fallback.
  */
 static int
-select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
+minlat_select_idle_cpu(struct task_struct *p, int prev_cpu, bool wants_big,
+		       int *llc_fb_cpu, unsigned int *llc_fb_nr)
 {
 	const struct cpumask *allowed = p->cpus_ptr;
-	int cpu, recent_used_cpu, best_cpu = -1;
-	int least_loaded_llc_cpu = -1;
-	unsigned int least_loaded_llc_nr = UINT_MAX;
-	unsigned int best_nr;
-
-	/*
-	 * 0. Wake affinity — for sync wakeups (futex, pipe), place the
-	 * wakee on the waker's CPU which is about to go idle.
-	 * Check wake affine BEFORE recording wakee, so last_wakee
-	 * reflects the previous wakeup target (not the current one).
-	 */
-	cpu = minlat_wake_affine_cpu(p, prev_cpu, flags);
-
-	if (flags & WF_TTWU)
-		minlat_record_wakee(p);
-	if (cpu >= 0)
-		return cpu;
-
-#if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
-	/*
-	 * Energy-aware placement: on asymmetric capacity systems with
-	 * an energy model, use EM-based energy estimation to select
-	 * the most energy-efficient CPU. This is only beneficial when
-	 * the system is not overutilized — under heavy load, the
-	 * traditional idle scan / load balancing is more appropriate.
-	 *
-	 * Skip for fork (no utilization history) and for sync wakeups
-	 * (already handled by wake affinity above).
-	 */
-	if ((flags & WF_TTWU) && sched_energy_enabled() &&
-	    !READ_ONCE(this_rq()->rd->overutilized)) {
-		int eas_cpu = find_energy_efficient_cpu_minlat(p, prev_cpu);
-
-		if (eas_cpu >= 0)
-			return eas_cpu;
-	}
+	int cpu, best_cpu = -1;
+	int fallback_cpu = -1;
+	int nr_scanned = 0;
+	int scan_limit;
+	unsigned int nr_cpus;
+	struct sched_domain_shared *sds;
+	bool llc_cores_saturated = false;
+#ifdef CONFIG_SCHED_SMT
+	int idle_smt_cpu = -1;
+	int off_llc_smt_cpu = -1;
+	bool idle_smt_same_tgid = false;
+	bool smt = sched_smt_active();
+#endif
+#ifdef CONFIG_NUMA_BALANCING
+	int preferred_nid = READ_ONCE(p->numa_preferred_nid);
 #endif
 
+	nr_cpus = num_online_cpus();
+
 	/*
-	 * Fork balancing: spread new tasks across the LLC.
+	 * Per-LLC idle detection: sd_llc_shared->nr_busy_cpus
+	 * tracks how many CPUs in this LLC have exited NOHZ
+	 * idle. llc_size - nr_busy_cpus = idle CPUs in LLC.
 	 *
-	 * CFS uses SD_BALANCE_FORK → sched_balance_find_dst_cpu() to
-	 * find the idlest CPU within the LLC domain. We do the same:
-	 * scan the LLC for the least-loaded CPU, with a randomized
-	 * start to prevent thundering-herd pileup when many children
-	 * are forked from the same parent CPU.
+	 * If idle CPUs exist in our LLC and the LLC is less
+	 * than 50% busy, idle cores must exist — stay local.
+	 *
+	 * If idle CPUs exist but the LLC is >50% busy, the
+	 * idle CPUs may all be SMT siblings of busy cores.
+	 * In that case, allow a limited off-LLC scan so we
+	 * can find idle cores elsewhere rather than stacking
+	 * unrelated tasks onto shared physical cores.
 	 */
-	if (flags & WF_FORK) {
+	sds = rcu_dereference_sched(per_cpu(sd_llc_shared, prev_cpu));
+	if (sds) {
+		int llc_sz = per_cpu(sd_llc_size, prev_cpu);
+		int llc_busy = atomic_read(&sds->nr_busy_cpus);
+		int llc_idle = llc_sz - llc_busy;
+
+		if (llc_idle > 0) {
+			if (IS_ENABLED(CONFIG_SCHED_SMT) && smt &&
+			    (llc_busy * 2 > llc_sz ||
+			     minlat_tgid_llc_overcommitted(p,
+							   prev_cpu))) {
+				/*
+				 * LLC >50% busy: physical cores
+				 * may be saturated. Do in-LLC
+				 * scan first (fast, cache-local).
+				 * A targeted off-LLC scan runs
+				 * after the main loop only if
+				 * no idle core was found in-LLC.
+				 */
+				llc_cores_saturated = true;
+				scan_limit = 0;
+			} else {
+				scan_limit = 0;
+			}
+			goto do_scan;
+		}
+	}
+
+	/*
+	 * LLC fully busy (or no LLC domain). We must scan
+	 * off-LLC to find idle CPUs.
+	 *
+	 * Don't pre-filter with a scan_limit based on local
+	 * LLC overload — local saturation says nothing about
+	 * remote LLCs. Instead, scan all off-LLC CPUs and
+	 * rely on the per-LLC nr_busy_cpus check during
+	 * traversal (phase-2) to skip saturated remote LLCs.
+	 *
+	 * Small machines (<=16 CPUs): always scan all.
+	 * Large machines: cap at nr_cpus to bound worst case.
+	 */
+	scan_limit = nr_cpus;
+do_scan:
+
+	for_each_cpu_wrap(cpu, cpu_active_mask, prev_cpu) {
+		if (!cpumask_test_cpu(cpu, allowed))
+			continue;
+
+		/*
+		 * In-LLC CPUs are always checked (cheap
+		 * migration, small scan space). Off-LLC
+		 * CPUs count against the scan limit.
+		 */
+		if (!cpus_share_cache(cpu, prev_cpu) &&
+		    ++nr_scanned > scan_limit)
+			break;
+
+		if (!minlat_cpu_effectively_idle(cpu)) {
+			/*
+			 * Track the least-loaded non-idle CPU
+			 * in same LLC for the no-idle fallback.
+			 */
+			if (cpus_share_cache(cpu, prev_cpu)) {
+				struct minlat_rq *mrq =
+					&cpu_rq(cpu)->minlat;
+				unsigned int nr = mrq->nr_running -
+					min(mrq->nr_running,
+					    mrq->nr_delayed);
+
+				if (nr < *llc_fb_nr) {
+					*llc_fb_nr = nr;
+					*llc_fb_cpu = cpu;
+				}
+			}
+			continue;
+		}
+
+		if (!minlat_task_fits_cpu(p, cpu)) {
+			if (fallback_cpu < 0)
+				fallback_cpu = cpu;
+			continue;
+		}
+
+		/* Soft big-core preference: skip little cores */
+		if (wants_big && !minlat_cpu_is_big(cpu)) {
+			if (fallback_cpu < 0)
+				fallback_cpu = cpu;
+			continue;
+		}
+
+		if (cpus_share_cache(cpu, prev_cpu)) {
+#ifdef CONFIG_SCHED_SMT
+			/*
+			 * SMT-aware: prefer idle cores (all
+			 * siblings idle) over idle SMT siblings
+			 * to avoid sharing execution resources.
+			 */
+			if (smt && !minlat_is_core_idle(cpu)) {
+				if (idle_smt_cpu < 0) {
+					idle_smt_cpu = cpu;
+					idle_smt_same_tgid =
+					    minlat_smt_sibling_same_tgid(
+						cpu, p);
+				}
+				continue;
+			}
+#endif
+			return cpu;
+		}
+
+		/* Off-LLC idle CPU */
+#ifdef CONFIG_SCHED_SMT
+		if (smt && !minlat_is_core_idle(cpu)) {
+			if (off_llc_smt_cpu < 0)
+				off_llc_smt_cpu = cpu;
+			continue;
+		}
+#endif
+		if (best_cpu < 0) {
+			best_cpu = cpu;
+		}
+#ifdef CONFIG_NUMA_BALANCING
+		else if (preferred_nid != NUMA_NO_NODE &&
+			 cpu_to_node(cpu) == preferred_nid &&
+			 cpu_to_node(best_cpu) != preferred_nid) {
+			best_cpu = cpu;
+		}
+#endif
+	}
+#ifdef CONFIG_SCHED_SMT
+	/*
+	 * Phase 2: targeted off-LLC scan when LLC cores are
+	 * saturated and only an SMT sibling was found in-LLC.
+	 */
+	if (llc_cores_saturated && idle_smt_cpu >= 0 &&
+	    best_cpu < 0) {
+		int off_start, off_limit, off_scanned = 0;
+		struct sched_domain_shared *rsds;
+
+		off_start = cpumask_any_and_distribute(
+				cpu_active_mask, allowed);
+		if (off_start >= nr_cpu_ids)
+			off_start = prev_cpu;
+
+		off_limit = 4;
+		for_each_cpu_wrap(cpu, cpu_active_mask,
+				  off_start) {
+			if (cpus_share_cache(cpu, prev_cpu))
+				continue;
+			if (!cpumask_test_cpu(cpu, allowed))
+				continue;
+
+			if (off_scanned == 0) {
+				rsds = rcu_dereference_sched(
+				    per_cpu(sd_llc_shared, cpu));
+				if (rsds) {
+					int rsz = per_cpu(
+					    sd_llc_size, cpu);
+					int rbusy = atomic_read(
+					    &rsds->nr_busy_cpus);
+					off_limit = max(rsz - rbusy,
+							0);
+				}
+				if (off_limit == 0)
+					break;
+			}
+			if (++off_scanned > off_limit)
+				break;
+
+			if (!minlat_cpu_effectively_idle(cpu))
+				continue;
+			if (!minlat_task_fits_cpu(p, cpu))
+				continue;
+
+			if (!minlat_is_core_idle(cpu)) {
+				if (off_llc_smt_cpu < 0)
+					off_llc_smt_cpu = cpu;
+				continue;
+			}
+			best_cpu = cpu;
+			break;
+		}
+	}
+
+	/*
+	 * SMT placement priority when LLC cores are saturated:
+	 *  1. Off-LLC idle core (dedicated physical core)
+	 *  2. Off-LLC idle SMT (cross-tgid only)
+	 *  3. In-LLC idle SMT (fallback)
+	 */
+	if (idle_smt_cpu >= 0) {
+		if (llc_cores_saturated) {
+			if (best_cpu >= 0)
+				return best_cpu;
+			if (!idle_smt_same_tgid &&
+			    off_llc_smt_cpu >= 0)
+				return off_llc_smt_cpu;
+		}
+		return idle_smt_cpu;
+	}
+	if (best_cpu >= 0)
+		return best_cpu;
+	if (off_llc_smt_cpu >= 0)
+		return off_llc_smt_cpu;
+#else
+	if (best_cpu >= 0)
+		return best_cpu;
+#endif
+
+	if (fallback_cpu >= 0)
+		return fallback_cpu;
+
+	return -1;
+}
+
+/*
+ * Fork balancing: spread new tasks across LLCs.
+ *
+ * Uses tgid-aware LLC selection to avoid over-packing.
+ * Falls back to a global least-loaded scan if no idle CPU
+ * is found within the LLC domain hierarchy.
+ */
+static int
+select_task_rq_minlat_fork(struct task_struct *p, int prev_cpu)
+{
+	const struct cpumask *allowed = p->cpus_ptr;
+	int cpu;
+	int llc_fb_cpu = -1;
+	unsigned int llc_fb_nr = UINT_MAX;
+
+	/*
+	 * Fork LLC balancing: spread children across LLCs using
+	 * tgid-aware selection, pick-2 comparison, and NUMA-aware
+	 * load distribution.
+	 */
+	{
 		struct sched_domain *sd, *numa_sd;
 		int best_cpu_local = -1, best_cpu_remote = -1;
 		unsigned int best_nr_local = UINT_MAX;
@@ -3187,20 +3395,6 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 		int local_llc_cpus = 0;
 		bool asym = sched_asym_cpucap_active();
 
-		/*
-		 * Fork balancing with tgid-aware LLC selection:
-		 *
-		 * 0. If the tgid is over-packing this LLC, steer the
-		 *    fork directly to the lightest LLC for this tgid.
-		 * 1. Scan current LLC for idle or least-loaded CPU
-		 * 2. Pick a random LLC in same NUMA, compare load
-		 * 3. Use the less-loaded LLC
-		 * 4. If NUMA node is saturated, try cross-NUMA
-		 *
-		 * On asymmetric capacity systems, prefer the highest-
-		 * capacity idle CPU since forked tasks have no
-		 * utilization history to guide placement.
-		 */
 		rcu_read_lock();
 
 		/*
@@ -3224,8 +3418,6 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 					lsd = rcu_dereference(
 						per_cpu(sd_llc, light_llc));
 					if (lsd) {
-						int cpu;
-
 						for_each_cpu_wrap(cpu,
 						    sched_domain_span(lsd),
 						    light_llc) {
@@ -3252,13 +3444,6 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 			bool llc_saturated = false;
 			struct sched_domain_shared *fsds;
 
-			/*
-			 * Check if the local LLC has its physical
-			 * cores saturated. If so, defer to pick-2
-			 * instead of returning the first idle CPU —
-			 * a remote LLC with more headroom gives
-			 * the forked task a dedicated core.
-			 */
 			if (IS_ENABLED(CONFIG_SCHED_SMT) &&
 			    sched_smt_active()) {
 				fsds = rcu_dereference(
@@ -3281,16 +3466,6 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 				nr = cpu_rq(cpu)->minlat.nr_running;
 				local_llc_load += nr;
 				if (nr == 0) {
-					/*
-					 * On symmetric systems with a
-					 * non-saturated LLC, return the
-					 * first idle CPU immediately.
-					 *
-					 * When saturated, save it and
-					 * continue scanning so the
-					 * pick-2 comparison can choose
-					 * a less-loaded remote LLC.
-					 */
 					if (!asym && !llc_saturated) {
 						rcu_read_unlock();
 						return cpu;
@@ -3321,10 +3496,7 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 			}
 		}
 
-		/*
-		 * Pick-2: sample a random LLC in the same NUMA node.
-		 * If it's less loaded, place the fork there instead.
-		 */
+		/* Pick-2: sample a random LLC in same NUMA node */
 		for_each_domain(prev_cpu, numa_sd) {
 			const struct cpumask *numa_span;
 			int rand_cpu, rand_llc;
@@ -3386,18 +3558,6 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 			}
 			remote_llc_load = rcpus ? rload : INT_MAX;
 
-			/*
-			 * Compare per-CPU average load between LLCs.
-			 * Use the less-loaded LLC if the imbalance exceeds
-			 * the tunable threshold percentage.
-			 *
-			 * Cross-NUMA requires a larger imbalance to justify
-			 * remote memory access cost.
-			 *
-			 * Formula: remote_avg * 100 + threshold * local_avg
-			 *          <= local_avg * 100
-			 * i.e.: remote is at least threshold% less loaded.
-			 */
 			if (best_cpu_remote >= 0 && rcpus > 0 &&
 			    local_llc_cpus > 0) {
 				bool cross_numa = numa_sd->flags & SD_NUMA;
@@ -3417,39 +3577,66 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 				}
 			}
 
-			/*
-			 * For same-NUMA domains, only try one random LLC
-			 * (pick-2). For cross-NUMA, also try one.
-			 */
 			break;
 		}
 
 		rcu_read_unlock();
 
-		/* Local LLC least-loaded is our fallback */
 		if (best_cpu_local >= 0)
 			return best_cpu_local;
-
-		/* No valid CPUs found — fall through to general path */
 	}
 
-	/*
-	 * Check if this task has a big-core preference. If so, O(1)
-	 * fast paths on little cores are skipped — we want the scan
-	 * to find a big core instead. The scan has a little-core
-	 * fallback so we never starve.
-	 */
+	/* Try the shared idle scan */
+	cpu = minlat_select_idle_cpu(p, prev_cpu, false,
+				     &llc_fb_cpu, &llc_fb_nr);
+	if (cpu >= 0)
+		return cpu;
+
+	/* Fork global fallback: find least-loaded CPU */
 	{
+		int best_cpu = prev_cpu;
+		unsigned int best_nr = cpu_rq(prev_cpu)->minlat.nr_running;
+
+		for_each_cpu_wrap(cpu, cpu_active_mask, prev_cpu) {
+			unsigned int nr;
+
+			if (!cpumask_test_cpu(cpu, allowed))
+				continue;
+			nr = cpu_rq(cpu)->minlat.nr_running;
+			if (nr < best_nr) {
+				best_nr = nr;
+				best_cpu = cpu;
+				if (nr == 0)
+					break;
+			}
+		}
+
+		return best_cpu;
+	}
+}
+
+/*
+ * Wakeup CPU selection: optimized for low latency.
+ *
+ * O(1) checks: prev_cpu, recent_used_cpu.
+ * Then the shared idle scan, followed by LLC-local and
+ * tgid-aware fallbacks under saturation.
+ */
+static int
+select_task_rq_minlat_wakeup(struct task_struct *p, int prev_cpu)
+{
+	const struct cpumask *allowed = p->cpus_ptr;
+	int cpu;
+	int llc_fb_cpu = -1;
+	unsigned int llc_fb_nr = UINT_MAX;
 	bool wants_big = minlat_prefers_big(p);
+	int recent_used_cpu;
 
 	/*
-	 * 1. prev_cpu if idle — fast path, no scanning.
+	 * prev_cpu if idle — fast path, no scanning.
 	 *
-	 * Skip the fast path when prev_cpu is an SMT sibling of a
-	 * busy core and the LLC has its physical cores saturated.
-	 * Returning to a shared core wastes ~30% IPC when off-LLC
-	 * idle cores exist. Fall through to the main scan which
-	 * can find a dedicated core.
+	 * Skip when prev_cpu is an SMT sibling of a busy core
+	 * and the LLC has its physical cores saturated.
 	 */
 	if (cpu_active(prev_cpu) && cpumask_test_cpu(prev_cpu, allowed) &&
 	    minlat_cpu_effectively_idle(prev_cpu) &&
@@ -3457,12 +3644,6 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 	    !(wants_big && !minlat_cpu_is_big(prev_cpu))) {
 #ifdef CONFIG_SCHED_SMT
 		if (sched_smt_active() && !minlat_is_core_idle(prev_cpu)) {
-			/*
-			 * prev_cpu is an SMT sibling. Skip if either:
-			 * - LLC globally >50% busy (cores saturated)
-			 * - This tgid has more threads than physical
-			 *   cores on this LLC (tgid over-packing)
-			 */
 			if (minlat_tgid_llc_overcommitted(p, prev_cpu))
 				goto do_full_scan;
 			{
@@ -3484,11 +3665,7 @@ select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 	}
 do_full_scan:
 
-	/*
-	 * 2. recent_used_cpu — O(1) check of a CPU this task recently
-	 * ran on. CFS maintains p->recent_used_cpu; we piggyback on it.
-	 * Only useful if it's in the same LLC (cache warm) and idle.
-	 */
+	/* recent_used_cpu: O(1) check of a recently-used CPU */
 	recent_used_cpu = p->recent_used_cpu;
 	p->recent_used_cpu = prev_cpu;
 
@@ -3502,375 +3679,28 @@ do_full_scan:
 	    !(wants_big && !minlat_cpu_is_big(recent_used_cpu)))
 		return recent_used_cpu;
 
+	/* Shared idle CPU scan */
+	cpu = minlat_select_idle_cpu(p, prev_cpu, wants_big,
+				     &llc_fb_cpu, &llc_fb_nr);
+	if (cpu >= 0)
+		return cpu;
+
 	/*
-	 * 3-4. Single scan for idle CPU, starting from prev_cpu so
-	 * each task scans a different order and spreads evenly.
-	 * Prefer same-LLC idle CPUs (cheaper migration).
-	 *
-	 * On asymmetric capacity systems, skip CPUs where the task
-	 * doesn't fit (little cores for compute-bound tasks). Track
-	 * a fallback for the case where no fitting CPU is idle — a
-	 * little core is better than staying on an overloaded big.
-	 *
-	 * When the task prefers big cores (interactive_big_prefer or
-	 * compute_big_prefer), additionally skip little cores even
-	 * if the task fits on them. The fallback catches the case
-	 * where no big core is idle.
-	 *
-	 * SIS_UTIL-style scan depth limiting: on large machines,
-	 * scanning all CPUs for an idle one is expensive. Use
-	 * per-LLC idle tracking (sd_llc_shared->nr_busy_cpus,
-	 * maintained by the NOHZ subsystem) to decide:
-	 *
-	 * 1. If our LLC has idle CPUs, skip off-LLC scan — cheap
-	 *    local migration is available.
-	 * 2. If our LLC is fully busy, compute off-LLC scan depth
-	 *    from global utilization (quadratic curve like CFS).
-	 *
-	 * In-LLC CPUs are always fully scanned (cache-local,
-	 * small scan space) — the limit applies only to off-LLC.
+	 * No idle CPU found. Wakeup fallback:
+	 * - least-loaded LLC-local CPU (prevent task pile-up)
+	 * - tgid-aware LLC spreading
+	 * - global spread at saturation
 	 */
 	{
-		int fallback_cpu = -1;
-		int nr_scanned = 0;
-		int scan_limit;
-		unsigned int nr_cpus;
-		struct sched_domain_shared *sds;
-		bool llc_cores_saturated = false;
-#ifdef CONFIG_SCHED_SMT
-		int idle_smt_cpu = -1;
-		int off_llc_smt_cpu = -1;
-		bool idle_smt_same_tgid = false;
-		bool smt = sched_smt_active();
-#endif
-#ifdef CONFIG_NUMA_BALANCING
-		int preferred_nid = READ_ONCE(p->numa_preferred_nid);
-#endif
-
-		nr_cpus = num_online_cpus();
-
-		/*
-		 * Per-LLC idle detection: sd_llc_shared->nr_busy_cpus
-		 * tracks how many CPUs in this LLC have exited NOHZ
-		 * idle. llc_size - nr_busy_cpus = idle CPUs in LLC.
-		 *
-		 * If idle CPUs exist in our LLC and the LLC is less
-		 * than 50% busy, idle cores must exist — stay local.
-		 *
-		 * If idle CPUs exist but the LLC is >50% busy, the
-		 * idle CPUs may all be SMT siblings of busy cores.
-		 * In that case, allow a limited off-LLC scan so we
-		 * can find idle cores elsewhere rather than stacking
-		 * unrelated tasks onto shared physical cores.
-		 */
-		sds = rcu_dereference_sched(per_cpu(sd_llc_shared, prev_cpu));
-		if (sds) {
-			int llc_sz = per_cpu(sd_llc_size, prev_cpu);
-			int llc_busy = atomic_read(&sds->nr_busy_cpus);
-			int llc_idle = llc_sz - llc_busy;
-
-			if (llc_idle > 0) {
-				if (IS_ENABLED(CONFIG_SCHED_SMT) && smt &&
-				    (llc_busy * 2 > llc_sz ||
-				     minlat_tgid_llc_overcommitted(p,
-								   prev_cpu))) {
-					/*
-					 * LLC >50% busy: physical cores
-					 * may be saturated. Do in-LLC
-					 * scan first (fast, cache-local).
-					 * A targeted off-LLC scan runs
-					 * after the main loop only if
-					 * no idle core was found in-LLC.
-					 */
-					llc_cores_saturated = true;
-					scan_limit = 0;
-				} else {
-					scan_limit = 0;
-				}
-				goto do_scan;
-			}
-		}
-
-		/*
-		 * LLC fully busy (or no LLC domain). Compute off-LLC
-		 * scan depth from global utilization.
-		 *
-		 * busy_pct = nr_overloaded / nr_online
-		 * scan_frac = 1 - (busy_pct / 0.85)^2
-		 * scan_limit = nr_online * scan_frac
-		 *
-		 * Quadratic curve: at 0% busy → scan all off-LLC,
-		 * at 85% busy → scan 0. Minimum of 4 ensures we
-		 * check at least a few off-LLC CPUs under moderate
-		 * load. Small machines (<=16 CPUs) always scan all.
-		 */
-		{
-			unsigned int nr_busy = atomic_read(
-				&per_cpu(minlat_llc_nr_overloaded,
-					 per_cpu(sd_llc_id, prev_cpu)));
-			unsigned int llc_size = per_cpu(sd_llc_size, prev_cpu);
-
-			if (nr_busy * 100 >= llc_size * 85) {
-				scan_limit = 0;
-			} else if (nr_cpus <= 16) {
-				scan_limit = nr_cpus;
-			} else {
-				unsigned int x = nr_busy * 100;
-				unsigned int thresh = llc_size * 85;
-
-				scan_limit = nr_cpus -
-					(u64)x * x * nr_cpus /
-					((u64)thresh * thresh);
-				scan_limit = max(scan_limit, 4);
-			}
-		}
-do_scan:
-
-		for_each_cpu_wrap(cpu, cpu_active_mask, prev_cpu) {
-			if (!cpumask_test_cpu(cpu, allowed))
-				continue;
-
-			/*
-			 * In-LLC CPUs are always checked (cheap
-			 * migration, small scan space). Off-LLC
-			 * CPUs count against the scan limit.
-			 */
-			if (!cpus_share_cache(cpu, prev_cpu) &&
-			    ++nr_scanned > scan_limit)
-				break;
-
-			if (!minlat_cpu_effectively_idle(cpu)) {
-				/*
-				 * Track the least-loaded non-idle CPU
-				 * in same LLC for the no-idle fallback.
-				 */
-				if (cpus_share_cache(cpu, prev_cpu)) {
-					struct minlat_rq *mrq =
-						&cpu_rq(cpu)->minlat;
-					unsigned int nr = mrq->nr_running -
-						min(mrq->nr_running,
-						    mrq->nr_delayed);
-
-					if (nr < least_loaded_llc_nr) {
-						least_loaded_llc_nr = nr;
-						least_loaded_llc_cpu = cpu;
-					}
-				}
-				continue;
-			}
-
-			if (!minlat_task_fits_cpu(p, cpu)) {
-				if (fallback_cpu < 0)
-					fallback_cpu = cpu;
-				continue;
-			}
-
-			/* Soft big-core preference: skip little cores */
-			if (wants_big && !minlat_cpu_is_big(cpu)) {
-				if (fallback_cpu < 0)
-					fallback_cpu = cpu;
-				continue;
-			}
-
-			if (cpus_share_cache(cpu, prev_cpu)) {
-#ifdef CONFIG_SCHED_SMT
-				/*
-				 * SMT-aware: prefer idle cores (all
-				 * siblings idle) over idle SMT siblings
-				 * to avoid sharing execution resources.
-				 * Two tasks on the same physical core
-				 * lose ~30-40% throughput each.
-				 *
-				 * Track whether the busy sibling belongs
-				 * to the same tgid — same-tgid SMT is
-				 * acceptable (shared address space).
-				 */
-				if (smt && !minlat_is_core_idle(cpu)) {
-					if (idle_smt_cpu < 0) {
-						idle_smt_cpu = cpu;
-						idle_smt_same_tgid =
-						    minlat_smt_sibling_same_tgid(
-							cpu, p);
-					}
-					continue;
-				}
-#endif
-				return cpu;
-			}
-
-			/* Off-LLC idle CPU */
-#ifdef CONFIG_SCHED_SMT
-			/*
-			 * Distinguish off-LLC idle cores from off-LLC
-			 * idle SMT siblings. An off-LLC idle core is
-			 * the best option (dedicated physical core).
-			 * An off-LLC idle SMT is still better than an
-			 * in-LLC cross-tgid SMT — the remote LLC may
-			 * have lower contention overall.
-			 */
-			if (smt && !minlat_is_core_idle(cpu)) {
-				if (off_llc_smt_cpu < 0)
-					off_llc_smt_cpu = cpu;
-				continue;
-			}
-#endif
-			if (best_cpu < 0) {
-				best_cpu = cpu;
-			}
-#ifdef CONFIG_NUMA_BALANCING
-			/*
-			 * NUMA preference: among off-LLC idle CPUs,
-			 * prefer one on the task's preferred NUMA
-			 * node for memory locality.
-			 */
-			else if (preferred_nid != NUMA_NO_NODE &&
-				 cpu_to_node(cpu) == preferred_nid &&
-				 cpu_to_node(best_cpu) != preferred_nid) {
-				best_cpu = cpu;
-			}
-#endif
-		}
-#ifdef CONFIG_SCHED_SMT
-		/*
-		 * Phase 2: targeted off-LLC scan.
-		 *
-		 * The main loop (phase 1) scanned in-LLC only when
-		 * cores are saturated (scan_limit=0). If we found
-		 * only an SMT sibling (no idle core in-LLC), scan
-		 * the remote LLC for idle cores. A dedicated
-		 * physical core always beats SMT — even for same-
-		 * tgid threads, the ~30% IPC loss from core sharing
-		 * outweighs TLB/cache locality at lower utilization.
-		 *
-		 * Randomize the scan start so different wakeups
-		 * probe different remote CPUs. Scan limit is set
-		 * from the remote LLC's actual idle count.
-		 */
-		if (llc_cores_saturated && idle_smt_cpu >= 0 &&
-		    best_cpu < 0) {
-			int off_start, off_limit, off_scanned = 0;
-			struct sched_domain_shared *rsds;
-
-			off_start = cpumask_any_and_distribute(
-					cpu_active_mask, allowed);
-			if (off_start >= nr_cpu_ids)
-				off_start = prev_cpu;
-
-			/* Read remote LLC idle count for scan depth */
-			off_limit = 4; /* fallback */
-			for_each_cpu_wrap(cpu, cpu_active_mask,
-					  off_start) {
-				if (cpus_share_cache(cpu, prev_cpu))
-					continue;
-				if (!cpumask_test_cpu(cpu, allowed))
-					continue;
-
-				/* Lazily set limit from first remote LLC */
-				if (off_scanned == 0) {
-					rsds = rcu_dereference_sched(
-					    per_cpu(sd_llc_shared, cpu));
-					if (rsds) {
-						int rsz = per_cpu(
-						    sd_llc_size, cpu);
-						int rbusy = atomic_read(
-						    &rsds->nr_busy_cpus);
-						off_limit = max(rsz - rbusy,
-								0);
-					}
-					if (off_limit == 0)
-						break;
-				}
-				if (++off_scanned > off_limit)
-					break;
-
-				if (!minlat_cpu_effectively_idle(cpu))
-					continue;
-				if (!minlat_task_fits_cpu(p, cpu))
-					continue;
-
-				if (!minlat_is_core_idle(cpu)) {
-					if (off_llc_smt_cpu < 0)
-						off_llc_smt_cpu = cpu;
-					continue;
-				}
-				/* Off-LLC idle core — best outcome */
-				best_cpu = cpu;
-				break;
-			}
-		}
-
-		/*
-		 * SMT placement priority when LLC cores are
-		 * saturated (>50% busy):
-		 *
-		 *  1. Off-LLC idle core (dedicated physical core —
-		 *     always preferred, even for same-tgid. The
-		 *     ~30% IPC gain from a full core outweighs
-		 *     same-LLC TLB/cache sharing at < full load.)
-		 *  2. Off-LLC idle SMT (cross-tgid only — remote
-		 *     LLC may have lower contention overall)
-		 *  3. In-LLC idle SMT (fallback)
-		 *
-		 * When cores are NOT saturated, in-LLC SMT is
-		 * always accepted (idle cores exist locally).
-		 */
-		if (idle_smt_cpu >= 0) {
-			if (llc_cores_saturated) {
-				if (best_cpu >= 0)
-					return best_cpu;
-				if (!idle_smt_same_tgid &&
-				    off_llc_smt_cpu >= 0)
-					return off_llc_smt_cpu;
-			}
-			return idle_smt_cpu;
-		}
-		/* No in-LLC idle at all — take off-LLC options */
-		if (best_cpu >= 0)
-			return best_cpu;
-		if (off_llc_smt_cpu >= 0)
-			return off_llc_smt_cpu;
-#else
-		if (best_cpu >= 0)
-			return best_cpu;
-#endif
-
-		/* No preferred idle CPU — use fallback (little core) */
-		if (fallback_cpu >= 0)
-			return fallback_cpu;
-	}
-	} /* end wants_big scope */
-
-	/*
-	 * 5. No idle CPU found.
-	 *
-	 * For fork: find least-loaded CPU globally to spread children.
-	 * For wakeup: prefer the least-loaded LLC-local CPU found
-	 * during the idle scan if prev_cpu is overloaded.  This
-	 * prevents task pile-up that inflates request tail latency
-	 * in producer-consumer workloads (e.g., schbench).
-	 */
-	if (!(flags & WF_FORK)) {
 		unsigned int prev_eff = cpu_rq(prev_cpu)->minlat.nr_running -
 			min(cpu_rq(prev_cpu)->minlat.nr_running,
 			    cpu_rq(prev_cpu)->minlat.nr_delayed);
 
-		/*
-		 * Wakeup with no idle CPU. Use the least-loaded
-		 * LLC-local CPU if it has fewer tasks than prev_cpu.
-		 * This spreads load within the LLC and prevents
-		 * task pile-up that inflates request tail latency
-		 * in producer-consumer workloads.
-		 */
-		if (least_loaded_llc_cpu >= 0 &&
-		    least_loaded_llc_nr < prev_eff)
-			return least_loaded_llc_cpu;
+		if (llc_fb_cpu >= 0 &&
+		    llc_fb_nr < prev_eff)
+			return llc_fb_cpu;
 
-		/*
-		 * Tgid-aware wakeup spreading: if this tgid has more
-		 * threads than physical cores on prev_cpu's LLC, try
-		 * the lightest LLC for this tgid. Cheaper than the
-		 * full global scan and targets the exact imbalance.
-		 */
+		/* Tgid-aware wakeup spreading */
 		if (minlat_tgid_llc_overcommitted(p, prev_cpu)) {
 			struct minlat_tgid_ctx *ctx;
 
@@ -3905,14 +3735,9 @@ do_scan:
 			rcu_read_unlock();
 		}
 
-		/*
-		 * At saturation, scan globally for a less-loaded
-		 * CPU. When prev_cpu has 2+ tasks queued and other
-		 * CPUs (even off-LLC) have fewer, spreading reduces
-		 * tail latency more than cache locality helps.
-		 */
+		/* Global spread at saturation */
 		if (prev_eff >= 2 &&
-		    sched_minlat_any_overloaded(cpu_rq(prev_cpu))) {
+		    sched_minlat_llc_overloaded(prev_cpu)) {
 			int spread_cpu = -1;
 			unsigned int spread_nr = prev_eff;
 
@@ -3940,25 +3765,42 @@ do_scan:
 
 		return prev_cpu;
 	}
+}
 
-	best_cpu = prev_cpu;
-	best_nr = cpu_rq(prev_cpu)->minlat.nr_running;
+/*
+ * CPU selection dispatcher.
+ *
+ * Routes to fork-specific or wakeup-specific paths after
+ * handling wake affinity and EAS.
+ */
+static int
+select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
+{
+	int cpu;
 
-	for_each_cpu_wrap(cpu, cpu_active_mask, prev_cpu) {
-		unsigned int nr;
+	/* Wake affinity: sync wakeups go to waker's CPU */
+	cpu = minlat_wake_affine_cpu(p, prev_cpu, flags);
 
-		if (!cpumask_test_cpu(cpu, allowed))
-			continue;
-		nr = cpu_rq(cpu)->minlat.nr_running;
-		if (nr < best_nr) {
-			best_nr = nr;
-			best_cpu = cpu;
-			if (nr == 0)
-				break;
-		}
+	if (flags & WF_TTWU)
+		minlat_record_wakee(p);
+	if (cpu >= 0)
+		return cpu;
+
+#if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
+	/* EAS: energy-efficient placement on asymmetric systems */
+	if ((flags & WF_TTWU) && sched_energy_enabled() &&
+	    !READ_ONCE(this_rq()->rd->overutilized)) {
+		int eas_cpu = find_energy_efficient_cpu_minlat(p, prev_cpu);
+
+		if (eas_cpu >= 0)
+			return eas_cpu;
 	}
+#endif
 
-	return best_cpu;
+	if (flags & WF_FORK)
+		return select_task_rq_minlat_fork(p, prev_cpu);
+
+	return select_task_rq_minlat_wakeup(p, prev_cpu);
 }
 
 /* ==== idle-pull load balancing ==== */
@@ -4048,7 +3890,7 @@ minlat_pick_pullable_task(struct rq *src_rq, int this_cpu, bool cross_numa)
 
 	{
 	bool dst_idle = minlat_cpu_eff(this_cpu) == 0;
-	int max_scan = sched_minlat_any_overloaded(cpu_rq(this_cpu)) ? 8 : 4;
+	int max_scan = sched_minlat_llc_overloaded(this_cpu) ? 8 : 4;
 
 	for (node = rb_last(&src_rq->minlat.tasks_timeline.rb_root);
 	     node && scanned < max_scan; node = rb_prev(node), scanned++) {
@@ -4464,7 +4306,7 @@ balance_minlat(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 	 * overloaded CPU without a full topology walk. Falls back
 	 * to the full topology-aware pull if LLC-local fails.
 	 */
-	if (sched_minlat_any_overloaded(rq)) {
+	if (sched_minlat_llc_overloaded(cpu_of(rq))) {
 		rq_unpin_lock(rq, rf);
 
 		if (!minlat_newidle_pull(rq))
@@ -4625,9 +4467,26 @@ minlat_sd_balance_interval(struct sched_domain *sd, int cpu_busy)
 		 */
 		unsigned int factor = sd->busy_factor;
 
-		if (sched_minlat_llc_overloaded(
-				cpumask_first(sched_domain_span(sd))))
-			factor = min_t(unsigned int, factor, 4);
+		/*
+		 * Check if any LLC in this sched_domain has
+		 * overloaded CPUs. For NUMA-level domains that
+		 * span multiple LLCs, check each LLC's leader.
+		 */
+		{
+			int c;
+			bool any_overloaded = false;
+
+			for_each_cpu(c, sched_domain_span(sd)) {
+				if (c != per_cpu(sd_llc_id, c))
+					continue;
+				if (sched_minlat_llc_overloaded(c)) {
+					any_overloaded = true;
+					break;
+				}
+			}
+			if (any_overloaded)
+				factor = min_t(unsigned int, factor, 4);
+		}
 		interval *= factor;
 	}
 
@@ -4926,7 +4785,7 @@ static bool minlat_balance_domain(struct rq *this_rq,
 	{
 		unsigned long thresh = NICE_0_LOAD;
 
-		if (sched_minlat_any_overloaded(this_rq))
+		if (sched_minlat_llc_overloaded(cpu_of(this_rq)))
 			thresh >>= 1;
 		if (imbalance < thresh)
 			return false;
@@ -5097,9 +4956,9 @@ static void task_tick_minlat(struct rq *rq, struct task_struct *p, int queued)
 	update_curr_minlat(rq);
 	check_preempt_tick_minlat(rq, p);
 
-	/* Deferred tgid_ctx allocation — keep wakeup path fast */
+	/* Fallback tgid_ctx allocation for pre-fork tasks */
 	if (unlikely(!p->minlat.tgid_ctx))
-		minlat_ensure_tgid_ctx(p);
+		minlat_ensure_tgid_ctx(p, GFP_ATOMIC);
 	else
 		minlat_maybe_update_llc(p);
 
@@ -5110,10 +4969,11 @@ static void task_tick_minlat(struct rq *rq, struct task_struct *p, int queued)
 #ifdef CONFIG_GROUP_SCHED_WEIGHT
 	{
 		unsigned long old_w = scale_load_down(p->minlat.load.weight);
+		unsigned long new_w;
 
 		minlat_set_load_weight(p);
 
-		unsigned long new_w = scale_load_down(p->minlat.load.weight);
+		new_w = scale_load_down(p->minlat.load.weight);
 		if (unlikely(old_w != new_w))
 			rq->minlat.load_weight += new_w - old_w;
 	}
@@ -5136,16 +4996,26 @@ static void task_tick_minlat(struct rq *rq, struct task_struct *p, int queued)
 
 static void task_dead_minlat(struct task_struct *p)
 {
+	struct rq *rq = task_rq(p);
 	struct minlat_tgid_ctx *ctx = p->minlat.tgid_ctx;
 
 	/*
-	 * No per-entity PELT subtraction from the rq aggregate.
-	 * minlat uses a binary rq-level PELT signal (like RT/DL):
-	 * "is any minlat task running?" The signal decays naturally
-	 * when the class goes idle. Per-entity subtraction would be
-	 * semantically wrong — entity values were never individually
-	 * added to the rq aggregate.
+	 * Subtract the dead task's PELT contribution from the rq
+	 * aggregate. The rq signal tracks entity contributions, so
+	 * removing the dead entity's values keeps the signal accurate.
 	 */
+	lsub_positive(&rq->minlat.avg.util_avg,
+		      READ_ONCE(p->minlat.avg.util_avg));
+	lsub_positive(&rq->minlat.avg.util_sum,
+		      p->minlat.avg.util_sum);
+	lsub_positive(&rq->minlat.avg.runnable_avg,
+		      READ_ONCE(p->minlat.avg.runnable_avg));
+	lsub_positive(&rq->minlat.avg.runnable_sum,
+		      p->minlat.avg.runnable_sum);
+	lsub_positive(&rq->minlat.avg.load_avg,
+		      READ_ONCE(p->minlat.avg.load_avg));
+	lsub_positive(&rq->minlat.avg.load_sum,
+		      p->minlat.avg.load_sum);
 
 	if (ctx) {
 		/*
@@ -5228,13 +5098,16 @@ static inline void migrate_minlat_se_pelt_lag(struct task_struct *p) {}
  * task_cpu(p) still identifies the source. The caller holds
  * p->pi_lock or the rq lock.
  *
- * No per-entity subtraction from rq->minlat.avg: the rq-level signal
- * is binary ("is minlat running?"), not an entity aggregate. It decays
- * naturally via update_minlat_rq_load_avg() once the class goes idle,
- * matching the RT/DL model.
+ * The rq-level PELT signal is an entity aggregate: load tracks the
+ * sum of entity weights, runnable tracks entity count, and util
+ * tracks the combined duty cycle. Subtract the migrating entity's
+ * contribution from the source rq so the signal reflects the
+ * remaining entities immediately (rather than waiting for decay).
  */
 static void migrate_task_rq_minlat(struct task_struct *p, int new_cpu)
 {
+	struct rq *rq = task_rq(p);
+
 	/*
 	 * Distinguish sleeping-task migration (ttwu placing on a new CPU)
 	 * from running-task migration (cpu_stopper dequeue/enqueue cycle).
@@ -5244,8 +5117,27 @@ static void migrate_task_rq_minlat(struct task_struct *p, int new_cpu)
 	 * We only need to apply the PELT lag correction for the wakeup-
 	 * on-new-CPU path where the entity may carry stale values.
 	 */
-	if (!task_on_rq_migrating(p))
+	if (!task_on_rq_migrating(p)) {
 		migrate_minlat_se_pelt_lag(p);
+
+		/*
+		 * Subtract entity's PELT contribution from the source rq.
+		 * The rq signal is an entity aggregate, so per-entity
+		 * subtraction is semantically correct here.
+		 */
+		lsub_positive(&rq->minlat.avg.util_avg,
+			      READ_ONCE(p->minlat.avg.util_avg));
+		lsub_positive(&rq->minlat.avg.util_sum,
+			      p->minlat.avg.util_sum);
+		lsub_positive(&rq->minlat.avg.runnable_avg,
+			      READ_ONCE(p->minlat.avg.runnable_avg));
+		lsub_positive(&rq->minlat.avg.runnable_sum,
+			      p->minlat.avg.runnable_sum);
+		lsub_positive(&rq->minlat.avg.load_avg,
+			      READ_ONCE(p->minlat.avg.load_avg));
+		lsub_positive(&rq->minlat.avg.load_sum,
+			      p->minlat.avg.load_sum);
+	}
 
 	/* Tell new CPU we are migrated — resync on next PELT update */
 	p->minlat.avg.last_update_time = 0;
@@ -5592,6 +5484,13 @@ __init void init_sched_minlat_class(void)
 static void task_fork_minlat(struct task_struct *p)
 {
 	set_task_max_allowed_capacity(p);
+
+	/*
+	 * Allocate tgid_ctx at fork time in process context (GFP_KERNEL)
+	 * rather than deferring to the first tick under rq_lock where
+	 * only GFP_ATOMIC is available.
+	 */
+	minlat_ensure_tgid_ctx(p, GFP_KERNEL);
 }
 
 static unsigned int get_rr_interval_minlat(struct rq *rq,
