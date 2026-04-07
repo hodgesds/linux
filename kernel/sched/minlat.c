@@ -17,6 +17,7 @@
 
 #include "sched.h"
 #include "pelt.h"
+#include <linux/sched/clock.h>
 #include <linux/sched/cputime.h>
 #include <linux/sched/signal.h>
 #include <linux/task_work.h>
@@ -1834,6 +1835,24 @@ static inline void sched_minlat_update_stop_tick(struct rq *rq,
 
 /* ==== runqueue init ==== */
 
+/*
+ * irq_work callback for deferred idle CPU kick.
+ *
+ * resched_cpu() takes the remote rq lock, so it cannot be called from
+ * enqueue_task_minlat() which already holds the local rq lock (AB-BA
+ * deadlock). Instead, enqueue records the target CPU and queues this
+ * irq_work, which runs on the local CPU after rq_unlock and can safely
+ * call resched_cpu() without holding any rq lock.
+ */
+static void minlat_kick_idle_func(struct irq_work *work)
+{
+	struct minlat_rq *mrq = container_of(work, struct minlat_rq, kick_work);
+	int cpu = READ_ONCE(mrq->kick_cpu);
+
+	if (cpu >= 0)
+		resched_cpu(cpu);
+}
+
 void init_minlat_rq(struct minlat_rq *minlat_rq)
 {
 	minlat_rq->tasks_timeline = RB_ROOT_CACHED;
@@ -1846,6 +1865,8 @@ void init_minlat_rq(struct minlat_rq *minlat_rq)
 	memset(&minlat_rq->avg, 0, sizeof(minlat_rq->avg));
 	minlat_rq->util_est = 0;
 	minlat_rq->next_balance = 0;
+	minlat_rq->kick_cpu = -1;
+	init_irq_work(&minlat_rq->kick_work, minlat_kick_idle_func);
 #ifdef CONFIG_CFS_BANDWIDTH
 	INIT_LIST_HEAD(&minlat_rq->bw_throttled_tasks);
 	minlat_rq->nr_bw_throttled = 0;
@@ -2276,13 +2297,16 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 			/*
 			 * Can't use resched_cpu() here — it acquires the
 			 * remote rq lock, and we already hold the local
-			 * rq lock (enqueue_task is always rq-locked).
-			 * That creates an AB-BA deadlock if the remote
-			 * CPU is simultaneously trying to lock our rq.
+			 * rq lock. That creates an AB-BA deadlock if the
+			 * remote CPU is simultaneously trying to lock our rq.
 			 *
-			 * Use a lock-free IPI instead.
+			 * Defer via irq_work: the callback runs on this CPU
+			 * after rq_unlock (when IRQs are re-enabled) and can
+			 * safely call resched_cpu() which sets TIF_NEED_RESCHED
+			 * on the target and sends the IPI.
 			 */
-			smp_send_reschedule(kick_cpu);
+			WRITE_ONCE(minlat_rq->kick_cpu, kick_cpu);
+			irq_work_queue(&minlat_rq->kick_work);
 		}
 	}
 }
@@ -5212,24 +5236,16 @@ static void task_tick_minlat(struct rq *rq, struct task_struct *p, int queued)
 
 static void task_dead_minlat(struct task_struct *p)
 {
-	struct rq *rq = task_rq(p);
 	struct minlat_tgid_ctx *ctx = p->minlat.tgid_ctx;
 
-	/* Remove dead task's PELT contribution from the rq aggregate */
-	if (p->minlat.avg.last_update_time) {
-		lsub_positive(&rq->minlat.avg.util_avg,
-			      p->minlat.avg.util_avg);
-		lsub_positive(&rq->minlat.avg.util_sum,
-			      p->minlat.avg.util_sum);
-		lsub_positive(&rq->minlat.avg.load_avg,
-			      p->minlat.avg.load_avg);
-		lsub_positive(&rq->minlat.avg.load_sum,
-			      p->minlat.avg.load_sum);
-		lsub_positive(&rq->minlat.avg.runnable_avg,
-			      p->minlat.avg.runnable_avg);
-		lsub_positive(&rq->minlat.avg.runnable_sum,
-			      p->minlat.avg.runnable_sum);
-	}
+	/*
+	 * No per-entity PELT subtraction from the rq aggregate.
+	 * minlat uses a binary rq-level PELT signal (like RT/DL):
+	 * "is any minlat task running?" The signal decays naturally
+	 * when the class goes idle. Per-entity subtraction would be
+	 * semantically wrong — entity values were never individually
+	 * added to the rq aggregate.
+	 */
 
 	if (ctx) {
 		/*
@@ -5248,30 +5264,84 @@ static void task_dead_minlat(struct task_struct *p)
 }
 
 /*
- * Called when a task is migrated to a new CPU. Reset PELT
- * last_update_time so the entity avg will be re-synced to
- * the new rq's clock on the next update_minlat_load_avg().
+ * Estimate and apply PELT decay missed while the source rq was idle.
+ *
+ * When a task sleeps on an idle CPU and wakes on a different one, the
+ * entity's PELT values are frozen at whatever they were at the last
+ * scheduling event. If the source rq hasn't ticked since then, these
+ * values are stale-high and would inflate PELT on the destination.
+ *
+ * This is the minlat equivalent of CFS's migrate_se_pelt_lag().
+ * We estimate "now" from the rq's idle clock snapshot and apply the
+ * missing blocked-time decay to the entity before migration.
+ */
+#ifdef CONFIG_NO_HZ_COMMON
+static void migrate_minlat_se_pelt_lag(struct task_struct *p)
+{
+	struct sched_minlat_entity *me = &p->minlat;
+	struct rq *rq = task_rq(p);
+	bool is_idle;
+	u64 now;
+
+	if (!me->avg.load_sum && !me->avg.util_sum && !me->avg.runnable_sum)
+		return;
+
+	rcu_read_lock();
+	is_idle = is_idle_task(rcu_dereference_all(rq->curr));
+	rcu_read_unlock();
+
+	/*
+	 * Only bother when the source CPU is idle — that's when we
+	 * are at greatest risk of a stale clock.
+	 */
+	if (!is_idle)
+		return;
+
+	now = u64_u32_load(rq->clock_pelt_idle);
+	/*
+	 * Paired with _update_idle_rq_clock_pelt(). At worst we see the
+	 * old clock_pelt_idle and new clock_idle, which underestimates
+	 * (safe). The reverse would overestimate.
+	 */
+	smp_rmb();
+
+	if (now < me->avg.last_update_time)
+		now = me->avg.last_update_time;
+	else
+		now += sched_clock_cpu(cpu_of(rq)) - u64_u32_load(rq->clock_idle);
+
+	if (___update_load_sum(now, &me->avg, 0, 0, 0))
+		___update_load_avg(&me->avg, scale_load_down(me->load.weight));
+}
+#else
+static inline void migrate_minlat_se_pelt_lag(struct task_struct *p) {}
+#endif
+
+/*
+ * Called immediately before a task is migrated to a new CPU.
+ * task_cpu(p) still identifies the source. The caller holds
+ * p->pi_lock or the rq lock.
+ *
+ * No per-entity subtraction from rq->minlat.avg: the rq-level signal
+ * is binary ("is minlat running?"), not an entity aggregate. It decays
+ * naturally via update_minlat_rq_load_avg() once the class goes idle,
+ * matching the RT/DL model.
  */
 static void migrate_task_rq_minlat(struct task_struct *p, int new_cpu)
 {
-	struct rq *rq = task_rq(p);
+	/*
+	 * Distinguish sleeping-task migration (ttwu placing on a new CPU)
+	 * from running-task migration (cpu_stopper dequeue/enqueue cycle).
+	 *
+	 * When the task is actively migrating (on_rq_migrating), the
+	 * dequeue/enqueue path handles the PELT transition under rq lock.
+	 * We only need to apply the PELT lag correction for the wakeup-
+	 * on-new-CPU path where the entity may carry stale values.
+	 */
+	if (!task_on_rq_migrating(p))
+		migrate_minlat_se_pelt_lag(p);
 
-	/* Remove entity's PELT contribution from source rq aggregate */
-	if (p->minlat.avg.last_update_time) {
-		lsub_positive(&rq->minlat.avg.util_avg,
-			      p->minlat.avg.util_avg);
-		lsub_positive(&rq->minlat.avg.util_sum,
-			      p->minlat.avg.util_sum);
-		lsub_positive(&rq->minlat.avg.load_avg,
-			      p->minlat.avg.load_avg);
-		lsub_positive(&rq->minlat.avg.load_sum,
-			      p->minlat.avg.load_sum);
-		lsub_positive(&rq->minlat.avg.runnable_avg,
-			      p->minlat.avg.runnable_avg);
-		lsub_positive(&rq->minlat.avg.runnable_sum,
-			      p->minlat.avg.runnable_sum);
-	}
-
+	/* Tell new CPU we are migrated — resync on next PELT update */
 	p->minlat.avg.last_update_time = 0;
 }
 
