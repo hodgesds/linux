@@ -4441,7 +4441,6 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 #ifdef CONFIG_SCHED_CLASS_MINLAT
 	RB_CLEAR_NODE(&p->minlat.run_node);
 	p->minlat.vruntime = 0;
-	p->minlat.min_vruntime = 0;
 	p->minlat.minlat_prio = 0;
 	p->minlat.on_rq = 0;
 	p->minlat.tgid_ctx = NULL;
@@ -4768,6 +4767,7 @@ void sched_post_fork(struct task_struct *p)
 {
 	uclamp_post_fork(p);
 	scx_post_fork(p);
+	minlat_post_fork(p);
 }
 
 unsigned long to_ratio(u64 period, u64 runtime)

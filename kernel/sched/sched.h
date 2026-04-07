@@ -186,6 +186,17 @@ extern u64 __calc_delta(u64 delta_exec, unsigned long weight,
 			struct load_weight *lw);
 
 /*
+ * Remove and clamp on negative, from a local variable.
+ *
+ * A variant of sub_positive(), which does not use explicit load-store
+ * and is thus optimized for local variable updates.
+ */
+#define lsub_positive(_ptr, _val) do {				\
+	typeof(_ptr) ptr = (_ptr);				\
+	*ptr -= min_t(typeof(*ptr), *ptr, _val);		\
+} while (0)
+
+/*
  * UTIL_EST shared helpers -- used by both CFS and MINLAT.
  * The EWMA math and flag handling are class-independent; only the
  * sched_avg and per-rq util_est counter differ between classes.
@@ -2871,6 +2882,7 @@ extern const struct sched_class idle_sched_class;
 extern const struct sched_class minlat_sched_class;
 extern void init_minlat_rq(struct minlat_rq *minlat_rq);
 extern void init_sched_minlat_class(void);
+extern void minlat_post_fork(struct task_struct *p);
 extern bool dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags);
 extern void minlat_put_prev_set_next(struct rq *rq,
 				     struct task_struct *prev,
@@ -2891,6 +2903,7 @@ static inline void minlat_init_latency_nice(struct sched_minlat_entity *me,
 }
 #else
 static inline bool minlat_enabled(void) { return false; }
+static inline void minlat_post_fork(struct task_struct *p) { }
 #endif
 
 /*

@@ -794,7 +794,6 @@ struct sched_minlat_entity {
 	 */
 	unsigned int			llc_runs;
 	unsigned int			minlat_prio;	/* 0-7, 0 = highest */
-	u64				min_vruntime;	/* snapshot for migration */
 
 	/* Migration and placement (cold path) */
 	struct minlat_tgid_ctx		*tgid_ctx;	/* per-tgid placement */
