@@ -225,10 +225,7 @@ void __init sched_init_granularity(void)
 	update_sysctl();
 }
 
-#define WMULT_CONST	(~0U)
-#define WMULT_SHIFT	32
-
-static void __update_inv_weight(struct load_weight *lw)
+void __update_inv_weight(struct load_weight *lw)
 {
 	unsigned long w;
 
@@ -257,7 +254,7 @@ static void __update_inv_weight(struct load_weight *lw)
  * Or, weight =< lw.weight (because lw.weight is the runqueue weight), thus
  * weight/lw.weight <= 1, and therefore our shift will also be positive.
  */
-static u64 __calc_delta(u64 delta_exec, unsigned long weight, struct load_weight *lw)
+u64 __calc_delta(u64 delta_exec, unsigned long weight, struct load_weight *lw)
 {
 	u64 fact = scale_load_down(weight);
 	u32 fact_hi = (u32)(fact >> 32);
@@ -4896,7 +4893,7 @@ static inline void util_est_dequeue(struct cfs_rq *cfs_rq,
 	trace_sched_util_est_cfs_tp(cfs_rq);
 }
 
-#define UTIL_EST_MARGIN (SCHED_CAPACITY_SCALE / 100)
+/* UTIL_EST_MARGIN is now defined in sched.h */
 
 static inline void util_est_update(struct cfs_rq *cfs_rq,
 				   struct task_struct *p,

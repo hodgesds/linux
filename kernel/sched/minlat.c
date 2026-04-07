@@ -22,57 +22,9 @@
 #include <linux/sched/signal.h>
 #include <linux/task_work.h>
 
-DEFINE_STATIC_KEY_TRUE(sched_minlat_enabled);
+DEFINE_STATIC_KEY_FALSE(sched_minlat_enabled);
 
-/* ---- weight math (private copy, fair.c's is static) ---- */
-
-#define WMULT_CONST	(~0U)
-#define WMULT_SHIFT	32
-
-static void minlat_update_inv_weight(struct load_weight *lw)
-{
-	unsigned long w;
-
-	if (likely(lw->inv_weight))
-		return;
-
-	w = scale_load_down(lw->weight);
-
-	if (BITS_PER_LONG > 32 && unlikely(w >= WMULT_CONST))
-		lw->inv_weight = 1;
-	else if (unlikely(!w))
-		lw->inv_weight = WMULT_CONST;
-	else
-		lw->inv_weight = WMULT_CONST / w;
-}
-
-static u64 minlat_calc_delta_weighted(u64 delta_exec, unsigned long weight,
-				      struct load_weight *lw)
-{
-	u64 fact = scale_load_down(weight);
-	u32 fact_hi = (u32)(fact >> 32);
-	int shift = WMULT_SHIFT;
-	int fs;
-
-	minlat_update_inv_weight(lw);
-
-	if (unlikely(fact_hi)) {
-		fs = fls(fact_hi);
-		shift -= fs;
-		fact >>= fs;
-	}
-
-	fact = mul_u32_u32(fact, lw->inv_weight);
-
-	fact_hi = (u32)(fact >> 32);
-	if (fact_hi) {
-		fs = fls(fact_hi);
-		shift -= fs;
-		fact >>= fs;
-	}
-
-	return mul_u64_u32_shr(delta_exec, fact, shift);
-}
+/* Weight math uses shared __calc_delta() from fair.c (declared in sched.h) */
 
 /* ---- tuning knobs (debugfs-tunable) ---- */
 
@@ -246,122 +198,34 @@ static inline unsigned long minlat_capacity_of(int cpu)
  * exponential smoothing on decrease (w=1/4), matching CFS behavior.
  */
 
-#define MINLAT_UTIL_EST_MARGIN (SCHED_CAPACITY_SCALE / 100)
-
-/*
- * Clear the UTIL_AVG_UNCHANGED flag when PELT updates util_avg.
- * This synchronizes util_est updates with actual PELT changes —
- * if util_avg didn't change during an activation, skip the
- * util_est update at dequeue to avoid noise.
- */
-static inline void minlat_se_util_change(struct sched_avg *avg)
-{
-	unsigned int enqueued;
-
-	if (!sched_feat(UTIL_EST))
-		return;
-
-	enqueued = avg->util_est;
-	if (!(enqueued & UTIL_AVG_UNCHANGED))
-		return;
-
-	enqueued &= ~UTIL_AVG_UNCHANGED;
-	WRITE_ONCE(avg->util_est, enqueued);
-}
+/* UTIL_EST: uses shared helpers from sched.h (__util_est_{enqueue,dequeue,update}) */
 
 static inline unsigned long minlat_task_util_est(struct task_struct *p)
 {
 	return max(READ_ONCE(p->minlat.avg.util_avg),
-		   READ_ONCE(p->minlat.avg.util_est) & ~UTIL_AVG_UNCHANGED);
+		   __read_util_est(&p->minlat.avg));
 }
 
-static inline unsigned long _minlat_task_util_est(struct task_struct *p)
+static inline void minlat_util_est_enqueue(struct rq *rq, struct task_struct *p)
 {
-	return READ_ONCE(p->minlat.avg.util_est) & ~UTIL_AVG_UNCHANGED;
-}
-
-static void minlat_util_est_enqueue(struct rq *rq, struct task_struct *p)
-{
-	unsigned int enqueued;
-
 	if (!sched_feat(UTIL_EST))
 		return;
-
-	enqueued = rq->minlat.util_est;
-	enqueued += _minlat_task_util_est(p);
-	WRITE_ONCE(rq->minlat.util_est, enqueued);
+	__util_est_enqueue(&rq->minlat.util_est, &p->minlat.avg);
 }
 
-static void minlat_util_est_dequeue(struct rq *rq, struct task_struct *p)
+static inline void minlat_util_est_dequeue(struct rq *rq, struct task_struct *p)
 {
-	unsigned int enqueued;
-
 	if (!sched_feat(UTIL_EST))
 		return;
-
-	enqueued = rq->minlat.util_est;
-	enqueued -= min_t(unsigned int, enqueued, _minlat_task_util_est(p));
-	WRITE_ONCE(rq->minlat.util_est, enqueued);
+	__util_est_dequeue(&rq->minlat.util_est, &p->minlat.avg);
 }
 
-static void minlat_util_est_update(struct rq *rq, struct task_struct *p,
-				   bool task_sleep)
+static inline void minlat_util_est_update(struct rq *rq, struct task_struct *p,
+					   bool task_sleep)
 {
-	unsigned int ewma, dequeued, last_ewma_diff;
-
 	if (!sched_feat(UTIL_EST))
 		return;
-
-	/* Only update when the task is going to sleep */
-	if (!task_sleep)
-		return;
-
-	ewma = READ_ONCE(p->minlat.avg.util_est);
-
-	/*
-	 * If PELT values haven't changed since enqueue,
-	 * skip the update to avoid noise.
-	 */
-	if (ewma & UTIL_AVG_UNCHANGED)
-		return;
-
-	/* Get current utilization at dequeue time */
-	dequeued = READ_ONCE(p->minlat.avg.util_avg);
-
-	/*
-	 * Instant ramp-up: if utilization increased, use the new
-	 * value directly. EWMA smoothing only applies to decreases.
-	 */
-	if (ewma <= dequeued) {
-		ewma = dequeued;
-		goto done;
-	}
-
-	/*
-	 * Skip update if already within ~1% of last activation value.
-	 */
-	last_ewma_diff = ewma - dequeued;
-	if (last_ewma_diff < MINLAT_UTIL_EST_MARGIN)
-		goto done;
-
-	/*
-	 * Skip update if the task didn't get all CPU time it wanted
-	 * (runnable_avg >> util_avg means contention, not lower demand).
-	 */
-	if ((dequeued + MINLAT_UTIL_EST_MARGIN) <
-	    READ_ONCE(p->minlat.avg.runnable_avg))
-		goto done;
-
-	/*
-	 * EWMA with w=1/4: smooths utilization decreases.
-	 * ewma(t) = 1/4 * util + 3/4 * ewma(t-1)
-	 */
-	ewma <<= UTIL_EST_WEIGHT_SHIFT;
-	ewma  -= last_ewma_diff;
-	ewma >>= UTIL_EST_WEIGHT_SHIFT;
-done:
-	ewma |= UTIL_AVG_UNCHANGED;
-	WRITE_ONCE(p->minlat.avg.util_est, ewma);
+	__util_est_update(&p->minlat.avg, task_sleep);
 }
 
 /*
@@ -390,7 +254,8 @@ static int update_minlat_se_load_avg(u64 now, struct rq *rq,
 			       !!me->on_rq,
 			       rq->minlat.curr == me)) {
 		___update_load_avg(&me->avg, scale_load_down(me->load.weight));
-		minlat_se_util_change(&me->avg);
+		if (sched_feat(UTIL_EST))
+			__se_util_est_change(&me->avg);
 		return 1;
 	}
 	return 0;
@@ -553,10 +418,25 @@ static void minlat_update_misfit_status(struct task_struct *p, struct rq *rq)
 #include <linux/energy_model.h>
 
 /*
+ * TODO: This struct and the EAS helper functions below duplicate
+ * fair.c's energy_env and compute_energy(). The duplication exists
+ * because the rq/entity types differ (minlat_rq vs cfs_rq). A shared
+ * EAS helper layer parameterized by a "get CPU utilization" callback
+ * would eliminate this. For now, keep in sync with fair.c manually.
+ */
+
+/*
  * Energy estimation environment — tracks utilization data for
  * computing energy across a performance domain.
  */
-struct minlat_energy_env {
+/*
+ * TODO: share a common EAS helper layer with fair.c.  The algorithmic
+ * structure (compute_energy, eenv_pd_busy_time, eenv_pd_max_util, and
+ * find_energy_efficient_cpu) is identical -- only the "read utilization
+ * for CPU X" primitive differs.  A parameterized helper taking a
+ * cpu_util callback would eliminate ~300 lines of duplication.
+ */
+struct energy_env {
 	unsigned long task_busy_time;	/* Task's utilization contribution */
 	unsigned long pd_busy_time;	/* PD utilization without the task */
 	unsigned long cpu_cap;		/* Max CPU capacity in the PD */
@@ -612,9 +492,9 @@ minlat_cpu_util(int cpu, struct task_struct *p, int dst_cpu)
 		unsigned long util_est = READ_ONCE(rq->minlat.util_est);
 
 		if (dst_cpu == cpu)
-			util_est += _minlat_task_util_est(p);
+			util_est += __read_util_est(&p->minlat.avg);
 		else if (p && unlikely(task_on_rq_queued(p) || current == p))
-			lsub_positive(&util_est, _minlat_task_util_est(p));
+			lsub_positive(&util_est, __read_util_est(&p->minlat.avg));
 
 		util = max(util, util_est);
 	}
@@ -673,7 +553,7 @@ minlat_eas_effective_cpu_util(int cpu, unsigned long util_minlat,
  * Compute the task busy time for energy estimation.
  * Uses IRQ scaling from prev_cpu where the task's PELT was measured.
  */
-static void minlat_eenv_task_busy_time(struct minlat_energy_env *eenv,
+static void minlat_eenv_task_busy_time(struct energy_env *eenv,
 				       struct task_struct *p, int prev_cpu)
 {
 	unsigned long busy_time, max_cap = arch_scale_cpu_capacity(prev_cpu);
@@ -693,7 +573,7 @@ static void minlat_eenv_task_busy_time(struct minlat_energy_env *eenv,
  * The task contribution is separated so it can be added to different
  * destination CPUs for fair comparison.
  */
-static void minlat_eenv_pd_busy_time(struct minlat_energy_env *eenv,
+static void minlat_eenv_pd_busy_time(struct energy_env *eenv,
 				     struct cpumask *pd_cpus,
 				     struct task_struct *p)
 {
@@ -716,7 +596,7 @@ static void minlat_eenv_pd_busy_time(struct minlat_energy_env *eenv,
  * frequency for the domain.
  */
 static unsigned long
-minlat_eenv_pd_max_util(struct minlat_energy_env *eenv, struct cpumask *pd_cpus,
+minlat_eenv_pd_max_util(struct energy_env *eenv, struct cpumask *pd_cpus,
 			struct task_struct *p, int dst_cpu)
 {
 	unsigned long max_util = 0;
@@ -753,7 +633,7 @@ minlat_eenv_pd_max_util(struct minlat_energy_env *eenv, struct cpumask *pd_cpus,
  * is excluded (baseline).
  */
 static unsigned long
-minlat_compute_energy(struct minlat_energy_env *eenv, struct perf_domain *pd,
+minlat_compute_energy(struct energy_env *eenv, struct perf_domain *pd,
 		      struct cpumask *pd_cpus, struct task_struct *p,
 		      int dst_cpu)
 {
@@ -815,7 +695,7 @@ find_energy_efficient_cpu_minlat(struct task_struct *p, int prev_cpu)
 	unsigned long prev_actual_cap = 0;
 	struct sched_domain *sd;
 	struct perf_domain *pd;
-	struct minlat_energy_env eenv;
+	struct energy_env eenv;
 
 	rcu_read_lock();
 	pd = rcu_dereference(rd->pd);
@@ -967,7 +847,7 @@ static void minlat_task_tick_numa(struct rq *rq, struct task_struct *curr)
 	 * Use runtime rather than walltime so idle tasks don't
 	 * trigger scanning, matching CFS behavior.
 	 */
-	now = curr->minlat.sum_exec_runtime;
+	now = curr->se.sum_exec_runtime;
 	period = (u64)curr->numa_scan_period * NSEC_PER_MSEC;
 
 	if (now > curr->node_stamp + period) {
@@ -988,15 +868,42 @@ static inline void minlat_task_tick_numa(struct rq *rq,
 #endif /* CONFIG_NUMA_BALANCING */
 
 /*
- * Global count of overloaded CPUs (those with 2+ minlat tasks).
- * O(1) check replaces O(N_CPUs) scan — critical for idle-pull
- * fast-skip on large machines.
+ * Per-LLC count of overloaded CPUs (those with 2+ effective minlat tasks).
+ *
+ * Indexed by sd_llc_id (the representative CPU of each LLC).
+ * Only bounces the cache line within the LLC -- CPUs sharing L3 cache
+ * also share this counter, so the atomic is effectively free compared
+ * to a global counter that bounces across sockets.
  */
-static atomic_t minlat_nr_overloaded = ATOMIC_INIT(0);
+static DEFINE_PER_CPU(atomic_t, minlat_llc_nr_overloaded);
+
+static void minlat_set_overloaded(struct rq *rq)
+{
+	if (!rq->minlat.overloaded) {
+		rq->minlat.overloaded = true;
+		atomic_inc(&per_cpu(minlat_llc_nr_overloaded,
+				    per_cpu(sd_llc_id, cpu_of(rq))));
+	}
+}
+
+static void minlat_clear_overloaded(struct rq *rq)
+{
+	if (rq->minlat.overloaded) {
+		rq->minlat.overloaded = false;
+		atomic_dec(&per_cpu(minlat_llc_nr_overloaded,
+				    per_cpu(sd_llc_id, cpu_of(rq))));
+	}
+}
+
+static bool sched_minlat_llc_overloaded(int cpu)
+{
+	return atomic_read(&per_cpu(minlat_llc_nr_overloaded,
+				    per_cpu(sd_llc_id, cpu))) > 0;
+}
 
 static bool sched_minlat_any_overloaded(struct rq *this_rq)
 {
-	return atomic_read(&minlat_nr_overloaded) > 0;
+	return sched_minlat_llc_overloaded(cpu_of(this_rq));
 }
 
 /* ---- priority/weight tables ---- */
@@ -1096,7 +1003,7 @@ minlat_calc_delta(u64 delta, struct sched_minlat_entity *me)
 {
 	if (me->load.weight == scale_load(1024))
 		return delta;
-	return minlat_calc_delta_weighted(delta, NICE_0_LOAD, &me->load);
+	return __calc_delta(delta, NICE_0_LOAD, &me->load);
 }
 
 /* ==== per-tgid LLC/NUMA context ==== */
@@ -1320,9 +1227,12 @@ static void minlat_ensure_tgid_ctx(struct task_struct *p)
 		struct minlat_tgid_ctx *existing;
 
 		/*
-		 * Publish on the leader so sibling threads can share it.
-		 * Race with other children: loser adopts the winner's ctx.
-		 * Count the leader as a task so task_dead_minlat balances.
+		 * Publish tgid_ctx atomically via cmpxchg.  We need
+		 * compare-and-swap (not plain rcu_assign_pointer) because
+		 * multiple children may race to publish.  cmpxchg provides
+		 * a full barrier on all architectures, satisfying RCU
+		 * publish ordering.  Readers use rcu_dereference(), and
+		 * task_dead clears via rcu_assign_pointer() + kfree_rcu().
 		 */
 		existing = cmpxchg(&leader->minlat.tgid_ctx, NULL, ctx);
 		if (!existing) {
@@ -1667,11 +1577,8 @@ static void minlat_throttle_tg_cpu(struct rq *rq, struct task_group *tg)
 		}
 	}
 
-	if (minlat_rq->nr_running - minlat_rq->nr_delayed < 2 &&
-	    minlat_rq->overloaded) {
-		WRITE_ONCE(minlat_rq->overloaded, false);
-		atomic_dec(&minlat_nr_overloaded);
-	}
+	if (minlat_rq->nr_running - minlat_rq->nr_delayed < 2)
+		minlat_clear_overloaded(rq);
 }
 
 /*
@@ -1725,11 +1632,8 @@ void minlat_unthrottle_bw(struct rq *rq, struct task_group *tg)
 		add_nr_running(rq, 1);
 	}
 
-	if (minlat_rq->nr_running - minlat_rq->nr_delayed >= 2 &&
-	    !minlat_rq->overloaded) {
-		WRITE_ONCE(minlat_rq->overloaded, true);
-		atomic_inc(&minlat_nr_overloaded);
-	}
+	if (minlat_rq->nr_running - minlat_rq->nr_delayed >= 2)
+		minlat_set_overloaded(rq);
 }
 
 /*
@@ -1997,14 +1901,13 @@ static __always_inline void update_curr_minlat_vruntime(struct rq *rq)
 
 	me = &curr->minlat;
 	now = rq_clock_task(rq);
-	delta_exec = now - me->exec_start;
+	delta_exec = now - curr->se.exec_start;
 
 	if (unlikely((s64)delta_exec <= 0))
 		return;
 
-	me->exec_start = now;
-	me->sum_exec_runtime += delta_exec;
-	curr->se.sum_exec_runtime = me->sum_exec_runtime;
+	curr->se.exec_start = now;
+	curr->se.sum_exec_runtime += delta_exec;
 	account_group_exec_runtime(curr, delta_exec);
 	cgroup_account_cputime(curr, delta_exec);
 
@@ -2103,8 +2006,8 @@ static void check_preempt_tick_minlat(struct rq *rq, struct task_struct *curr)
 	 *     0: min_gran = 500us → default
 	 *    19: min_gran ≈ 34ms  → clamped to 2ms (ceiling)
 	 */
-	delta_exec = curr_me->sum_exec_runtime -
-		     curr_me->prev_sum_exec_runtime;
+	delta_exec = curr->se.sum_exec_runtime -
+		     curr->se.prev_sum_exec_runtime;
 	{
 		u64 min_gran = minlat_latency_thresh(
 					MINLAT_MIN_GRANULARITY_NS,
@@ -2147,8 +2050,7 @@ static void check_preempt_tick_minlat(struct rq *rq, struct task_struct *curr)
 		 */
 		if (eff < 3 &&
 		    !(eff >= 2 &&
-		      atomic_read(&minlat_nr_overloaded) <
-		      num_online_cpus() / 2) &&
+		      sched_minlat_any_overloaded(rq)) &&
 		    minlat_preempt_resisted(curr_me, rq) &&
 		    delta_exec <= 2 * ideal_runtime)
 			return;
@@ -2250,11 +2152,8 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	 * tasks kept in the tree for O(1) wakeup — they don't need
 	 * CPU time and shouldn't trigger migration pressure.
 	 */
-	if (minlat_rq->nr_running - minlat_rq->nr_delayed >= 2 &&
-	    !minlat_rq->overloaded) {
-		WRITE_ONCE(minlat_rq->overloaded, true);
-		atomic_inc(&minlat_nr_overloaded);
-	}
+	if (minlat_rq->nr_running - minlat_rq->nr_delayed >= 2)
+		minlat_set_overloaded(rq);
 
 #if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
 	minlat_check_update_overutilized(rq);
@@ -2386,8 +2285,8 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	if ((flags & DEQUEUE_SLEEP) && was_curr &&
 	    !(flags & (DEQUEUE_DELAYED | DEQUEUE_SPECIAL)) &&
 	    me->on_rq && minlat_rq->nr_running > 1) {
-		u64 run_ns = me->sum_exec_runtime -
-			     me->prev_sum_exec_runtime;
+		u64 run_ns = p->se.sum_exec_runtime -
+			     p->se.prev_sum_exec_runtime;
 		/*
 		 * Delayed dequeue: keep sleeping curr on the runqueue
 		 * for O(1) re-wakeup via ttwu_runnable().
@@ -2437,11 +2336,8 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 
 	minlat_rq->nr_running--;
 
-	if (minlat_rq->nr_running - minlat_rq->nr_delayed < 2 &&
-	    minlat_rq->overloaded) {
-		WRITE_ONCE(minlat_rq->overloaded, false);
-		atomic_dec(&minlat_nr_overloaded);
-	}
+	if (minlat_rq->nr_running - minlat_rq->nr_delayed < 2)
+		minlat_clear_overloaded(rq);
 	minlat_rq->load_weight -= scale_load_down(me->load.weight);
 	sub_nr_running(rq, 1);
 
@@ -2644,8 +2540,8 @@ wakeup_preempt_minlat(struct rq *rq, struct task_struct *p, int flags)
 		u32 wmult = p->minlat.latency_wmult;
 
 		if (eff <= 2) {
-			u64 ran = curr->minlat.sum_exec_runtime -
-				  curr->minlat.prev_sum_exec_runtime;
+			u64 ran = curr->se.sum_exec_runtime -
+				  curr->se.prev_sum_exec_runtime;
 			u64 min_gran = minlat_latency_thresh(
 					MINLAT_MIN_GRANULARITY_NS,
 					wmult);
@@ -2800,11 +2696,11 @@ __put_prev_task_minlat(struct rq *rq, struct task_struct *p,
 	 * and second class check.
 	 */
 	now = rq_clock_task(rq);
-	delta_exec = now - me->exec_start;
+	delta_exec = now - p->se.exec_start;
 
 	if (likely((s64)delta_exec > 0)) {
-		me->exec_start = now;
-		me->sum_exec_runtime += delta_exec;
+		p->se.exec_start = now;
+		p->se.sum_exec_runtime += delta_exec;
 		account_group_exec_runtime(p, delta_exec);
 		cgroup_account_cputime(p, delta_exec);
 		me->vruntime += minlat_calc_delta(delta_exec, me);
@@ -2858,8 +2754,8 @@ __set_next_task_minlat(struct rq *rq, struct task_struct *p, bool first)
 
 	minlat_rq->curr = me;
 
-	me->exec_start = rq_clock_task(rq);
-	me->prev_sum_exec_runtime = me->sum_exec_runtime;
+	p->se.exec_start = rq_clock_task(rq);
+	p->se.prev_sum_exec_runtime = p->se.sum_exec_runtime;
 
 	/* LLC stickiness: count runs on current LLC */
 	me->llc_runs++;
@@ -2931,16 +2827,16 @@ static void minlat_update_interactivity(struct task_struct *p,
 static void minlat_record_sleep(struct task_struct *p, struct rq *rq)
 {
 	struct sched_minlat_entity *me = &p->minlat;
-	u64 run_ns = me->sum_exec_runtime - me->prev_sum_exec_runtime;
+	u64 run_ns = p->se.sum_exec_runtime - p->se.prev_sum_exec_runtime;
 
 	me->total_run_ns = (me->total_run_ns *
 			    (MINLAT_INTERACTIVITY_DECAY - 1) +
 			    run_ns) / MINLAT_INTERACTIVITY_DECAY;
 
 	me->interactive = (me->total_run_ns < MINLAT_INTERACTIVE_THRESH_NS);
-	/* Use exec_start as sleep-start timestamp — already set by
+	/* Use se.exec_start as sleep-start timestamp — already set by
 	 * the last update_curr, avoids an extra rq_clock() read. */
-	me->last_sleep_duration = me->exec_start;
+	me->last_sleep_duration = p->se.exec_start;
 }
 
 /* SMT helpers removed — unused. Kept minlat_smt_sibling_same_tgid() below. */
@@ -3709,15 +3605,18 @@ do_full_scan:
 		 * load. Small machines (<=16 CPUs) always scan all.
 		 */
 		{
-			unsigned int nr_busy = atomic_read(&minlat_nr_overloaded);
+			unsigned int nr_busy = atomic_read(
+				&per_cpu(minlat_llc_nr_overloaded,
+					 per_cpu(sd_llc_id, prev_cpu)));
+			unsigned int llc_size = per_cpu(sd_llc_size, prev_cpu);
 
-			if (nr_busy * 100 >= nr_cpus * 85) {
+			if (nr_busy * 100 >= llc_size * 85) {
 				scan_limit = 0;
 			} else if (nr_cpus <= 16) {
 				scan_limit = nr_cpus;
 			} else {
 				unsigned int x = nr_busy * 100;
-				unsigned int thresh = nr_cpus * 85;
+				unsigned int thresh = llc_size * 85;
 
 				scan_limit = nr_cpus -
 					(u64)x * x * nr_cpus /
@@ -4013,7 +3912,7 @@ do_scan:
 		 * tail latency more than cache locality helps.
 		 */
 		if (prev_eff >= 2 &&
-		    atomic_read(&minlat_nr_overloaded) > 0) {
+		    sched_minlat_any_overloaded(cpu_rq(prev_cpu))) {
 			int spread_cpu = -1;
 			unsigned int spread_nr = prev_eff;
 
@@ -4071,10 +3970,10 @@ static bool minlat_task_cache_hot(struct task_struct *p, struct rq *src_rq)
 	if (unlikely(p->sched_class != &minlat_sched_class))
 		return false;
 
-	if (p->minlat.exec_start == 0)
+	if (p->se.exec_start == 0)
 		return false;
 
-	return (rq_clock_task(src_rq) - p->minlat.exec_start) < minlat_cache_hot_ns;
+	return (rq_clock_task(src_rq) - p->se.exec_start) < minlat_cache_hot_ns;
 }
 
 /*
@@ -4149,7 +4048,7 @@ minlat_pick_pullable_task(struct rq *src_rq, int this_cpu, bool cross_numa)
 
 	{
 	bool dst_idle = minlat_cpu_eff(this_cpu) == 0;
-	int max_scan = atomic_read(&minlat_nr_overloaded) > 0 ? 8 : 4;
+	int max_scan = sched_minlat_any_overloaded(cpu_rq(this_cpu)) ? 8 : 4;
 
 	for (node = rb_last(&src_rq->minlat.tasks_timeline.rb_root);
 	     node && scanned < max_scan; node = rb_prev(node), scanned++) {
@@ -4726,7 +4625,8 @@ minlat_sd_balance_interval(struct sched_domain *sd, int cpu_busy)
 		 */
 		unsigned int factor = sd->busy_factor;
 
-		if (atomic_read(&minlat_nr_overloaded) > 0)
+		if (sched_minlat_llc_overloaded(
+				cpumask_first(sched_domain_span(sd))))
 			factor = min_t(unsigned int, factor, 4);
 		interval *= factor;
 	}
@@ -4937,11 +4837,11 @@ unlock:
 }
 
 /*
- * Find the busiest CPU in @span by PELT load_avg.
+ * Find the busiest CPU in @span by instantaneous load weight.
  * Returns NULL if no CPU is busier than this_rq.
  */
 static struct rq *
-minlat_find_busiest_rq_pelt(struct rq *this_rq, const struct cpumask *span)
+minlat_find_busiest_rq_weight(struct rq *this_rq, const struct cpumask *span)
 {
 	struct rq *busiest = NULL;
 	unsigned long busiest_load = minlat_cpu_load(this_rq->cpu);
@@ -4985,7 +4885,7 @@ static bool minlat_balance_domain(struct rq *this_rq,
 
 	this_load = minlat_cpu_load(this_rq->cpu);
 
-	/* Compute domain average PELT load */
+	/* Compute domain average load weight */
 	for_each_cpu(cpu, span) {
 		total_load += minlat_cpu_load(cpu);
 		nr_cpus++;
@@ -5000,8 +4900,8 @@ static bool minlat_balance_domain(struct rq *this_rq,
 	if (this_load >= domain_avg)
 		return false;
 
-	/* Find busiest CPU by PELT load */
-	busiest = minlat_find_busiest_rq_pelt(this_rq, span);
+	/* Find busiest CPU by load weight */
+	busiest = minlat_find_busiest_rq_weight(this_rq, span);
 	if (!busiest)
 		return false;
 
@@ -5026,7 +4926,7 @@ static bool minlat_balance_domain(struct rq *this_rq,
 	{
 		unsigned long thresh = NICE_0_LOAD;
 
-		if (atomic_read(&minlat_nr_overloaded) > 0)
+		if (sched_minlat_any_overloaded(this_rq))
 			thresh >>= 1;
 		if (imbalance < thresh)
 			return false;
@@ -5302,6 +5202,12 @@ static void migrate_minlat_se_pelt_lag(struct task_struct *p)
 	 * Paired with _update_idle_rq_clock_pelt(). At worst we see the
 	 * old clock_pelt_idle and new clock_idle, which underestimates
 	 * (safe). The reverse would overestimate.
+	 *
+	 * TODO: CFS subtracts cfs_rq->throttled_pelt_idle here to avoid
+	 * over-decaying tasks that were bandwidth-throttled when the CPU
+	 * went idle.  Minlat reuses CFS bandwidth but doesn't track per-rq
+	 * throttle-idle time yet.  In practice this corner case (throttle +
+	 * idle + cross-CPU wakeup) is rare.
 	 */
 	smp_rmb();
 
@@ -5676,7 +5582,7 @@ __init void init_sched_minlat_class(void)
 #if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
 	minlat_eas_init();
 #endif
-	pr_info("minlat: scheduler class initialized\n");
+	pr_info("minlat: scheduler class initialized (disabled by default, enable via debugfs)\n");
 }
 
 /*
