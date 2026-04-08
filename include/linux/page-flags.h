@@ -717,7 +717,13 @@ PAGEFLAG_FALSE(VmemmapSelfHosted, vmemmap_self_hosted)
 #define FOLIO_MAPPING_ANON	0x1
 #define FOLIO_MAPPING_ANON_KSM	0x2
 #define FOLIO_MAPPING_KSM	(FOLIO_MAPPING_ANON | FOLIO_MAPPING_ANON_KSM)
-#define FOLIO_MAPPING_FLAGS	(FOLIO_MAPPING_ANON | FOLIO_MAPPING_ANON_KSM)
+#ifdef CONFIG_NUMA_PAGE_REPLICATE
+#define FOLIO_MAPPING_REPLICA	0x4
+#else
+#define FOLIO_MAPPING_REPLICA	0
+#endif
+#define FOLIO_MAPPING_FLAGS	(FOLIO_MAPPING_ANON | FOLIO_MAPPING_ANON_KSM | \
+				 FOLIO_MAPPING_REPLICA)
 
 static __always_inline bool folio_test_anon(const struct folio *folio)
 {
@@ -735,6 +741,32 @@ static __always_inline bool PageAnon(const struct page *page)
 {
 	return folio_test_anon(page_folio(page));
 }
+
+#ifdef CONFIG_NUMA_PAGE_REPLICATE
+/*
+ * A replica folio has FOLIO_MAPPING_REPLICA (bit 2) set in folio->mapping.
+ * folio_mapping() returns NULL for replicas, preserving the invariant that
+ * folio_mapping() != NULL means "folio is in the page cache."
+ * Use folio_raw_mapping() to extract the real address_space pointer.
+ *
+ * The ANON and REPLICA bits are mutually exclusive: ANON means the mapping
+ * pointer is an anon_vma, while REPLICA means it is a tagged address_space.
+ * A folio with both bits set indicates memory corruption.
+ */
+static __always_inline bool folio_test_replica(const struct folio *folio)
+{
+	unsigned long mapping = (unsigned long)folio->mapping;
+
+	return (mapping & FOLIO_MAPPING_REPLICA) &&
+	       !(mapping & FOLIO_MAPPING_ANON);
+}
+#else
+static __always_inline bool folio_test_replica(const struct folio *folio)
+{
+	return false;
+}
+#endif
+
 #ifdef CONFIG_KSM
 /*
  * A KSM page is one of those write-protected "shared pages" or "merged pages"
