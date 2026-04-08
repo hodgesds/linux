@@ -79,6 +79,9 @@
 
 #define MADV_COLLAPSE	25		/* Synchronous hugepage collapse */
 
+#define MADV_NUMA_REPLICATE	26	/* Replicate read-only pages per NUMA node */
+#define MADV_NUMA_NOREPLICATE	27	/* Don't replicate pages per NUMA node */
+
 #define MADV_GUARD_INSTALL 102		/* fatal signal on access to range */
 #define MADV_GUARD_REMOVE 103		/* unguard range */
 

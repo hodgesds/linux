@@ -8,6 +8,7 @@
 
 #include <linux/mman.h>
 #include <linux/pagemap.h>
+#include <linux/numa_replicate.h>
 #include <linux/syscalls.h>
 #include <linux/mempolicy.h>
 #include <linux/page-isolation.h>
@@ -154,9 +155,10 @@ static int madvise_update_vma(vm_flags_t new_flags,
 	struct madvise_behavior_range *range = &madv_behavior->range;
 	struct anon_vma_name *anon_name = madv_behavior->anon_name;
 	bool set_new_anon_name = madv_behavior->behavior == __MADV_SET_ANON_VMA_NAME;
+	vm_flags_t oldflags = vma->vm_flags;
 	VMA_ITERATOR(vmi, madv_behavior->mm, range->start);
 
-	if (new_flags == vma->vm_flags && (!set_new_anon_name ||
+	if (new_flags == oldflags && (!set_new_anon_name ||
 			anon_vma_name_eq(anon_vma_name(vma), anon_name)))
 		return 0;
 
@@ -174,6 +176,35 @@ static int madvise_update_vma(vm_flags_t new_flags,
 
 	/* vm_flags is protected by the mmap_lock held in write mode. */
 	vma_start_write(vma);
+
+	/*
+	 * Invalidate NUMA replicas after vma_start_write() has drained
+	 * per-VMA lock holders.  No new faults under per-VMA lock can
+	 * see VM_NUMA_REPLICATE after this point, so no new replicas
+	 * will be created.
+	 *
+	 * Use oldflags (saved before vma_modify_flags) because after a
+	 * successful VMA merge the returned VMA already has new_flags.
+	 * Use range->start/end (the madvise range) not the full VMA
+	 * extent, which may be wider after the merge.
+	 */
+	if (IS_ENABLED(CONFIG_NUMA_PAGE_REPLICATE) &&
+	    (oldflags & VM_NUMA_REPLICATE) &&
+	    !(new_flags & VM_NUMA_REPLICATE) && vma->vm_file) {
+		struct address_space *mapping = vma->vm_file->f_mapping;
+
+		if (mapping && mapping_numa_replicated(mapping)) {
+			pgoff_t start_pgoff = vma->vm_pgoff +
+				((range->start - vma->vm_start) >> PAGE_SHIFT);
+			pgoff_t end_pgoff = vma->vm_pgoff +
+				((range->end - vma->vm_start) >> PAGE_SHIFT) - 1;
+
+			numa_replica_invalidate_range(
+				numa_replica_tree_for_mapping(mapping),
+				start_pgoff, end_pgoff);
+		}
+	}
+
 	vm_flags_reset(vma, new_flags);
 	if (set_new_anon_name)
 		return replace_anon_vma_name(vma, anon_name);
@@ -1426,6 +1457,64 @@ static int madvise_vma_behavior(struct madvise_behavior *madv_behavior)
 		if (error)
 			goto out;
 		break;
+#ifdef CONFIG_NUMA_PAGE_REPLICATE
+	case MADV_NUMA_REPLICATE: {
+		struct address_space *mapping;
+		struct numa_replica_tree *nrt;
+
+		if (vma_is_anonymous(vma) || (new_flags & VM_WRITE) ||
+		    vma_is_shmem(vma) || vma_is_dax(vma)) {
+			error = -EINVAL;
+			goto out;
+		}
+		if (!vma->vm_file) {
+			error = -EINVAL;
+			goto out;
+		}
+
+		mapping = vma->vm_file->f_mapping;
+		new_flags |= VM_NUMA_REPLICATE;
+
+		/*
+		 * Pre-allocate replica tree with GFP_KERNEL while we can
+		 * sleep.  Two concurrent madvise calls can both see
+		 * !mapping_numa_replicated and both allocate a tree.
+		 * The xa_cmpxchg in register catches the race: the loser
+		 * gets -EEXIST and frees its tree.  This is correct but
+		 * wastes one allocation in the rare concurrent case.
+		 */
+		if (mapping && !mapping_numa_replicated(mapping)) {
+			int ret;
+
+			nrt = numa_replica_tree_alloc_sleepable(mapping);
+			if (!nrt) {
+				error = -ENOMEM;
+				goto out;
+			}
+			ret = numa_replica_tree_register(mapping, nrt);
+			if (ret == -EEXIST) {
+				/* Another thread won the race -- fine */
+				numa_replica_tree_free(nrt);
+			} else if (ret) {
+				numa_replica_tree_free(nrt);
+				error = ret;
+				goto out;
+			} else {
+				mapping_set_numa_replicated(mapping);
+			}
+		}
+		break;
+	}
+	case MADV_NUMA_NOREPLICATE:
+		/*
+		 * Invalidation is deferred to madvise_update_vma() after
+		 * vma_start_write() drains per-VMA lock holders, preventing
+		 * a race where concurrent faults create new replicas between
+		 * invalidation and flag clearing.
+		 */
+		new_flags &= ~VM_NUMA_REPLICATE;
+		break;
+#endif
 	case __MADV_SET_ANON_VMA_NAME:
 		/* Only anonymous mappings can be named */
 		if (vma->vm_file && !vma_is_anon_shmem(vma))
@@ -1554,6 +1643,10 @@ madvise_behavior_valid(int behavior)
 	case MADV_KEEPONFORK:
 	case MADV_GUARD_INSTALL:
 	case MADV_GUARD_REMOVE:
+#ifdef CONFIG_NUMA_PAGE_REPLICATE
+	case MADV_NUMA_REPLICATE:
+	case MADV_NUMA_NOREPLICATE:
+#endif
 #ifdef CONFIG_MEMORY_FAILURE
 	case MADV_SOFT_OFFLINE:
 	case MADV_HWPOISON:
