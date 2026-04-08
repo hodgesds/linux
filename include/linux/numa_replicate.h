@@ -76,6 +76,23 @@ struct folio *numa_replica_lookup(struct numa_replica_tree *nrt,
 				  pgoff_t pgoff, int nid);
 
 /*
+ * Replica context for the two-phase create/install pattern used in
+ * fault paths.  Bundles the prepared and old replica pointers so
+ * callers do not need to thread two separate folio pointers through
+ * the fault code.
+ */
+struct numa_replica_ctx {
+	struct folio	*prepared;	/* phase 1 output, NULL if none */
+	struct folio	*old;		/* replaced replica, cleanup after PTL */
+};
+
+static inline void numa_replica_ctx_init(struct numa_replica_ctx *ctx)
+{
+	ctx->prepared = NULL;
+	ctx->old = NULL;
+}
+
+/*
  * Two-phase replica creation for use around PTL:
  *
  *  Phase 1 (before PTL): numa_replica_prepare() allocates a folio on
