@@ -28,6 +28,7 @@
 #include <linux/blkdev.h>
 #include <linux/mpage.h>
 #include <linux/rmap.h>
+#include <linux/numa_replicate.h>
 #include <linux/percpu.h>
 #include <linux/smp.h>
 #include <linux/sysctl.h>
@@ -2759,6 +2760,23 @@ bool folio_mark_dirty(struct folio *folio)
 	struct address_space *mapping = folio_mapping(folio);
 
 	if (likely(mapping)) {
+		/*
+		 * Invalidate NUMA replicas on the first dirty transition.
+		 * If the folio is already dirty, replicas were invalidated
+		 * on the prior transition; re-invalidating is wasteful and
+		 * adds overhead to a hot path.
+		 *
+		 * The !folio_test_dirty() check is racy: two CPUs dirtying
+		 * the same clean folio will both pass the check and call
+		 * numa_replica_invalidate_dirty().  This is harmless --
+		 * xa_erase() serialization ensures only one caller frees
+		 * each replica.
+		 */
+		if (numa_replicate_is_active() &&
+		    !folio_test_dirty(folio) &&
+		    unlikely(mapping_numa_replicated(mapping)))
+			numa_replica_invalidate_dirty(mapping, folio->index);
+
 		/*
 		 * readahead/folio_deactivate could remain
 		 * PG_readahead/PG_reclaim due to race with folio_end_writeback

@@ -111,6 +111,8 @@ struct folio *numa_replica_install(struct vm_area_struct *vma,
 				   struct folio **old_out);
 
 void numa_replica_invalidate(struct numa_replica_tree *nrt, pgoff_t pgoff);
+void numa_replica_invalidate_one(struct numa_replica_tree *nrt,
+				 pgoff_t pgoff, int nid);
 void numa_replica_invalidate_range(struct numa_replica_tree *nrt,
 				   pgoff_t start, pgoff_t end);
 void numa_replica_invalidate_dirty(struct address_space *mapping,
@@ -167,6 +169,10 @@ numa_replica_install(struct vm_area_struct *vma, struct folio *prepared,
 
 static inline void
 numa_replica_invalidate(struct numa_replica_tree *nrt, pgoff_t pgoff) {}
+
+static inline void
+numa_replica_invalidate_one(struct numa_replica_tree *nrt,
+			    pgoff_t pgoff, int nid) {}
 
 static inline void
 numa_replica_invalidate_range(struct numa_replica_tree *nrt,

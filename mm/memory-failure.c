@@ -47,6 +47,7 @@
 #include <linux/rmap.h>
 #include <linux/export.h>
 #include <linux/pagemap.h>
+#include <linux/numa_replicate.h>
 #include <linux/swap.h>
 #include <linux/backing-dev.h>
 #include <linux/migrate.h>
@@ -2437,6 +2438,33 @@ try_again:
 	}
 
 	folio = page_folio(p);
+
+	/*
+	 * NUMA replica folios have folio->mapping set but are NOT in the
+	 * page cache.  The canonical page is still valid, so invalidate
+	 * only the specific poisoned replica (pgoff, nid) -- replicas of
+	 * the same page on other nodes are unaffected.  No data is lost.
+	 *
+	 * hwpoison_filter() is intentionally skipped here: replicas are
+	 * transient copies whose lifecycle is managed by the replica
+	 * shrinker, so user-space poison filter sysctls do not apply.
+	 */
+	if (IS_ENABLED(CONFIG_NUMA_PAGE_REPLICATE) && folio_test_replica(folio)) {
+		struct address_space *mapping = folio_raw_mapping(folio);
+
+		if (mapping) {
+			struct numa_replica_tree *nrt;
+
+			nrt = numa_replica_tree_for_mapping(mapping);
+			if (nrt)
+				numa_replica_invalidate_one(nrt, folio->index,
+							    folio_nid(folio));
+		}
+		ClearPageHWPoison(p);
+		folio_put(folio);
+		res = action_result(pfn, MF_MSG_CLEAN, MF_RECOVERED);
+		goto unlock_mutex;
+	}
 
 	/* filter pages that are protected from hwpoison test by users */
 	folio_lock(folio);

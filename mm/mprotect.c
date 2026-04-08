@@ -13,6 +13,7 @@
 #include <linux/hugetlb.h>
 #include <linux/shm.h>
 #include <linux/mman.h>
+#include <linux/numa_replicate.h>
 #include <linux/fs.h>
 #include <linux/highmem.h>
 #include <linux/security.h>
@@ -766,6 +767,39 @@ mprotect_fixup(struct vma_iterator *vmi, struct mmu_gather *tlb,
 	 * held in write mode.
 	 */
 	vma_start_write(vma);
+
+	/*
+	 * Invalidate NUMA replicas after vma_start_write() has drained
+	 * per-VMA lock holders.  At this point no new page faults can
+	 * enter under per-VMA lock, so no new replicas can be created.
+	 * This must happen before change_protection() makes PTEs writable.
+	 *
+	 * Narrow the invalidation to [start, end) converted to file pgoff
+	 * rather than the full VMA range.  vma_modify_flags() above may
+	 * have merged VMAs, but only the mprotect range is changing
+	 * permissions, so only those pages need replica invalidation.
+	 *
+	 * The pgoff calculation uses the post-merge VMA's vm_pgoff and
+	 * vm_start; the linear relationship (vm_pgoff + ((addr - vm_start)
+	 * >> PAGE_SHIFT) == file pgoff at addr) is preserved across merges.
+	 */
+	if (IS_ENABLED(CONFIG_NUMA_PAGE_REPLICATE) &&
+	    (newflags & VM_WRITE) && (oldflags & VM_NUMA_REPLICATE) &&
+	    vma->vm_file) {
+		struct address_space *mapping = vma->vm_file->f_mapping;
+
+		if (mapping && mapping_numa_replicated(mapping)) {
+			pgoff_t start_pgoff = vma->vm_pgoff +
+				((start - vma->vm_start) >> PAGE_SHIFT);
+			pgoff_t end_pgoff = vma->vm_pgoff +
+				((end - vma->vm_start) >> PAGE_SHIFT) - 1;
+
+			numa_replica_invalidate_range(
+				numa_replica_tree_for_mapping(mapping),
+				start_pgoff, end_pgoff);
+		}
+	}
+
 	vm_flags_reset_once(vma, newflags);
 	if (vma_wants_manual_pte_write_upgrade(vma))
 		mm_cp_flags |= MM_CP_TRY_CHANGE_WRITABLE;
@@ -895,6 +929,21 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
 		new_vma_pkey = arch_override_mprotect_pkey(vma, prot, pkey);
 		newflags = calc_vm_prot_bits(prot, new_vma_pkey);
 		newflags |= (vma->vm_flags & ~mask_off_old_flags);
+
+		/*
+		 * Adding write permission clears VM_NUMA_REPLICATE.
+		 * The flag is not automatically restored when write
+		 * permission is later removed; the user must re-apply
+		 * MADV_NUMA_REPLICATE to re-enable replication.
+		 *
+		 * Replica invalidation is deferred to mprotect_fixup()
+		 * after vma_start_write() to prevent a race where a
+		 * concurrent page fault under per-VMA lock creates a
+		 * new replica between invalidation and flag clearing.
+		 */
+		if ((newflags & VM_WRITE) &&
+		    (vma->vm_flags & VM_NUMA_REPLICATE))
+			newflags &= ~VM_NUMA_REPLICATE;
 
 		/* newflags >> 4 shift VM_MAY% in place of VM_% */
 		if ((newflags & ~(newflags >> 4)) & VM_ACCESS_FLAGS) {

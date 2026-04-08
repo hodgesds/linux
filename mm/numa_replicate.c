@@ -502,6 +502,33 @@ struct folio *numa_replica_install(struct vm_area_struct *vma,
 }
 
 /*
+ * Erase and free a single replica for (@pgoff, @nid).
+ * Called from memory_failure where we know exactly which replica is
+ * affected and do not need to invalidate replicas on other nodes.
+ *
+ * Uses xa_erase() return value to avoid double-free races with the
+ * shrinker: only the path that successfully erases owns the folio.
+ */
+void numa_replica_invalidate_one(struct numa_replica_tree *nrt,
+				 pgoff_t pgoff, int nid)
+{
+	struct folio *folio;
+	unsigned long key;
+
+	if (!nrt)
+		return;
+
+	key = replica_key(pgoff, nid);
+	folio = xa_erase(&nrt->replicas, key);
+	if (!folio)
+		return;
+
+	atomic_long_dec(&node_nr_replicas[nid]);
+	atomic_long_dec(&nrt->nr_replicas);
+	replica_unmap_and_free(folio, nid, pgoff, "hwpoison");
+}
+
+/*
  * Unmap and drop all replicas for @pgoff.
  * Called on reclaim/truncate where sleeping is allowed.
  *
