@@ -2445,9 +2445,20 @@ try_again:
 	 * only the specific poisoned replica (pgoff, nid) -- replicas of
 	 * the same page on other nodes are unaffected.  No data is lost.
 	 *
-	 * hwpoison_filter() is intentionally skipped here: replicas are
-	 * transient copies whose lifecycle is managed by the replica
-	 * shrinker, so user-space poison filter sysctls do not apply.
+	 * folio_lock() is intentionally skipped for replicas.  The normal
+	 * memory_failure path takes folio_lock before hwpoison_filter(),
+	 * but replicas use xa_erase() return-value serialization instead:
+	 * numa_replica_invalidate_one() atomically erases the replica from
+	 * the XArray, and only the winner of xa_erase() proceeds to unmap
+	 * and free.  This prevents double-free races with the replica
+	 * shrinker, which uses the same xa_erase() serialization pattern.
+	 * The get_hwpoison_page() reference keeps the folio alive through
+	 * ClearPageHWPoison + folio_put even after xa_erase() has dropped
+	 * the XArray reference.
+	 *
+	 * hwpoison_filter() is also skipped: replicas are transient copies
+	 * whose lifecycle is managed by the replica shrinker, so user-space
+	 * poison filter sysctls do not apply.
 	 */
 	if (IS_ENABLED(CONFIG_NUMA_PAGE_REPLICATE) && folio_test_replica(folio)) {
 		struct address_space *mapping = folio_raw_mapping(folio);

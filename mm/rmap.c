@@ -1072,6 +1072,22 @@ int folio_referenced(struct folio *folio, int is_locked,
 	if (!folio_raw_mapping(folio))
 		return 0;
 
+	/*
+	 * NUMA replica folios are not on the LRU, so this function should
+	 * not normally be called on them.  This is defense-in-depth: if a
+	 * replica is ever reached via PFN scan or other unexpected path,
+	 * return 0 so it does not influence reclaim decisions.  The custom
+	 * shrinker handles replica lifecycle.
+	 *
+	 * IS_ENABLED (compile-time elimination) is used here rather than
+	 * static_branch_unlikely because this is a defense-in-depth path
+	 * that should rarely be reached.  The hot reclaim path in
+	 * folio_check_dirty_writeback uses static_branch_unlikely for
+	 * minimal runtime overhead on the common shrink_folio_list path.
+	 */
+	if (IS_ENABLED(CONFIG_NUMA_PAGE_REPLICATE) && folio_test_replica(folio))
+		return 0;
+
 	if (!is_locked) {
 		we_locked = folio_trylock(folio);
 		if (!we_locked)
@@ -3007,7 +3023,8 @@ static void __rmap_walk_file(struct folio *folio, struct address_space *mapping,
 	pgoff_t pgoff_end = pgoff_start + nr_pages - 1;
 	struct vm_area_struct *vma;
 
-	VM_WARN_ON_FOLIO(folio && mapping != folio_mapping(folio), folio);
+	VM_WARN_ON_FOLIO(folio && !folio_test_replica(folio) &&
+			 mapping != folio_mapping(folio), folio);
 	VM_WARN_ON_FOLIO(folio && pgoff_start != folio_pgoff(folio), folio);
 	VM_WARN_ON_FOLIO(folio && nr_pages != folio_nr_pages(folio), folio);
 
@@ -3066,7 +3083,12 @@ static void rmap_walk_file(struct folio *folio,
 	if (!folio->mapping)
 		return;
 
-	__rmap_walk_file(folio, folio->mapping, folio->index,
+	/*
+	 * Use folio_raw_mapping() to strip FOLIO_MAPPING_FLAGS;
+	 * folio_mapping() returns NULL for NUMA replicas due to the
+	 * FOLIO_MAPPING_REPLICA bit.
+	 */
+	__rmap_walk_file(folio, folio_raw_mapping(folio), folio->index,
 			 folio_nr_pages(folio), rwc, locked);
 }
 

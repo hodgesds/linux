@@ -958,6 +958,17 @@ static void folio_check_dirty_writeback(struct folio *folio,
 	struct address_space *mapping;
 
 	/*
+	 * NUMA replica folios are never dirty or under writeback;
+	 * their lifecycle is managed by the custom replica shrinker.
+	 */
+	if (numa_replicate_is_active() &&
+	    folio_test_replica(folio)) {
+		*dirty = false;
+		*writeback = false;
+		return;
+	}
+
+	/*
 	 * Anonymous folios are not handled by flushers and must be written
 	 * from reclaim context. Do not stall reclaim based on them.
 	 * MADV_FREE anonymous folios are put into inactive file list too.
@@ -1375,7 +1386,7 @@ retry:
 			 * also takes i_mmap_rwsem.  These are sequential, not
 			 * nested, read-lock acquisitions on the same rwsem.
 			 */
-			if (static_branch_unlikely(&numa_replicate_active) &&
+			if (numa_replicate_is_active() &&
 			    folio_is_file_lru(folio) && folio->mapping &&
 			    mapping_numa_replicated(folio->mapping))
 				numa_replica_invalidate(
