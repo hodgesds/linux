@@ -5434,11 +5434,23 @@ static ssize_t minlat_enabled_write(struct file *file,
 		return cnt;
 
 	if (enable) {
+		/*
+		 * Enable the static key first so new forks land on
+		 * minlat immediately, then migrate existing tasks.
+		 * This is safe because we do NOT skip fair_sched_class
+		 * in next_active_class() — the scheduler visits both
+		 * classes during the transition.
+		 */
 		static_branch_enable(&sched_minlat_enabled);
 		minlat_switch_all(true);
 		pr_info("minlat: scheduler enabled, migrated all fair tasks\n");
 	} else {
 		minlat_switch_all(false);
+		/*
+		 * A task forked after Phase 2 but before this disable may
+		 * still have minlat_sched_class.  This is benign: we do not
+		 * skip fair in next_active_class(), so it is scheduled normally.
+		 */
 		static_branch_disable(&sched_minlat_enabled);
 		pr_info("minlat: scheduler disabled, migrated all tasks to CFS\n");
 	}

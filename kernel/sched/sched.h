@@ -2919,10 +2919,14 @@ static inline const struct sched_class *next_active_class(const struct sched_cla
 	if (!scx_enabled() && class == &ext_sched_class)
 		class++;
 #endif
-#ifdef CONFIG_SCHED_CLASS_MINLAT
-	if (minlat_enabled() && class == &fair_sched_class)
-		class++;
-#endif
+	/*
+	 * Note: we intentionally do NOT skip fair_sched_class when
+	 * minlat is enabled.  The fair runqueue is empty (all tasks
+	 * migrated to minlat), so pick_task_fair() returns NULL and
+	 * we naturally fall through.  Skipping fair would create a
+	 * race during the enable/disable transition where tasks
+	 * could be stranded on a class the scheduler no longer visits.
+	 */
 	return class;
 }
 
