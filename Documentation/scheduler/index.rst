@@ -13,6 +13,7 @@ Scheduler
     sched-deadline
     sched-design-CFS
     sched-eevdf
+    sched-minlat-colony
     sched-domains
     sched-capacity
     sched-energy
