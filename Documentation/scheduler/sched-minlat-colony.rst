@@ -1452,15 +1452,14 @@ This document is the input to step 1.
 References
 ==========
 
-* :doc:`sched-design-CFS` — the current proportional-fairness model
-  SCHED_MINLAT inherits from.
+* :doc:`sched-design-CFS` — the proportional-fairness model
+  SCHED_MINLAT inherits from; also useful for comparison of the
+  wait-time vs consumed-time framings.
 * :doc:`sched-eevdf` — the production alternative that solves the
   fairness/latency tension via virtual deadlines.
 * :doc:`sched-ext` — the BPF-based extensible scheduler class, which
   represents a different approach (programmable rather than
   redesigned).
-* :doc:`sched-design-CFS` — for comparison of the wait-time vs
-  consumed-time framings.
 * ``kernel/sched/minlat.c`` — the current SCHED_MINLAT implementation
   this proposal aims to replace.
 * ``kernel/sched/fair.c`` — the EEVDF implementation, particularly

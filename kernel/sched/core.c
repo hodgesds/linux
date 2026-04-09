@@ -110,6 +110,7 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(ipi_send_cpumask);
 EXPORT_TRACEPOINT_SYMBOL_GPL(pelt_cfs_tp);
 EXPORT_TRACEPOINT_SYMBOL_GPL(pelt_rt_tp);
 EXPORT_TRACEPOINT_SYMBOL_GPL(pelt_dl_tp);
+EXPORT_TRACEPOINT_SYMBOL_GPL(pelt_minlat_tp);
 EXPORT_TRACEPOINT_SYMBOL_GPL(pelt_irq_tp);
 EXPORT_TRACEPOINT_SYMBOL_GPL(pelt_se_tp);
 EXPORT_TRACEPOINT_SYMBOL_GPL(pelt_hw_tp);
@@ -5959,9 +5960,9 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 	 * at or below minlat class, pick directly without prev_balance()
 	 * or iterating stop/dl/rt pick_task callbacks.
 	 *
-	 * Priority order:
-	 *  1. Wakeup buddy (set by sync wakeup — O(1), no tree traversal)
-	 *  2. Leftmost in rb-tree (with inline delayed entity handling)
+	 * Priority order (colony picker):
+	 *  1. Express FIFO head (list_first_entry of express_q)
+	 *  2. Regular rb-tree leftmost (rb_first_cached of regular_root)
 	 *  3. Curr out-of-tree fallback
 	 */
 	if (!sched_class_above(prev->sched_class, &minlat_sched_class) &&

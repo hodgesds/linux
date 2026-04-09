@@ -50,9 +50,15 @@ update_irq_load_avg(struct rq *rq, u64 running)
 }
 #endif
 
-int ___update_load_sum(u64 now, struct sched_avg *sa,
-		      unsigned long load, unsigned long runnable, int running);
-void ___update_load_avg(struct sched_avg *sa, unsigned long load);
+/*
+ * Low-level PELT primitives.  Not intended for general use outside
+ * scheduler class implementations (CFS, RT, DL, minlat).
+ */
+__always_inline int
+___update_load_sum(u64 now, struct sched_avg *sa,
+		   unsigned long load, unsigned long runnable, int running);
+__always_inline void
+___update_load_avg(struct sched_avg *sa, unsigned long load);
 
 #define PELT_MIN_DIVIDER	(LOAD_AVG_MAX - 1024)
 

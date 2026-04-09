@@ -394,10 +394,14 @@ int update_dl_rq_load_avg(u64 now, struct rq *rq, int running)
  *
  *   load:     aggregate weight of all enqueued minlat entities
  *   runnable: number of runnable minlat entities
- *   running:  is any minlat task currently executing? (binary)
+ *   running:  binary -- is any minlat task currently executing?
  *
- *   This gives schedutil a proportional utilization signal and
- *   allows correct per-entity subtraction for migration and EAS.
+ *   Because load and runnable are entity-aggregate (not binary like
+ *   RT/DL), per-entity subtraction in task_dead_minlat() and
+ *   migrate_task_rq_minlat() is required to keep the signal accurate
+ *   on the source CPU after migration or exit.  Without it the rq
+ *   PELT would remain stale-high until natural decay (~32ms half-life),
+ *   causing schedutil to hold CPU frequency up unnecessarily.
  */
 int update_minlat_rq_load_avg(u64 now, struct rq *rq, int running)
 {
@@ -409,6 +413,7 @@ int update_minlat_rq_load_avg(u64 now, struct rq *rq, int running)
 				running)) {
 
 		___update_load_avg(&mrq->avg, 1);
+		trace_pelt_minlat_tp(rq);
 		return 1;
 	}
 

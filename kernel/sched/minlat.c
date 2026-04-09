@@ -1774,6 +1774,11 @@ static __always_inline u64 minlat_graduation_interval(struct sched_minlat_entity
 {
 	u64 g = minlat_latency_thresh(minlat_graduation_base_ns, me->latency_wmult);
 
+	/*
+	 * Note: if graduation_min_ns > graduation_max_ns (e.g. due to
+	 * independent debugfs writes), clamp_t returns graduation_max_ns
+	 * regardless of base, effectively ignoring the other tunables.
+	 */
 	return clamp_t(u64, g,
 		       (u64)minlat_graduation_min_ns,
 		       (u64)minlat_graduation_max_ns);
@@ -2098,7 +2103,14 @@ static int minlat_find_colony_cpu(struct task_struct *p, int prev_cpu)
 		if (me->pheromone[i].strength < minlat_pheromone_use_threshold)
 			break;
 		rcu_read_lock();
-		waker = find_task_by_pid_ns(me->pheromone[i].waker_tgid, &init_pid_ns);
+		/*
+		 * Look up by PIDTYPE_TGID so the slot stays valid even if
+		 * the thread group leader exits while other threads remain.
+		 * find_task_by_pid_ns() uses PIDTYPE_PID which would fail
+		 * in that case.
+		 */
+		waker = pid_task(find_pid_ns(me->pheromone[i].waker_tgid,
+					     &init_pid_ns), PIDTYPE_TGID);
 		wcpu = waker ? task_cpu(waker) : -1;
 		rcu_read_unlock();
 		if (wcpu >= 0 && wcpu < nr_cpu_ids)
@@ -2597,14 +2609,6 @@ wakeup_preempt_minlat(struct rq *rq, struct task_struct *p, int flags)
 	resched_curr(rq);
 }
 
-/*
- * Check if an entity is eligible for buddy selection.
- *
- * The buddy's vruntime must not be too far ahead of min_vruntime
- * to prevent unfairness. Mirrors EEVDF's entity_eligible() which
- * checks vruntime <= avg_vruntime. Since minlat doesn't track
- * avg_vruntime, we use min_vruntime + latency_target as the bound.
- */
 /*
  * Colony picker: regime-aware express+regular dispatch.
  *
@@ -5629,6 +5633,12 @@ static ssize_t minlat_enabled_write(struct file *file,
 		return cnt;
 
 	if (enable) {
+#ifdef CONFIG_SCHED_CLASS_EXT
+		if (scx_enabled()) {
+			pr_warn("minlat: cannot enable while SCX is active\n");
+			return -EBUSY;
+		}
+#endif
 		/*
 		 * Enable the static key first so new forks land on
 		 * minlat immediately, then migrate existing tasks.

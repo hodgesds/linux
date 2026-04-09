@@ -583,6 +583,11 @@ struct sched_entity {
 
 	struct list_head		group_node;
 	unsigned char			on_rq;
+	/*
+	 * Shared between CFS and minlat: when set, the entity remains
+	 * on the rq but is not eligible for pick.  The owning class
+	 * (whichever class the task belongs to) is the only writer.
+	 */
 	unsigned char			sched_delayed;
 	unsigned char			rel_deadline;
 	unsigned char			custom_slice;
@@ -805,7 +810,7 @@ struct sched_minlat_entity {
 	 * put_prev/set_next touch these every switch — keep together.
 	 */
 	enum minlat_lane		lane;
-	unsigned int			on_rq;	/* mirrors (lane != BLOCKED) */
+	unsigned int			on_rq;	/* mirrors (lane != BLOCKED), except bw_throttled */
 	u64				lane_enter_ns;
 	union {
 		struct list_head	express_node;

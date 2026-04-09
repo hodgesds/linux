@@ -842,6 +842,10 @@ DECLARE_TRACE(pelt_dl,
 	TP_PROTO(struct rq *rq),
 	TP_ARGS(rq));
 
+DECLARE_TRACE(pelt_minlat,
+	TP_PROTO(struct rq *rq),
+	TP_ARGS(rq));
+
 DECLARE_TRACE(pelt_hw,
 	TP_PROTO(struct rq *rq),
 	TP_ARGS(rq));
