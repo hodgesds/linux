@@ -869,6 +869,29 @@ struct sched_minlat_entity {
 #endif
 };
 
+/*
+ * latency_nice: per-task latency tuning, range [-20, 19].
+ *
+ * Design rationale: the range and weight-table mapping intentionally
+ * mirror the nice(2) system.  This makes latency_nice a scheduler-
+ * agnostic knob — if CFS/EEVDF gains latency_nice support (prior
+ * RFC attempts exist), it can reuse the same sched_attr field and
+ * semantics without ABI conflict.
+ *
+ *   -20  = most latency-sensitive  (6us wakeup preemption floor)
+ *    19  = throughput-oriented      (34ms wakeup preemption floor)
+ *     0  = default (inherits parent's latency_nice on fork)
+ *
+ * Mapped to weight/wmult via sched_prio_to_weight[]/sched_prio_to_wmult[]
+ * (same tables as nice), then used by minlat_latency_thresh() to scale
+ * time-based thresholds (min_granularity, graduation interval).
+ *
+ * Currently consumed only when CONFIG_SCHED_CLASS_MINLAT=y.  The UAPI
+ * extension (sched_latency_nice field in struct sched_attr) was removed
+ * pending broader agreement on whether this should be a cross-class ABI
+ * contract.  The internal mechanism is retained for debugfs tuning and
+ * future UAPI restoration.
+ */
 #define MIN_LATENCY_NICE	(-20)
 #define MAX_LATENCY_NICE	19
 #endif

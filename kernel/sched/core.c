@@ -6036,6 +6036,21 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 			goto restart;
 		}
 
+		/*
+		 * No minlat tasks on this CPU. If minlat is enabled
+		 * and other CPUs are overloaded, use the slow path so
+		 * prev_balance() → balance_minlat() can pull work
+		 * before we go idle. Without this, idle CPUs under
+		 * minlat never attempt idle-balance and sleep forever
+		 * while other CPUs are overloaded.
+		 *
+		 * When minlat is disabled (pure CFS), fall through to
+		 * pick_next_task_fair directly to preserve CFS fast-path
+		 * performance.
+		 */
+		if (minlat_enabled())
+			goto restart;
+
 		/* No minlat tasks — fall through to CFS */
 		p = pick_next_task_fair(rq, prev, rf);
 		if (unlikely(p == RETRY_TASK))

@@ -53,12 +53,13 @@ update_irq_load_avg(struct rq *rq, u64 running)
 /*
  * Low-level PELT primitives.  Not intended for general use outside
  * scheduler class implementations (CFS, RT, DL, minlat).
+ *
+ * Defined as __always_inline in pelt.c.  Cross-TU callers (minlat.c)
+ * get a regular call unless LTO is enabled.
  */
-__always_inline int
-___update_load_sum(u64 now, struct sched_avg *sa,
-		   unsigned long load, unsigned long runnable, int running);
-__always_inline void
-___update_load_avg(struct sched_avg *sa, unsigned long load);
+int ___update_load_sum(u64 now, struct sched_avg *sa,
+		       unsigned long load, unsigned long runnable, int running);
+void ___update_load_avg(struct sched_avg *sa, unsigned long load);
 
 #define PELT_MIN_DIVIDER	(LOAD_AVG_MAX - 1024)
 
@@ -69,19 +70,10 @@ static inline u32 get_pelt_divider(struct sched_avg *avg)
 
 static inline void cfs_se_util_change(struct sched_avg *avg)
 {
-	unsigned int enqueued;
-
 	if (!sched_feat(UTIL_EST))
 		return;
 
-	/* Avoid store if the flag has been already reset */
-	enqueued = avg->util_est;
-	if (!(enqueued & UTIL_AVG_UNCHANGED))
-		return;
-
-	/* Reset flag to report util_avg has been updated */
-	enqueued &= ~UTIL_AVG_UNCHANGED;
-	WRITE_ONCE(avg->util_est, enqueued);
+	__se_util_est_change(avg);
 }
 
 static inline u64 rq_clock_pelt(struct rq *rq)

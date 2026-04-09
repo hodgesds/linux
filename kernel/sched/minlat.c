@@ -1323,6 +1323,10 @@ static void minlat_lane_reenter(struct minlat_rq *mr,
  * throttle state and calls minlat_unthrottle_bw() to re-enqueue minlat tasks.
  */
 
+/* Forward declaration: defined in the colony picker section below. */
+static __always_inline void
+minlat_regular_insert(struct minlat_rq *mr, struct sched_minlat_entity *me);
+
 /* Borrowing slice: 5ms (matches CFS default) */
 #define MINLAT_BW_SLICE		(5 * NSEC_PER_MSEC)
 
@@ -2593,6 +2597,22 @@ wakeup_preempt_minlat(struct rq *rq, struct task_struct *p, int flags)
 	 * curr to have run for at least latency_wmult-scaled
 	 * minlat_balance_min_gran_ns. Restores the v3 invariant on top
 	 * of the colony picker.
+	 *
+	 * Intentional asymmetry: the WAKEE's latency_wmult controls
+	 * how long CURR is protected from preemption:
+	 *
+	 *   latency-sensitive wakee (nice=-20): min_gran ~6us
+	 *     → preempts curr almost immediately
+	 *   throughput wakee (nice=19):          min_gran ~34ms
+	 *     → curr runs its full slice undisturbed
+	 *
+	 * This is by design: a latency-sensitive task that just woke up
+	 * should preempt sooner because IT needs the CPU urgently.  A
+	 * throughput-oriented wakee does not benefit from preempting curr
+	 * early — it is better off waiting for curr to finish its slice
+	 * and inheriting a warm cache.  CFS uses a symmetric granularity
+	 * (sysctl_sched_wakeup_granularity) that does not distinguish;
+	 * the asymmetry here is the latency_nice value proposition.
 	 */
 	ran = curr->se.sum_exec_runtime - curr->se.prev_sum_exec_runtime;
 	min_gran = minlat_latency_thresh(minlat_balance_min_gran_ns,
@@ -2723,9 +2743,16 @@ __put_prev_task_minlat(struct rq *rq, struct task_struct *p,
 	/*
 	 * Re-enter the appropriate lane at the tail. minlat_lane_reenter
 	 * handles graduation if the task has exceeded its express age.
+	 *
+	 * This must run unconditionally for delayed tasks too: when the
+	 * delayed-dequeue path in dequeue_task_minlat() returns false,
+	 * curr is left as a non-NULL me but the task has already been
+	 * removed from its lane by __set_next_task_minlat(). If we skip
+	 * the reenter here, the task ends up in no lane and not as curr,
+	 * invisible to the picker. The picker handles delayed entities
+	 * found at lane heads via the DEQUEUE_DELAYED force-dequeue path.
 	 */
-	if (!p->se.sched_delayed)
-		minlat_lane_reenter(minlat_rq, me);
+	minlat_lane_reenter(minlat_rq, me);
 	minlat_rq->curr = NULL;
 
 	/* Update PELT: entity stopped running */
