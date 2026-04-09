@@ -28,13 +28,10 @@ DEFINE_STATIC_KEY_FALSE(sched_minlat_enabled);
 
 /* ---- tuning knobs (debugfs-tunable) ---- */
 
-unsigned int minlat_latency_ns = 1500 * NSEC_PER_USEC;
-unsigned int minlat_min_granularity_ns = 500 * NSEC_PER_USEC;
 unsigned int minlat_cache_hot_ns = 500 * NSEC_PER_USEC;
 unsigned int minlat_numa_imbalance_min = 2;
 unsigned int minlat_migration_cooldown_ns = 1 * NSEC_PER_MSEC;
 unsigned int minlat_numa_saturated_pct = 75;
-unsigned int minlat_wake_affine = 1;
 /*
  * Fork balancing imbalance thresholds (percentage).
  * A remote LLC is preferred over local when its per-CPU load
@@ -44,52 +41,16 @@ unsigned int minlat_wake_affine = 1;
 unsigned int minlat_fork_imbalance_pct = 25;
 unsigned int minlat_fork_numa_imbalance_pct = 50;
 /*
- * Wakeup preemption threshold (ns). Non-sync wakeups only preempt
- * if the vruntime advantage exceeds this value. Higher values
- * reduce context switches but increase latency for new wakeups.
- * 0 = preempt whenever wakee has lower vruntime (aggressive).
- */
-unsigned int minlat_wakeup_preempt_thresh_ns = 2 * NSEC_PER_MSEC;
-/*
  * Big-core preference for interactive and compute-bound tasks.
  * Controls placement on asymmetric capacity (big.LITTLE/hybrid) systems.
- *
- * interactive_big_prefer:
- *   0 = default: place interactive tasks on any idle CPU (cache-local)
- *   1 = prefer big cores for interactive tasks. On hybrid systems,
- *       latency-critical tasks (short burst, frequent sleep) are
- *       routed to high-capacity cores for lowest wake-to-run latency.
- *       Trades cache locality for raw single-thread performance.
- *
- * compute_big_prefer:
- *   0 = default: place compute-bound tasks on any available CPU
- *   1 = prefer big cores for compute-bound tasks. CPU-intensive
- *       tasks (high utilization, long run bursts) are routed to
- *       high-capacity cores for maximum throughput. Little cores
- *       are used as overflow when all big cores are busy.
- *
- * Both are no-ops on symmetric capacity systems.
  */
 unsigned int minlat_interactive_big_prefer;
 unsigned int minlat_compute_big_prefer;
 /*
  * LLC stickiness: minimum number of times a task must run on its
  * current LLC before it becomes eligible for cross-LLC migration.
- * Prevents migration ping-pong that wastes cache warmth.
- * Inspired by p2dq's min_llc_runs concept.
- *
- * 0 = disabled (any task can be pulled immediately)
- * 1 = default (task must run 1 time before cross-LLC pull)
  */
 unsigned int minlat_llc_stickiness = 1;
-/*
- * Preempt resist window (ns). After involuntary preemption, a task
- * gains temporary resistance to further preemption for this duration.
- * Reduces tail latency for tasks near completion of a work burst.
- * Scaled by the current task's latency_wmult (like min_granularity).
- * 0 = disabled.
- */
-unsigned int minlat_preempt_resist_ns = 2 * NSEC_PER_MSEC;
 
 /*
  * Wake-burst spread: per-waker round-robin to break up wake bursts.
@@ -112,59 +73,64 @@ unsigned int minlat_preempt_resist_ns = 2 * NSEC_PER_MSEC;
 unsigned int minlat_wake_burst_window_ns = 100 * NSEC_PER_USEC;
 unsigned int minlat_wake_burst_threshold = 4;
 
-#define MINLAT_LATENCY_NS		minlat_latency_ns
-#define MINLAT_MIN_GRANULARITY_NS	minlat_min_granularity_ns
+/*
+ * Colony picker tunables.
+ *
+ * graduation_base_ns:    base time a task may sit in express before
+ *                        being demoted to regular. Scaled by latency_wmult.
+ * graduation_min_ns:     lower clamp on the scaled interval (anti-gaming)
+ * graduation_max_ns:     upper clamp on the scaled interval (anti-gaming)
+ * balance_min_gran_ns:   minimum runtime curr must accumulate before any
+ *                        wake-driven preemption may displace it. Mirrors
+ *                        the v3 min_gran floor invariant.
+ * express_min_capacity:  hard floor on express lane capacity
+ * express_capacity_pct:  capacity as a percentage of effective queue depth
+ *                        (eff = nr_running - nr_delayed)
+ */
+unsigned int minlat_graduation_base_ns	= 1500 * NSEC_PER_USEC;
+unsigned int minlat_graduation_min_ns	= 250 * NSEC_PER_USEC;
+unsigned int minlat_graduation_max_ns	= 16 * NSEC_PER_MSEC;
+unsigned int minlat_balance_min_gran_ns	= 500 * NSEC_PER_USEC;
+unsigned int minlat_express_min_capacity = 1;
+unsigned int minlat_express_capacity_pct = 50;
+
+/*
+ * Colony placement (pheromone) tunables.
+ *
+ * pheromone_increment:        per-wake increment to a pheromone slot
+ * pheromone_half_life_ns:     wall-clock interval at which strength halves
+ * pheromone_use_threshold:    minimum strength for a slot to influence the
+ *                             colony location query
+ * pheromone_replace_threshold: maximum strength of an existing weakest slot
+ *                              that we'll evict to add a new waker
+ */
+unsigned int minlat_pheromone_increment		= 1024;
+unsigned int minlat_pheromone_half_life_ns	= 500 * NSEC_PER_MSEC;
+unsigned int minlat_pheromone_use_threshold	= 256;
+unsigned int minlat_pheromone_replace_threshold = 128;
+
+/*
+ * yield_to_promotion: 1 = yield_to_task_minlat moves the target into the
+ * head of express on its rq (strong "you should run next" semantics for
+ * KVM's kvm_vcpu_on_spin); 0 = soft hint only.
+ */
+unsigned int minlat_yield_to_promotion = 1;
 
 /*
  * Latency nice: weight-based scaling helpers.
  *
  * latency_nice maps to the nice weight table (sched_prio_to_weight[]),
- * giving exponential (~1.25x per step) scaling. This is load-aware
- * since vruntime already encodes weight-based fairness.
+ * giving exponential (~1.25x per step) scaling.
  *
- * minlat_latency_thresh(): preemption/min_gran threshold scaling
- *   result = base * 1024 / latency_weight
- *   Uses inverse weight (wmult) to avoid division on the hot path.
- *   -20 (weight=88761): base * 0.012  → ~12us for 1ms base
- *     0 (weight=1024):  base * 1.0    → base unchanged
- *    19 (weight=15):    base * 68     → ~68ms for 1ms base
- *
- * minlat_latency_credit(): wakeup placement credit scaling
- *   result = base * latency_weight / 1024, capped at 2*base
- *   -20: 2*base (capped)
- *     0: base
- *    19: base/68
+ * minlat_latency_thresh(): scales a base interval by inverse latency
+ * weight. -20 (weight=88761) → base * 0.012; 0 → base; 19 → base * 68.
+ * Used by graduation interval, min_gran floor, and similar scaled
+ * thresholds throughout the colony picker.
  */
 static __always_inline u64
 minlat_latency_thresh(u64 base, u32 wmult)
 {
 	return mul_u64_u32_shr(base, wmult, 22);
-}
-
-/*
- * Check if the currently running task has preempt resistance.
- * Returns true if preemption should be suppressed.
- */
-static __always_inline bool
-minlat_preempt_resisted(struct sched_minlat_entity *me, struct rq *rq)
-{
-	u64 window, elapsed;
-
-	if (!me->last_preempt_ts || !minlat_preempt_resist_ns)
-		return false;
-
-	window = minlat_latency_thresh(minlat_preempt_resist_ns,
-				       me->latency_wmult);
-	elapsed = rq_clock_task(rq) - me->last_preempt_ts;
-	return elapsed < window;
-}
-
-static __always_inline u64
-minlat_latency_credit(u64 base, unsigned int weight)
-{
-	u64 credit = ((u64)base * weight) >> 10;
-
-	return min_t(u64, credit, 2 * base);
 }
 
 /* minlat_init_latency_nice() defined in sched.h for cross-file access */
@@ -1005,14 +971,6 @@ static void minlat_set_load_weight(struct task_struct *p)
 #endif
 }
 
-static __always_inline u64
-minlat_calc_delta(u64 delta, struct sched_minlat_entity *me)
-{
-	if (me->load.weight == scale_load(1024))
-		return delta;
-	return __calc_delta(delta, NICE_0_LOAD, &me->load);
-}
-
 /* ==== per-tgid LLC/NUMA context ==== */
 
 /*
@@ -1335,15 +1293,12 @@ static void minlat_update_interactivity(struct task_struct *p,
 static void minlat_record_sleep(struct task_struct *p, struct rq *rq);
 static void pull_minlat_task(struct rq *this_rq);
 static inline unsigned int minlat_cpu_eff(int cpu);
-static __always_inline void
-__enqueue_minlat_entity(struct minlat_rq *minlat_rq,
-			struct sched_minlat_entity *me);
-static __always_inline void
-__dequeue_minlat_entity(struct minlat_rq *minlat_rq,
-			struct sched_minlat_entity *me);
-static __always_inline void
-set_next_buddy_minlat(struct minlat_rq *minlat_rq,
-		      struct sched_minlat_entity *me);
+static void minlat_lane_dequeue(struct minlat_rq *mr,
+				struct sched_minlat_entity *me);
+static void minlat_lane_enqueue(struct minlat_rq *mr,
+				struct sched_minlat_entity *me, int flags);
+static void minlat_lane_reenter(struct minlat_rq *mr,
+				struct sched_minlat_entity *me);
 
 /* ==== CFS bandwidth (cpu.max) throttling ==== */
 
@@ -1505,15 +1460,48 @@ static int minlat_tg_throttle_down(struct task_group *tg, void *data)
 }
 
 /*
+ * Throttle a single minlat entity: remove from whichever lane, add to
+ * bw_throttled_tasks list, decrement counters.
+ */
+static void __minlat_bw_throttle_one(struct rq *rq, struct task_struct *p,
+				     struct sched_minlat_entity *me,
+				     bool was_curr)
+{
+	struct minlat_rq *minlat_rq = &rq->minlat;
+
+	if (was_curr) {
+		minlat_rq->curr = NULL;
+	} else {
+		minlat_lane_dequeue(minlat_rq, me);
+	}
+
+	me->bw_throttled = 1;
+	me->lane = MINLAT_LANE_BLOCKED;
+	list_add_tail(&me->bw_throttled_node,
+		      &minlat_rq->bw_throttled_tasks);
+	minlat_rq->nr_bw_throttled++;
+	minlat_rq->nr_running--;
+	if (p->se.sched_delayed)
+		minlat_rq->nr_delayed--;
+	minlat_rq->load_weight -= scale_load_down(me->load.weight);
+	sub_nr_running(rq, 1);
+}
+
+/*
  * Throttle all minlat tasks of a task group on this CPU.
  * Called from pick_task_minlat when runtime is exhausted.
+ *
+ * Walks BOTH lanes (express list + regular rb-tree) since the colony
+ * picker has two queues. Tasks belonging to the throttled tg (or any
+ * descendant) are removed from their lane and parked on the
+ * bw_throttled_tasks list until the period timer refills runtime.
  */
 static void minlat_throttle_tg_cpu(struct rq *rq, struct task_group *tg)
 {
 	struct minlat_rq *minlat_rq = &rq->minlat;
 	struct cfs_rq *cfs_rq = tg->cfs_rq[cpu_of(rq)];
 	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
-	struct sched_minlat_entity *me;
+	struct sched_minlat_entity *me, *tmp;
 	struct rb_node *node, *next;
 	struct task_struct *p;
 
@@ -1542,45 +1530,30 @@ static void minlat_throttle_tg_cpu(struct rq *rq, struct task_group *tg)
 	walk_tg_tree_from(tg, minlat_tg_throttle_down, tg_nop, (void *)rq);
 	rcu_read_unlock();
 
-	/* Dequeue all minlat tasks belonging to this tg or its descendants */
-	for (node = rb_first_cached(&minlat_rq->tasks_timeline);
-	     node; node = next) {
-		next = rb_next(node);
-		me = rb_entry(node, struct sched_minlat_entity, run_node);
+	/* Walk express lane: throttle matching tasks */
+	list_for_each_entry_safe(me, tmp, &minlat_rq->express_q,
+				 lane_link.express_node) {
 		p = container_of(me, struct task_struct, minlat);
-
 		if (!minlat_tg_is_descendant(task_group(p), tg))
 			continue;
+		__minlat_bw_throttle_one(rq, p, me, false);
+	}
 
-		__dequeue_minlat_entity(minlat_rq, me);
-		me->bw_throttled = 1;
-		list_add_tail(&me->bw_throttled_node,
-			      &minlat_rq->bw_throttled_tasks);
-		minlat_rq->nr_bw_throttled++;
-		minlat_rq->nr_running--;
-		if (p->se.sched_delayed)
-			minlat_rq->nr_delayed--;
-		minlat_rq->load_weight -= scale_load_down(me->load.weight);
-		sub_nr_running(rq, 1);
+	/* Walk regular rb-tree: throttle matching tasks */
+	for (node = rb_first_cached(&minlat_rq->regular_root); node; node = next) {
+		next = rb_next(node);
+		me = rb_entry(node, struct sched_minlat_entity, lane_link.regular_node);
+		p = container_of(me, struct task_struct, minlat);
+		if (!minlat_tg_is_descendant(task_group(p), tg))
+			continue;
+		__minlat_bw_throttle_one(rq, p, me, false);
 	}
 
 	/* Also throttle curr if it belongs to this tg or descendant */
 	if (minlat_rq->curr) {
 		p = container_of(minlat_rq->curr, struct task_struct, minlat);
-		if (minlat_tg_is_descendant(task_group(p), tg)) {
-			me = minlat_rq->curr;
-			minlat_rq->curr = NULL;
-			me->bw_throttled = 1;
-			list_add_tail(&me->bw_throttled_node,
-				      &minlat_rq->bw_throttled_tasks);
-			minlat_rq->nr_bw_throttled++;
-			minlat_rq->nr_running--;
-			if (p->se.sched_delayed)
-				minlat_rq->nr_delayed--;
-			minlat_rq->load_weight -=
-				scale_load_down(me->load.weight);
-			sub_nr_running(rq, 1);
-		}
+		if (minlat_tg_is_descendant(task_group(p), tg))
+			__minlat_bw_throttle_one(rq, p, minlat_rq->curr, true);
 	}
 
 	if (minlat_rq->nr_running - minlat_rq->nr_delayed < 2)
@@ -1629,8 +1602,11 @@ void minlat_unthrottle_bw(struct rq *rq, struct task_group *tg)
 		me->bw_throttled = 0;
 		minlat_rq->nr_bw_throttled--;
 
-		/* Re-enqueue into rb-tree */
-		__enqueue_minlat_entity(minlat_rq, me);
+		/* Re-enqueue into the regular lane (not a fresh wake) */
+		me->lane_enter_ns = sched_clock();
+		me->lane = MINLAT_LANE_REGULAR;
+		RB_CLEAR_NODE(&me->lane_link.regular_node);
+		minlat_regular_insert(minlat_rq, me);
 		minlat_rq->nr_running++;
 		if (p->se.sched_delayed)
 			minlat_rq->nr_delayed++;
@@ -1763,14 +1739,429 @@ static void minlat_kick_idle_func(struct irq_work *work)
 		resched_cpu(cpu);
 }
 
+/* ==== colony picker helpers ==== */
+
+/*
+ * Effective queue depth for picker decisions: total runnable tasks
+ * minus tasks in delayed-dequeue state (sleeping but kept on rq).
+ */
+static __always_inline unsigned int minlat_eff(struct minlat_rq *mr)
+{
+	return mr->nr_running - min(mr->nr_running, mr->nr_delayed);
+}
+
+/*
+ * Express lane capacity. Tunable percentage of eff, with a hard floor.
+ * Recomputed on every enqueue/dequeue.
+ */
+static __always_inline unsigned int minlat_express_capacity_calc(unsigned int eff)
+{
+	unsigned int cap = eff * minlat_express_capacity_pct / 100;
+
+	return max_t(unsigned int, cap, minlat_express_min_capacity);
+}
+
+/*
+ * Per-task graduation interval: how long the task may sit in express
+ * before being demoted to regular. Scaled by latency_wmult so that
+ * latency-sensitive tasks (negative latency_nice) graduate later
+ * (stay in express longer); throughput-friendly tasks graduate sooner.
+ *
+ * Clamped to [graduation_min_ns, graduation_max_ns] so adversarial
+ * latency_nice values can't push the interval to extremes.
+ */
+static __always_inline u64 minlat_graduation_interval(struct sched_minlat_entity *me)
+{
+	u64 g = minlat_latency_thresh(minlat_graduation_base_ns, me->latency_wmult);
+
+	return clamp_t(u64, g,
+		       (u64)minlat_graduation_min_ns,
+		       (u64)minlat_graduation_max_ns);
+}
+
+/*
+ * Sort key for the regular rb-tree.
+ *
+ *   key = lane_enter_ns * NICE_0_LOAD / load.weight
+ *
+ * Heavier tasks → smaller key → leftmost → picked first. Mathematically
+ * equivalent to vruntime, but using wait-time (lane_enter_ns) as the
+ * base instead of consumed runtime. The key is set on each insertion
+ * (via lane_enter_ns) and stays constant while the entity is in the
+ * rb-tree, so insertion is O(log n) and pick is O(1) via rb_first_cached.
+ *
+ * Returned as s64 because the rb-tree comparator needs signed
+ * comparison to handle wrap-around correctly.
+ */
+static __always_inline s64 minlat_regular_key(struct sched_minlat_entity *me)
+{
+	unsigned long w;
+
+	if (likely(me->load.weight == scale_load(NICE_0_LOAD)))
+		return (s64)me->lane_enter_ns;
+	w = scale_load_down(me->load.weight);
+	if (unlikely(!w))
+		w = 1;
+	return (s64)mul_u64_u64_div_u64(me->lane_enter_ns,
+					NICE_0_LOAD, (u64)w);
+}
+
+static __always_inline bool minlat_regular_less(struct rb_node *a,
+						 const struct rb_node *b)
+{
+	struct sched_minlat_entity *ea, *eb;
+
+	ea = rb_entry(a, struct sched_minlat_entity, lane_link.regular_node);
+	eb = rb_entry(b, struct sched_minlat_entity, lane_link.regular_node);
+	return minlat_regular_key(ea) < minlat_regular_key(eb);
+}
+
+static __always_inline void
+minlat_regular_insert(struct minlat_rq *mr, struct sched_minlat_entity *me)
+{
+	rb_add_cached(&me->lane_link.regular_node, &mr->regular_root,
+		      minlat_regular_less);
+}
+
+static __always_inline void
+minlat_regular_remove(struct minlat_rq *mr, struct sched_minlat_entity *me)
+{
+	rb_erase_cached(&me->lane_link.regular_node, &mr->regular_root);
+	RB_CLEAR_NODE(&me->lane_link.regular_node);
+}
+
+static __always_inline struct sched_minlat_entity *
+minlat_regular_first(struct minlat_rq *mr)
+{
+	struct rb_node *n = rb_first_cached(&mr->regular_root);
+
+	if (!n)
+		return NULL;
+	return rb_entry(n, struct sched_minlat_entity, lane_link.regular_node);
+}
+
+/*
+ * Move an entity from the express lane to the regular lane. Used by
+ * graduation (express age exceeded) and overflow (express full). The
+ * entity's lane_enter_ns is preserved so it carries its waited-time
+ * priority into the regular sort.
+ */
+static void
+minlat_demote_express_to_regular(struct minlat_rq *mr,
+				 struct sched_minlat_entity *me)
+{
+	list_del_init(&me->lane_link.express_node);
+	mr->express_count--;
+	me->lane = MINLAT_LANE_REGULAR;
+	minlat_regular_insert(mr, me);
+}
+
+/*
+ * Express overflow handler. Called from enqueue paths after a fresh
+ * insert into express. While express is over capacity, demote the
+ * OLDEST express entry (front of FIFO) to regular.
+ */
+static void minlat_express_overflow_check(struct minlat_rq *mr)
+{
+	while (mr->express_count > mr->express_capacity &&
+	       !list_empty(&mr->express_q)) {
+		struct sched_minlat_entity *me;
+
+		me = list_first_entry(&mr->express_q,
+				      struct sched_minlat_entity,
+				      lane_link.express_node);
+		minlat_demote_express_to_regular(mr, me);
+	}
+}
+
+/*
+ * Lazy graduation sweep on the express head. Called at the start of
+ * pick_task_minlat: any entries at the front of express that have
+ * sat there longer than their graduation interval are demoted to
+ * regular before the picker considers them.
+ */
+static void minlat_graduate_express_head(struct minlat_rq *mr, u64 now)
+{
+	while (!list_empty(&mr->express_q)) {
+		struct sched_minlat_entity *me;
+		u64 age;
+
+		me = list_first_entry(&mr->express_q,
+				      struct sched_minlat_entity,
+				      lane_link.express_node);
+		age = now - me->lane_enter_ns;
+		if (age <= minlat_graduation_interval(me))
+			break;
+		minlat_demote_express_to_regular(mr, me);
+	}
+}
+
+/*
+ * Insert an entity into a lane, recording the entry time.
+ *
+ * For ENQUEUE_WAKEUP (a fresh wake), the task enters express. The
+ * lane_enter_ns is set to NOW; the wake target counts as fresh.
+ * For other enqueue paths (re-queue after migration, unthrottle,
+ * cgroup move), the task enters regular at the back so it gets a
+ * fair turn through the FIFO sort.
+ */
+static void
+minlat_lane_enqueue(struct minlat_rq *mr, struct sched_minlat_entity *me,
+		    int flags)
+{
+	u64 now = sched_clock();
+
+	if (flags & ENQUEUE_WAKEUP) {
+		me->lane = MINLAT_LANE_EXPRESS;
+		me->lane_enter_ns = now;
+		INIT_LIST_HEAD(&me->lane_link.express_node);
+		list_add_tail(&me->lane_link.express_node, &mr->express_q);
+		mr->express_count++;
+	} else {
+		me->lane = MINLAT_LANE_REGULAR;
+		me->lane_enter_ns = now;
+		RB_CLEAR_NODE(&me->lane_link.regular_node);
+		minlat_regular_insert(mr, me);
+	}
+	me->on_rq = 1;
+	mr->express_capacity = minlat_express_capacity_calc(minlat_eff(mr) + 1);
+	minlat_express_overflow_check(mr);
+}
+
+/*
+ * Remove an entity from whichever lane it's currently in. Used by
+ * dequeue, set_next_task, and bw throttle paths. Safe to call even
+ * if the entity isn't in any lane (LANE_RUNNING / LANE_BLOCKED).
+ */
+static void
+minlat_lane_dequeue(struct minlat_rq *mr, struct sched_minlat_entity *me)
+{
+	switch (me->lane) {
+	case MINLAT_LANE_EXPRESS:
+		if (!list_empty(&me->lane_link.express_node)) {
+			list_del_init(&me->lane_link.express_node);
+			if (mr->express_count)
+				mr->express_count--;
+		}
+		break;
+	case MINLAT_LANE_REGULAR:
+		if (!RB_EMPTY_NODE(&me->lane_link.regular_node))
+			minlat_regular_remove(mr, me);
+		break;
+	default:
+		break;
+	}
+}
+
+/*
+ * Re-insert an entity into its current lane (or the appropriate lane
+ * based on age). Used by put_prev_task: when a task is preempted but
+ * still runnable, it goes back into its lane at the tail.
+ *
+ * If the entity has been runnable longer than its graduation interval,
+ * it's demoted from express to regular before re-insertion.
+ */
+static void
+minlat_lane_reenter(struct minlat_rq *mr, struct sched_minlat_entity *me)
+{
+	u64 now = sched_clock();
+
+	if (me->lane == MINLAT_LANE_EXPRESS &&
+	    (now - me->lane_enter_ns) > minlat_graduation_interval(me)) {
+		me->lane = MINLAT_LANE_REGULAR;
+		/* lane_enter_ns is preserved — graduated tasks have priority
+		 * in regular relative to fresh wakes */
+	}
+
+	if (me->lane == MINLAT_LANE_EXPRESS) {
+		INIT_LIST_HEAD(&me->lane_link.express_node);
+		list_add_tail(&me->lane_link.express_node, &mr->express_q);
+		mr->express_count++;
+	} else {
+		me->lane = MINLAT_LANE_REGULAR;
+		RB_CLEAR_NODE(&me->lane_link.regular_node);
+		minlat_regular_insert(mr, me);
+	}
+	mr->express_capacity = minlat_express_capacity_calc(minlat_eff(mr));
+	minlat_express_overflow_check(mr);
+}
+
+/* ==== colony pheromone (placement) helpers ==== */
+
+/*
+ * Lazy decay of a task's pheromone array. Multiplicative decay applied
+ * once per half-life elapsed since the last decay. Stale arrays
+ * (>16 half-lives) are zeroed wholesale.
+ */
+static void minlat_pheromone_decay(struct sched_minlat_entity *me, u64 now)
+{
+	u64 elapsed;
+	unsigned int half_lives;
+	int i;
+
+	if (!minlat_pheromone_half_life_ns)
+		return;
+	if (now < me->pheromone_last_decay_ns)
+		return;
+	elapsed = now - me->pheromone_last_decay_ns;
+	half_lives = (unsigned int)(elapsed / minlat_pheromone_half_life_ns);
+	if (half_lives == 0)
+		return;
+	if (half_lives >= 16) {
+		memset(me->pheromone, 0, sizeof(me->pheromone));
+	} else {
+		for (i = 0; i < MINLAT_PHEROMONE_FANIN; i++)
+			me->pheromone[i].strength >>= half_lives;
+	}
+	me->pheromone_last_decay_ns = now;
+}
+
+/*
+ * Re-sort a single pheromone slot after its strength changed (insertion
+ * sort: shift toward the head while greater than predecessor).
+ */
+static __always_inline void
+minlat_pheromone_resort(struct sched_minlat_entity *me, int slot)
+{
+	while (slot > 0 &&
+	       me->pheromone[slot].strength > me->pheromone[slot - 1].strength) {
+		struct minlat_pheromone tmp = me->pheromone[slot - 1];
+
+		me->pheromone[slot - 1] = me->pheromone[slot];
+		me->pheromone[slot] = tmp;
+		slot--;
+	}
+}
+
+/*
+ * Record a wake event in the wakee's pheromone array. The wakee is
+ * `p`; the waker is `current`. Skips self-wakes (anti-gaming) and
+ * non-minlat wakers.
+ */
+static void
+minlat_record_pheromone(struct task_struct *p, struct task_struct *waker)
+{
+	struct sched_minlat_entity *me = &p->minlat;
+	pid_t tgid;
+	u64 now;
+	int i;
+
+	if (!waker || waker->sched_class != &minlat_sched_class)
+		return;
+	tgid = task_tgid_nr(waker);
+	if (tgid == 0 || tgid == task_tgid_nr(p))
+		return;	/* skip self-tgid wakes */
+
+	now = sched_clock();
+	minlat_pheromone_decay(me, now);
+
+	/* Find existing slot for this waker tgid */
+	for (i = 0; i < MINLAT_PHEROMONE_FANIN; i++) {
+		if (me->pheromone[i].waker_tgid == tgid) {
+			u32 s = me->pheromone[i].strength;
+
+			if (s + minlat_pheromone_increment < s)
+				me->pheromone[i].strength = U32_MAX;
+			else
+				me->pheromone[i].strength = s + minlat_pheromone_increment;
+			minlat_pheromone_resort(me, i);
+			return;
+		}
+	}
+
+	/* No existing slot — try to evict the weakest if it's weak enough. */
+	i = MINLAT_PHEROMONE_FANIN - 1;
+	if (me->pheromone[i].strength <= minlat_pheromone_replace_threshold) {
+		me->pheromone[i].waker_tgid = tgid;
+		me->pheromone[i].strength = minlat_pheromone_increment;
+		minlat_pheromone_resort(me, i);
+	}
+}
+
+/*
+ * Find a CPU within the wakee's colony footprint. Walks the strongest
+ * pheromones, looks up where each waker is currently running, and
+ * picks an underutilized CPU within those LLCs. Returns -1 if the
+ * wakee has no usable colony information (cold start).
+ */
+static int minlat_find_colony_cpu(struct task_struct *p, int prev_cpu)
+{
+	struct sched_minlat_entity *me = &p->minlat;
+	int colony_cpus[MINLAT_PHEROMONE_FANIN];
+	int n = 0, i, best = -1;
+	unsigned int best_eff = UINT_MAX;
+
+	for (i = 0; i < MINLAT_PHEROMONE_FANIN; i++) {
+		struct task_struct *waker;
+		int wcpu;
+
+		if (me->pheromone[i].strength < minlat_pheromone_use_threshold)
+			break;
+		rcu_read_lock();
+		waker = find_task_by_pid_ns(me->pheromone[i].waker_tgid, &init_pid_ns);
+		wcpu = waker ? task_cpu(waker) : -1;
+		rcu_read_unlock();
+		if (wcpu >= 0 && wcpu < nr_cpu_ids)
+			colony_cpus[n++] = wcpu;
+	}
+	if (n == 0)
+		return -1;	/* no colony — cold start */
+
+	/*
+	 * For each colony source CPU, walk its LLC mask and pick the
+	 * least-loaded eligible CPU. Prefer cpus_ptr-allowed, active CPUs
+	 * with lowest eff.
+	 */
+	rcu_read_lock();
+	for (i = 0; i < n; i++) {
+		struct sched_domain *sd;
+		int cpu;
+
+		sd = rcu_dereference(per_cpu(sd_llc, colony_cpus[i]));
+		if (!sd)
+			continue;
+		for_each_cpu(cpu, sched_domain_span(sd)) {
+			struct minlat_rq *mr;
+			unsigned int e;
+
+			if (!cpu_active(cpu))
+				continue;
+			if (!cpumask_test_cpu(cpu, p->cpus_ptr))
+				continue;
+			mr = &cpu_rq(cpu)->minlat;
+			e = minlat_eff(mr);
+			if (e < best_eff) {
+				best_eff = e;
+				best = cpu;
+				if (e == 0)
+					goto found;
+			}
+		}
+	}
+found:
+	rcu_read_unlock();
+	return best;
+}
+
 void init_minlat_rq(struct minlat_rq *minlat_rq)
 {
-	minlat_rq->tasks_timeline = RB_ROOT_CACHED;
+	/*
+	 * Compile-time invariants for the colony picker.
+	 *
+	 * MINLAT_PHEROMONE_FANIN must be at least 1 or the pheromone
+	 * helpers degenerate. Keep it small enough that the per-task
+	 * array stays cache-friendly.
+	 */
+	BUILD_BUG_ON(MINLAT_PHEROMONE_FANIN < 1);
+	BUILD_BUG_ON(MINLAT_PHEROMONE_FANIN > 32);
+
+	INIT_LIST_HEAD(&minlat_rq->express_q);
+	minlat_rq->regular_root = RB_ROOT_CACHED;
+	minlat_rq->express_count = 0;
+	minlat_rq->express_capacity = 1;	/* recomputed on enqueue */
 	minlat_rq->curr = NULL;
-	minlat_rq->next = NULL;
 	minlat_rq->nr_running = 0;
 	minlat_rq->nr_delayed = 0;
-	minlat_rq->min_vruntime = 0;
 	minlat_rq->load_weight = 0;
 	memset(&minlat_rq->avg, 0, sizeof(minlat_rq->avg));
 	minlat_rq->util_est = 0;
@@ -1784,131 +2175,24 @@ void init_minlat_rq(struct minlat_rq *minlat_rq)
 #endif
 }
 
-/* ==== rb-tree operations ==== */
-
-static __always_inline bool __minlat_less(struct rb_node *a,
-					  const struct rb_node *b)
-{
-	struct sched_minlat_entity *ea, *eb;
-
-	ea = rb_entry(a, struct sched_minlat_entity, run_node);
-	eb = rb_entry(b, struct sched_minlat_entity, run_node);
-	return (s64)(ea->vruntime - eb->vruntime) < 0;
-}
-
-static __always_inline void
-__enqueue_minlat_entity(struct minlat_rq *minlat_rq,
-			struct sched_minlat_entity *me)
-{
-	rb_add_cached(&me->run_node, &minlat_rq->tasks_timeline,
-		      __minlat_less);
-}
-
-static __always_inline void
-__dequeue_minlat_entity(struct minlat_rq *minlat_rq,
-			struct sched_minlat_entity *me)
-{
-	if (RB_EMPTY_NODE(&me->run_node))
-		return;
-	rb_erase_cached(&me->run_node, &minlat_rq->tasks_timeline);
-	RB_CLEAR_NODE(&me->run_node);
-}
-
-static __always_inline struct sched_minlat_entity *
-__pick_first_minlat_entity(struct minlat_rq *minlat_rq)
-{
-	struct rb_node *left = rb_first_cached(&minlat_rq->tasks_timeline);
-
-	if (!left)
-		return NULL;
-	return rb_entry(left, struct sched_minlat_entity, run_node);
-}
-
-static __always_inline struct rq *rq_of_minlat_rq(struct minlat_rq *minlat_rq)
-{
-	return container_of(minlat_rq, struct rq, minlat);
-}
-
-/*
- * Update min_vruntime to track the minimum vruntime across all runnable
- * tasks. This must consider BOTH the currently running task and the
- * leftmost (next-to-run) task in the tree.
- *
- * Without considering the current task, min_vruntime can be pulled up
- * by high-weight tasks (high nice value = fast vruntime), causing
- * low-nice tasks to lose their vruntime advantage when they sleep
- * and wake up (place_minlat_entity uses min_vruntime for placement).
- */
-static __always_inline void update_min_vruntime(struct minlat_rq *minlat_rq)
-{
-	struct sched_minlat_entity *leftmost;
-	struct task_struct *curr = rq_of_minlat_rq(minlat_rq)->curr;
-	u64 vruntime = minlat_rq->min_vruntime;
-
-	if (curr && curr->sched_class == &minlat_sched_class)
-		vruntime = curr->minlat.vruntime;
-
-	leftmost = __pick_first_minlat_entity(minlat_rq);
-	if (leftmost) {
-		if (!curr || curr->sched_class != &minlat_sched_class)
-			vruntime = leftmost->vruntime;
-		else
-			vruntime = min_t(u64, vruntime, leftmost->vruntime);
-	}
-
-	/* min_vruntime only moves forward */
-	minlat_rq->min_vruntime = max_t(u64, minlat_rq->min_vruntime, vruntime);
-}
-
-static void place_minlat_entity(struct minlat_rq *minlat_rq,
-				struct sched_minlat_entity *me, int flags)
-{
-	u64 vruntime = minlat_rq->min_vruntime;
-
-	if (flags & ENQUEUE_WAKEUP) {
-		/*
-		 * Give waking tasks a vruntime credit so they run soon
-		 * after wakeup. Base credit is half the latency target,
-		 * scaled by the nice weight table via latency_nice:
-		 *   -20: 2x credit (capped) → runs soonest
-		 *     0: 1x credit          → normal
-		 *    19: ~1/68 credit        → minimal boost
-		 */
-		u64 credit = minlat_latency_credit(MINLAT_LATENCY_NS / 2,
-						   me->latency_weight);
-		u64 thresh;
-
-		if (likely(me->load.weight == scale_load(1024)))
-			thresh = credit;
-		else
-			thresh = minlat_calc_delta(credit, me);
-
-		vruntime -= min(vruntime, thresh);
-	}
-
-	me->vruntime = max_t(s64, me->vruntime, vruntime);
-}
-
 /* ==== core scheduling callbacks ==== */
 
 /*
- * Lightweight vruntime update — just accounting, no tree reposition.
- * Used on the wakeup preemption path where we need fresh vruntime
- * for comparison but don't need correct tree ordering yet.
+ * Runtime accounting for the colony picker. No vruntime — just
+ * advance sum_exec_runtime and charge bandwidth. Lane order is
+ * determined by lane membership and lane_enter_ns, not by accumulated
+ * runtime.
  */
-static __always_inline void update_curr_minlat_vruntime(struct rq *rq)
+static void update_curr_minlat(struct rq *rq)
 {
 	struct task_struct *curr = rq->curr;
-	struct sched_minlat_entity *me;
 	u64 now, delta_exec;
 
 	if (curr->sched_class != &minlat_sched_class)
 		return;
 
-	me = &curr->minlat;
 	now = rq_clock_task(rq);
 	delta_exec = now - curr->se.exec_start;
-
 	if (unlikely((s64)delta_exec <= 0))
 		return;
 
@@ -1916,154 +2200,7 @@ static __always_inline void update_curr_minlat_vruntime(struct rq *rq)
 	curr->se.sum_exec_runtime += delta_exec;
 	account_group_exec_runtime(curr, delta_exec);
 	cgroup_account_cputime(curr, delta_exec);
-
-	me->vruntime += minlat_calc_delta(delta_exec, me);
-
 	minlat_account_bw_runtime(rq, curr, delta_exec);
-}
-
-static void update_curr_minlat(struct rq *rq)
-{
-	struct minlat_rq *minlat_rq = &rq->minlat;
-
-	update_curr_minlat_vruntime(rq);
-
-	if (rq->curr->sched_class != &minlat_sched_class)
-		return;
-
-	/*
-	 * Current entity is out-of-tree (removed by set_next_task).
-	 * No tree repositioning needed — put_prev_task will re-insert
-	 * it at the correct position when it stops running.
-	 */
-	update_min_vruntime(minlat_rq);
-}
-
-/*
- * Compute the effective scheduling period for this runqueue.
- *
- * With 1-2 effective tasks, use the base latency_ns (1500us).
- * Beyond that, scale the period up linearly with nr_running
- * (like CFS's __sched_period) so each task still gets at least
- * min_granularity. This keeps slices from shrinking below
- * min_gran at high queue depth, while ensuring the total
- * scheduling round doesn't balloon — queuing delay stays
- * proportional to the actual contention.
- */
-static u64 minlat_sched_period(struct minlat_rq *minlat_rq)
-{
-	unsigned int eff = minlat_rq->nr_running -
-			   min(minlat_rq->nr_running,
-			       minlat_rq->nr_delayed);
-	u64 period = MINLAT_LATENCY_NS;
-
-	/*
-	 * For 3+ effective tasks, period = eff * min_granularity.
-	 * This scales the round-robin cycle linearly with depth
-	 * rather than shrinking slices below the useful floor.
-	 *
-	 * Example at default settings (latency=1500us, min_gran=500us):
-	 *   2 tasks: period=1500us, slice=750us
-	 *   3 tasks: period=1500us, slice=500us (= min_gran)
-	 *   4 tasks: period=2000us, slice=500us
-	 *
-	 * This matches CFS's __sched_period behavior.
-	 */
-	if (eff > MINLAT_LATENCY_NS / MINLAT_MIN_GRANULARITY_NS)
-		period = (u64)eff * MINLAT_MIN_GRANULARITY_NS;
-
-	return period;
-}
-
-/*
- * Compute weight-proportional timeslice for a task.
- * Higher-weight (lower nice) tasks get longer slices.
- * Like CFS's sched_slice().
- */
-static u64 minlat_sched_slice(struct minlat_rq *minlat_rq,
-			      struct sched_minlat_entity *me)
-{
-	u64 slice = minlat_sched_period(minlat_rq);
-
-	if (minlat_rq->load_weight > 0) {
-		slice *= scale_load_down(me->load.weight);
-		slice = div_u64(slice, minlat_rq->load_weight);
-	}
-
-	return max_t(u64, slice, MINLAT_MIN_GRANULARITY_NS);
-}
-
-static void check_preempt_tick_minlat(struct rq *rq, struct task_struct *curr)
-{
-	struct sched_minlat_entity *curr_me = &curr->minlat;
-	struct minlat_rq *minlat_rq = &rq->minlat;
-	u64 ideal_runtime, delta_exec;
-
-	if (minlat_rq->nr_running <= 1)
-		return;
-
-	ideal_runtime = minlat_sched_slice(minlat_rq, curr_me);
-
-	/*
-	 * Minimum running time protection. Don't preempt until the
-	 * task has run for at least min_granularity. Scaled by the
-	 * current task's latency weight (from nice weight table):
-	 *   -20: min_gran ≈ 6us   → clamped to 125us (floor)
-	 *     0: min_gran = 500us → default
-	 *    19: min_gran ≈ 34ms  → clamped to 2ms (ceiling)
-	 */
-	delta_exec = curr->se.sum_exec_runtime -
-		     curr->se.prev_sum_exec_runtime;
-	{
-		u64 min_gran = minlat_latency_thresh(
-					MINLAT_MIN_GRANULARITY_NS,
-					curr_me->latency_wmult);
-		min_gran = clamp_t(u64, min_gran,
-				   MINLAT_MIN_GRANULARITY_NS / 4,
-				   4 * MINLAT_MIN_GRANULARITY_NS);
-		if (delta_exec < min_gran)
-			return;
-	}
-
-	/*
-	 * O(1) preemption check: if curr has exceeded its ideal
-	 * timeslice, request a reschedule. No tree scan needed —
-	 * pick_task_minlat will find the right next entity.
-	 *
-	 * Only preempt if there are non-delayed competitors
-	 * (delayed entities are sleeping and shouldn't cause
-	 * preemption).
-	 */
-	if (minlat_rq->nr_running - minlat_rq->nr_delayed <= 1)
-		return;
-
-	if (delta_exec > ideal_runtime) {
-		unsigned int eff = minlat_rq->nr_running -
-				   minlat_rq->nr_delayed;
-		/*
-		 * Preempt resist: if this task was recently preempted,
-		 * allow it to finish its slice. Hard cap at 2x
-		 * ideal_runtime prevents fairness inversion.
-		 *
-		 * Disabled when:
-		 *  - CPU is contended (3+ effective tasks)
-		 *  - Local LLC has overloaded CPUs — tasks should
-		 *    migrate to idle CPUs in this LLC. Only checks
-		 *    the local LLC: cross-socket migration cost makes
-		 *    remote idle CPUs a poor reason to disable resist
-		 *
-		 * Under these conditions, fast preemption reduces
-		 * tail latency for queued tasks.
-		 */
-		if (eff < 3 &&
-		    !(eff >= 2 &&
-		      sched_minlat_llc_overloaded(cpu_of(rq))) &&
-		    minlat_preempt_resisted(curr_me, rq) &&
-		    delta_exec <= 2 * ideal_runtime)
-			return;
-		curr_me->last_preempt_ts = 0;
-		resched_curr(rq);
-	}
 }
 
 static void
@@ -2100,41 +2237,21 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	 */
 	update_minlat_load_avg(rq, me);
 
-	if (!me->on_rq) {
-		/*
-		 * First enqueue or wakeup from sleep — weight may need
-		 * recalculating (e.g., after fork or nice change while
-		 * sleeping). Once set, weight stays valid until
-		 * prio_changed/switched_to callbacks update it.
-		 */
-		minlat_set_load_weight(p);
-		place_minlat_entity(minlat_rq, me, flags);
-		me->on_rq = 1;
-	} else {
-		/*
-		 * Re-enqueue from migration or sched_move_task.
-		 * Recompute weight and normalize vruntime against
-		 * the (possibly new) rq's min_vruntime.
-		 *
-		 * CFS unconditionally clears se->on_rq in dequeue_entity,
-		 * so live migration always runs through place_entity() on
-		 * the destination rq. Minlat keeps on_rq=1 for non-sleep
-		 * dequeues, so we must explicitly place here to prevent
-		 * unfairness when CPUs have divergent min_vruntimes.
-		 */
-		minlat_set_load_weight(p);
-		place_minlat_entity(minlat_rq, me, flags);
-	}
+	/* Recompute weight on every (re-)enqueue: covers fork, wake from
+	 * long sleep, prio change while sleeping, cgroup move, etc. */
+	minlat_set_load_weight(p);
 
 	/*
 	 * If this task's tg is bandwidth-throttled on this CPU,
-	 * add to the throttle list instead of the rb-tree.
-	 * The task will be re-enqueued when the period timer
-	 * replenishes runtime and unthrottle_cfs_rq fires.
+	 * add to the throttle list instead of either lane. The task
+	 * will be re-enqueued when the period timer replenishes
+	 * runtime and unthrottle_cfs_rq fires.
 	 */
 #ifdef CONFIG_CFS_BANDWIDTH
 	if (minlat_bw_throttled(p, cpu_of(rq))) {
 		me->bw_throttled = 1;
+		me->lane = MINLAT_LANE_BLOCKED;
+		me->on_rq = 1;	/* still considered "queued" by core */
 		list_add_tail(&me->bw_throttled_node,
 			      &minlat_rq->bw_throttled_tasks);
 		minlat_rq->nr_bw_throttled++;
@@ -2143,11 +2260,13 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 #endif
 
 	/*
-	 * Don't insert into the tree if this entity is the currently
-	 * running task (curr is kept out-of-tree while running).
+	 * Insert into the appropriate lane unless the task is currently
+	 * running (curr is kept out-of-lane while on-CPU).
 	 */
 	if (minlat_rq->curr != me)
-		__enqueue_minlat_entity(minlat_rq, me);
+		minlat_lane_enqueue(minlat_rq, me, flags);
+	else
+		me->on_rq = 1;	/* curr stays out-of-lane but is queued */
 
 	minlat_rq->nr_running++;
 	minlat_rq->load_weight += scale_load_down(me->load.weight);
@@ -2228,8 +2347,6 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 #ifdef CONFIG_CFS_BANDWIDTH
 	/* If task is on the bandwidth throttle list, remove it */
 	if (me->bw_throttled) {
-		if (minlat_rq->next == me)
-			minlat_rq->next = NULL;
 		list_del_init(&me->bw_throttled_node);
 		me->bw_throttled = 0;
 		minlat_rq->nr_bw_throttled--;
@@ -2242,14 +2359,13 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 			minlat_util_est_dequeue(rq, p);
 		minlat_util_est_update(rq, p, flags & DEQUEUE_SLEEP);
 		update_minlat_load_avg(rq, me);
-		if (flags & DEQUEUE_SLEEP)
+		if (flags & DEQUEUE_SLEEP) {
 			me->on_rq = 0;
+			me->lane = MINLAT_LANE_BLOCKED;
+		}
 		return true;
 	}
 #endif
-
-	if (minlat_rq->next == me)
-		minlat_rq->next = NULL;
 
 	/*
 	 * Remove task's util_est from rq sum unless the task is being
@@ -2310,7 +2426,7 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 		 *
 		 * Also prevent all-delayed state.
 		 */
-		if (run_ns < max_t(u64, MINLAT_MIN_GRANULARITY_NS,
+		if (run_ns < max_t(u64, minlat_balance_min_gran_ns,
 				   sysctl_sched_base_slice) &&
 		    minlat_rq->nr_running - minlat_rq->nr_delayed > 1 &&
 		    minlat_rq->nr_delayed <
@@ -2330,16 +2446,15 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 
 	if (was_curr) {
 		/*
-		 * Currently running entity is already out of the tree
+		 * Currently running entity is already out of the lane
 		 * (removed by set_next_task). Just clear curr.
 		 */
 		minlat_rq->curr = NULL;
-	} else if (me->on_rq && !RB_EMPTY_NODE(&me->run_node)) {
-		/* Check if this was leftmost before removing */
-		was_leftmost = (rb_first_cached(&minlat_rq->tasks_timeline) ==
-				&me->run_node);
-		__dequeue_minlat_entity(minlat_rq, me);
+	} else {
+		/* Remove from whichever lane the entity is in */
+		minlat_lane_dequeue(minlat_rq, me);
 	}
+	(void)was_leftmost;
 
 	minlat_rq->nr_running--;
 
@@ -2350,7 +2465,7 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 
 	if (flags & DEQUEUE_SLEEP) {
 		me->on_rq = 0;
-		me->last_preempt_ts = 0;
+		me->lane = MINLAT_LANE_BLOCKED;
 		minlat_record_sleep(p, rq);
 	}
 
@@ -2360,10 +2475,6 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	 */
 	if (minlat_rq->nr_running == 0)
 		rq->misfit_task_load = 0;
-
-	/* Only update min_vruntime if the leftmost node changed */
-	if (was_leftmost)
-		update_min_vruntime(minlat_rq);
 
 	/*
 	 * Fix-up what block_task() skipped for delayed dequeue.
@@ -2380,102 +2491,79 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	return true;
 }
 
+/*
+ * Voluntary yield: push self to the back of the regular lane on its
+ * own rq. The colony picker has no vruntime to bump; instead, we
+ * force the lane to REGULAR (graduating from express if needed) and
+ * set lane_enter_ns to a fresh timestamp so the task lands at the
+ * back of the regular FIFO. The actual reinsertion happens in
+ * put_prev_task → minlat_lane_reenter.
+ */
 static void yield_task_minlat(struct rq *rq)
 {
 	struct task_struct *p = rq->donor;
 	struct sched_minlat_entity *me = &p->minlat;
-	struct minlat_rq *minlat_rq = &rq->minlat;
-	struct sched_minlat_entity *next_me;
-	struct rb_node *next;
 
 	update_rq_clock(rq);
 	update_curr_minlat(rq);
 
-	/*
-	 * Current is out of the tree — rb_first_cached returns the
-	 * next competitor directly. Set our vruntime just past it
-	 * so we'll be re-inserted behind it by put_prev_task.
-	 */
-	next = rb_first_cached(&minlat_rq->tasks_timeline);
-	if (next) {
-		next_me = rb_entry(next, struct sched_minlat_entity, run_node);
-		me->vruntime = next_me->vruntime + 1;
-		return;
-	}
-	/* Fallback: no other tasks, minor bump */
-	me->vruntime = minlat_rq->min_vruntime +
-		minlat_calc_delta(MINLAT_LATENCY_NS, me);
+	/* Demote to regular and reset wait clock so we go to the back. */
+	me->lane = MINLAT_LANE_REGULAR;
+	me->lane_enter_ns = sched_clock();
 }
 
 /*
- * Yield to a specific task — used by KVM (sched_yield_to) and
- * sys_sched_yield(SCHED_YIELD_TO). Sets the target as the wakeup
- * buddy so pick_task prefers it, then yields current.
+ * Yield to a specific task (KVM kvm_vcpu_on_spin, sys_sched_yield_to).
+ *
+ * Promote the target into the head of express on its rq by clearing
+ * lane_enter_ns to a sentinel (the colony picker treats this as
+ * "leftmost in any sort"). yield_to_promotion=0 makes this a no-op
+ * for testing.
  */
 static bool yield_to_task_minlat(struct rq *rq, struct task_struct *p)
 {
 	struct sched_minlat_entity *me = &p->minlat;
+	struct minlat_rq *target_rq;
 
 	if (!me->on_rq)
 		return false;
+	if (me->lane != MINLAT_LANE_EXPRESS && me->lane != MINLAT_LANE_REGULAR)
+		return false;
 
-	/*
-	 * Set buddy on p's rq, not the yielding rq.  CFS does this
-	 * via cfs_rq_of(se)->next; we must use task_rq(p) since
-	 * p may be on a different CPU.  Both rqs are double-locked
-	 * by the caller (yield_to in syscalls.c).
-	 */
-	set_next_buddy_minlat(&task_rq(p)->minlat, me);
+	target_rq = &task_rq(p)->minlat;
+
+	if (minlat_yield_to_promotion) {
+		minlat_lane_dequeue(target_rq, me);
+		me->lane = MINLAT_LANE_EXPRESS;
+		me->lane_enter_ns = 0;	/* sentinel: leftmost */
+		INIT_LIST_HEAD(&me->lane_link.express_node);
+		list_add(&me->lane_link.express_node, &target_rq->express_q);
+		target_rq->express_count++;
+	}
 
 	yield_task_minlat(rq);
-
 	return true;
 }
 
 /*
- * Set the wakeup buddy — mirrors CFS set_next_buddy().
+ * Wakeup preemption (colony version).
  *
- * The buddy is a hint to pick_task_minlat() to prefer this entity
- * at the next scheduling decision. Unlike CFS which walks cgroup
- * hierarchy, minlat is flat so we just set the per-rq pointer.
+ * Uniform handling, no eff-based branches. The min_granularity floor
+ * is enforced for ALL wake-driven preemption, restoring the invariant
+ * that classic CFS provided via sysctl_sched_wakeup_granularity and
+ * EEVDF provides via entity_eligible() + RUN_TO_PARITY.
  *
- * Keep an existing buddy if it has a lower vruntime (more claim to
- * run). This mirrors CFS set_preempt_buddy() which keeps an existing
- * buddy with an earlier deadline.
- */
-static __always_inline void
-set_next_buddy_minlat(struct minlat_rq *minlat_rq,
-		      struct sched_minlat_entity *me)
-{
-	if (minlat_rq->next &&
-	    (s64)(me->vruntime - minlat_rq->next->vruntime) > 0)
-		return;
-
-	minlat_rq->next = me;
-}
-
-/*
- * Wakeup preemption — mirrors EEVDF's wakeup_preempt_fair() structure:
- *
- *  1. update_curr — freshen current's vruntime
- *  2. Skip if already rescheduling
- *  3. Skip WF_FORK (forked tasks unlikely to share data)
- *  4. Set wakee as next buddy (like CFS NEXT_BUDDY)
- *  5. WF_SYNC: preempt if wakee has vruntime advantage AND current
- *     ran >= cache_hot threshold (mirrors preempt_sync()).
- *  6. Pick check: preempt if wakee has lower vruntime than current
- *     (analogous to __pick_eevdf() == pse)
- *
- * No min_granularity on the wakeup path — that's for tick preemption
- * only (task_tick). EEVDF similarly separates slice protection
- * (RUN_TO_PARITY) from wakeup preemption.
+ *  1. Foreign-class curr → preempt (minlat outranks fair)
+ *  2. Already-pending resched → no-op
+ *  3. Forked task wake → no-op (WF_FORK)
+ *  4. Curr ran < min_gran → no-op (in-flight protection)
+ *  5. Wakee should preempt curr → resched_curr
  */
 static void
 wakeup_preempt_minlat(struct rq *rq, struct task_struct *p, int flags)
 {
 	struct task_struct *curr = rq->curr;
-	struct minlat_rq *minlat_rq = &rq->minlat;
-	s64 delta;
+	u64 ran, min_gran;
 
 	if (curr->sched_class != &minlat_sched_class) {
 		resched_curr(rq);
@@ -2485,103 +2573,28 @@ wakeup_preempt_minlat(struct rq *rq, struct task_struct *p, int flags)
 	if (test_tsk_need_resched(curr))
 		return;
 
-	/*
-	 * Don't preempt for forked tasks — they are unlikely to
-	 * share data with the parent. Mirrors EEVDF WF_FORK skip.
-	 */
 	if (flags & WF_FORK)
 		return;
 
-	/* Set the wakee as the preferred next task (NEXT_BUDDY) */
-	set_next_buddy_minlat(minlat_rq, &p->minlat);
-
 	/*
-	 * WF_SYNC: waker expects to sleep soon.
-	 *
-	 * For same-CPU: no resched needed — the waker blocks soon,
-	 * schedule() picks the buddy. Avoids extra switches in
-	 * pipe/hackbench where the waker blocks immediately.
-	 *
-	 * For remote-CPU: the wakee is on a different CPU. If the
-	 * wakee has significant vruntime advantage over that CPU's
-	 * current task, use resched_curr for prompt scheduling.
-	 * Small advantages don't justify the IPI cost (the tick
-	 * will handle it). This gives hackbench throughput (senders
-	 * complete all writes before being preempted) while keeping
-	 * schbench latency low (computing workers get preempted).
+	 * Min-granularity floor: any wake-driven preemption requires
+	 * curr to have run for at least latency_wmult-scaled
+	 * minlat_balance_min_gran_ns. Restores the v3 invariant on top
+	 * of the colony picker.
 	 */
-	if (flags & WF_SYNC) {
-		if (task_cpu(p) != smp_processor_id()) {
-			update_curr_minlat_vruntime(rq);
-			delta = (s64)(rq->curr->minlat.vruntime -
-				      p->minlat.vruntime);
-			if (delta > (s64)MINLAT_MIN_GRANULARITY_NS)
-				resched_curr(rq);
-		}
+	ran = curr->se.sum_exec_runtime - curr->se.prev_sum_exec_runtime;
+	min_gran = minlat_latency_thresh(minlat_balance_min_gran_ns,
+					 p->minlat.latency_wmult);
+	if (ran < min_gran)
 		return;
-	}
 
 	/*
-	 * Non-sync: freshen current's vruntime for accurate comparison.
+	 * Past min_gran: the wakee earns a preempt regardless of which
+	 * CPU it's destined for. The picker on the destination rq will
+	 * pick the wakee from its express lane on the next schedule()
+	 * (subject to graduation / overflow).
 	 */
-	update_curr_minlat_vruntime(rq);
-
-	delta = (s64)(curr->minlat.vruntime - p->minlat.vruntime);
-
-	/*
-	 * Preempt if the wakee has a vruntime advantage.
-	 *
-	 * Thresholds scaled by the wakee's latency weight (from nice
-	 * weight table via latency_nice). Uses inverse weight (wmult)
-	 * for division-free hot path:
-	 *   -20 (w=88761): thresh ≈ base/87  → ~12us, always preempt
-	 *     0 (w=1024):  thresh = base     → default behavior
-	 *    19 (w=15):    thresh ≈ base*68  → ~68ms, rarely preempt
-	 *
-	 * Light load (eff ≤ 2): scale min_granularity by wakee weight.
-	 * Heavy load (eff > 2): scale preemption threshold.
-	 */
-	if (delta > 0) {
-		unsigned int eff = minlat_rq->nr_running -
-				   minlat_rq->nr_delayed;
-		u32 wmult = p->minlat.latency_wmult;
-
-		if (eff <= 2) {
-			u64 ran = curr->se.sum_exec_runtime -
-				  curr->se.prev_sum_exec_runtime;
-			u64 min_gran = minlat_latency_thresh(
-					MINLAT_MIN_GRANULARITY_NS,
-					wmult);
-
-			if (ran >= min_gran) {
-				if (minlat_preempt_resisted(&curr->minlat, rq) &&
-				    ran <= 2 * minlat_sched_slice(minlat_rq,
-								  &curr->minlat))
-					return;
-				resched_curr(rq);
-			}
-		} else {
-			u64 thresh = minlat_latency_thresh(
-					minlat_wakeup_preempt_thresh_ns,
-					wmult);
-
-			/*
-			 * At high contention (3+ tasks), halve the
-			 * preemption threshold. The waking task has
-			 * been waiting longer and the cost of delayed
-			 * preemption (queuing latency) outweighs the
-			 * cost of the extra context switch.
-			 */
-			if (eff >= 3)
-				thresh >>= 1;
-
-			if (delta > (s64)thresh) {
-				if (eff >= 3 ||
-				    !minlat_preempt_resisted(&curr->minlat, rq))
-					resched_curr(rq);
-			}
-		}
-	}
+	resched_curr(rq);
 }
 
 /*
@@ -2592,85 +2605,77 @@ wakeup_preempt_minlat(struct rq *rq, struct task_struct *p, int flags)
  * checks vruntime <= avg_vruntime. Since minlat doesn't track
  * avg_vruntime, we use min_vruntime + latency_target as the bound.
  */
-static __always_inline bool
-minlat_buddy_eligible(struct minlat_rq *minlat_rq,
-		      struct sched_minlat_entity *me)
-{
-	return (s64)(me->vruntime - minlat_rq->min_vruntime) <=
-	       (s64)MINLAT_LATENCY_NS;
-}
-
+/*
+ * Colony picker: regime-aware express+regular dispatch.
+ *
+ *   eff = 0  → empty rq, fall through to idle-pull
+ *   eff > 0  → graduate stale express heads, then pick express head
+ *              if any, else regular leftmost (rb_first_cached)
+ *
+ * Lazy graduation sweep happens at the head of express on every pick;
+ * tasks that have sat in express longer than their per-task graduation
+ * interval are demoted to regular before the picker considers them.
+ *
+ * Delayed entities are still in their lane but are skipped over via
+ * the same force-dequeue mechanism the legacy picker used.
+ */
 static struct task_struct *
 pick_task_minlat(struct rq *rq, struct rq_flags *rf)
 {
 	struct minlat_rq *minlat_rq = &rq->minlat;
 	struct sched_minlat_entity *me;
 	struct task_struct *p;
+	u64 now;
 
 	/* Check if current task's tg needs bandwidth throttling */
 	minlat_check_bw_throttle(rq);
 
-	/*
-	 * PICK_BUDDY: prefer the wakeup buddy if it's still queued,
-	 * eligible, and not delayed. Mirrors EEVDF's PICK_BUDDY.
-	 */
-	if (minlat_rq->next &&
-	    !RB_EMPTY_NODE(&minlat_rq->next->run_node) &&
-	    minlat_buddy_eligible(minlat_rq, minlat_rq->next)) {
-		p = container_of(minlat_rq->next, struct task_struct, minlat);
-		if (!p->se.sched_delayed) {
-			me = minlat_rq->next;
-			minlat_rq->next = NULL;
-			return container_of(me, struct task_struct, minlat);
-		}
-	}
-	minlat_rq->next = NULL;
+	now = sched_clock();
+	minlat_graduate_express_head(minlat_rq, now);
 
-	/*
-	 * Pick leftmost non-delayed entity. Force-dequeue any delayed
-	 * entities at the head of the tree instead of scanning past
-	 * them (O(n) scan degrades at high oversubscription).
-	 *
-	 * This mirrors CFS's pick_next_entity approach: pick the best
-	 * candidate, and if it's delayed, force-dequeue it and retry.
-	 * Force-dequeued entities go through full ttwu on wakeup,
-	 * getting a chance to migrate to a less loaded CPU.
-	 */
-	while ((me = __pick_first_minlat_entity(minlat_rq))) {
+	/* Express lane: pick head, skipping delayed entities. */
+	while (!list_empty(&minlat_rq->express_q)) {
+		me = list_first_entry(&minlat_rq->express_q,
+				      struct sched_minlat_entity,
+				      lane_link.express_node);
 		p = container_of(me, struct task_struct, minlat);
 		if (!p->se.sched_delayed)
 			return p;
 		dequeue_task_minlat(rq, p, DEQUEUE_SLEEP | DEQUEUE_DELAYED);
 	}
 
-	/*
-	 * Tree is empty but curr exists out-of-tree — return it.
-	 * If curr is delayed, force-dequeue it.
-	 */
+	/* Regular lane: pick rb_first_cached, skipping delayed entities. */
+	while ((me = minlat_regular_first(minlat_rq))) {
+		p = container_of(me, struct task_struct, minlat);
+		if (!p->se.sched_delayed)
+			return p;
+		dequeue_task_minlat(rq, p, DEQUEUE_SLEEP | DEQUEUE_DELAYED);
+	}
+
+	/* Both lanes empty but curr is still on_rq — return it. */
 	if (minlat_rq->curr && minlat_rq->curr->on_rq) {
 		p = container_of(minlat_rq->curr, struct task_struct, minlat);
 		if (!p->se.sched_delayed)
 			return p;
-
 		dequeue_task_minlat(rq, p, DEQUEUE_SLEEP | DEQUEUE_DELAYED);
 	}
 
 	/*
 	 * No minlat tasks on this CPU. Try idle-pull from a busy CPU.
-	 *
-	 * prev_balance() only calls balance_minlat() when prev's class
-	 * is at or above minlat. When prev is the idle task, balance_minlat
-	 * is never reached, so we must pull here.
-	 *
-	 * Skip the pull if no CPU is overloaded — avoids expensive
-	 * cross-CPU scanning when the system is balanced.
+	 * Skip the pull if no CPU is overloaded.
 	 */
 	if (rf && sched_minlat_llc_overloaded(cpu_of(rq))) {
 		rq_unpin_lock(rq, rf);
 		pull_minlat_task(rq);
 		rq_repin_lock(rq, rf);
 
-		me = __pick_first_minlat_entity(&rq->minlat);
+		if (!list_empty(&minlat_rq->express_q)) {
+			me = list_first_entry(&minlat_rq->express_q,
+					      struct sched_minlat_entity,
+					      lane_link.express_node);
+			return container_of(me, struct task_struct, minlat);
+		}
+		me = minlat_regular_first(minlat_rq);
 		if (me)
 			return container_of(me, struct task_struct, minlat);
 	}
@@ -2684,8 +2689,7 @@ __put_prev_task_minlat(struct rq *rq, struct task_struct *p,
 {
 	struct sched_minlat_entity *me = &p->minlat;
 	struct minlat_rq *minlat_rq = &rq->minlat;
-	struct sched_minlat_entity *leftmost;
-	u64 now, delta_exec, vruntime;
+	u64 now, delta_exec;
 
 	if (unlikely(minlat_rq->curr != me))
 		return;
@@ -2696,11 +2700,10 @@ __put_prev_task_minlat(struct rq *rq, struct task_struct *p,
 	}
 
 	/*
-	 * Combined vruntime + min_vruntime update.
-	 * We know curr is minlat class — skip the class check that
-	 * the standalone update_curr_minlat_vruntime() does.
-	 * Inline min_vruntime update to avoid redundant rq lookup
-	 * and second class check.
+	 * Runtime accounting only — the colony picker has no vruntime,
+	 * so we just charge wall-clock runtime to the task and bandwidth
+	 * accounting. The pick order is determined by lane membership and
+	 * lane_enter_ns, not by accumulated runtime.
 	 */
 	now = rq_clock_task(rq);
 	delta_exec = now - p->se.exec_start;
@@ -2710,23 +2713,15 @@ __put_prev_task_minlat(struct rq *rq, struct task_struct *p,
 		p->se.sum_exec_runtime += delta_exec;
 		account_group_exec_runtime(p, delta_exec);
 		cgroup_account_cputime(p, delta_exec);
-		me->vruntime += minlat_calc_delta(delta_exec, me);
 		minlat_account_bw_runtime(rq, p, delta_exec);
 	}
 
-	/* Inline min_vruntime: curr vruntime is fresh, check leftmost */
-	vruntime = me->vruntime;
-	leftmost = __pick_first_minlat_entity(minlat_rq);
-	if (leftmost)
-		vruntime = min_t(u64, vruntime, leftmost->vruntime);
-	minlat_rq->min_vruntime = max_t(u64, minlat_rq->min_vruntime,
-					vruntime);
-
-	/* Preempt resist: stamp if involuntarily preempted (still runnable) */
-	if (me->on_rq && !p->se.sched_delayed && minlat_preempt_resist_ns)
-		me->last_preempt_ts = now;
-
-	__enqueue_minlat_entity(minlat_rq, me);
+	/*
+	 * Re-enter the appropriate lane at the tail. minlat_lane_reenter
+	 * handles graduation if the task has exceeded its express age.
+	 */
+	if (!p->se.sched_delayed)
+		minlat_lane_reenter(minlat_rq, me);
 	minlat_rq->curr = NULL;
 
 	/* Update PELT: entity stopped running */
@@ -2747,18 +2742,12 @@ __set_next_task_minlat(struct rq *rq, struct task_struct *p, bool first)
 	struct minlat_rq *minlat_rq = &rq->minlat;
 
 	/*
-	 * Remove the entity from the rb-tree. It stays out-of-tree
-	 * while running, avoiding expensive conditional tree
-	 * repositioning in update_curr_minlat(). put_prev_task will
-	 * re-insert it when it stops running.
+	 * Remove the entity from its lane. It stays out-of-lane while
+	 * running; put_prev_task will re-insert it when it stops.
 	 */
-	if (likely(me->on_rq) && likely(!RB_EMPTY_NODE(&me->run_node)))
-		__dequeue_minlat_entity(minlat_rq, me);
-
-	/* Clear buddy — it's been picked or is no longer relevant */
-	if (unlikely(minlat_rq->next == me))
-		minlat_rq->next = NULL;
-
+	if (likely(me->on_rq))
+		minlat_lane_dequeue(minlat_rq, me);
+	me->lane = MINLAT_LANE_RUNNING;
 	minlat_rq->curr = me;
 
 	p->se.exec_start = rq_clock_task(rq);
@@ -3032,9 +3021,6 @@ static int minlat_wake_affine_cpu(struct task_struct *p, int prev_cpu,
 				  int flags)
 {
 	int this_cpu = smp_processor_id();
-
-	if (!minlat_wake_affine)
-		return -1;
 
 	/* Only on wakeup path, not fork/exec */
 	if (!(flags & WF_TTWU))
@@ -3894,13 +3880,35 @@ static int minlat_wake_burst_spread(struct task_struct *p, int cpu)
 static int
 select_task_rq_minlat(struct task_struct *p, int prev_cpu, int flags)
 {
-	int cpu;
+	int cpu = -1;
 
-	/* Wake affinity: sync wakeups go to waker's CPU */
-	cpu = minlat_wake_affine_cpu(p, prev_cpu, flags);
+	/*
+	 * exec(): the task is about to run a new program, so its old
+	 * pheromones are stale (they reflect the previous binary's wake
+	 * patterns). Clear them. This is the adversarial-defense hook
+	 * against pheromone aging staleness across exec boundaries.
+	 */
+	if (flags & WF_EXEC) {
+		memset(p->minlat.pheromone, 0, sizeof(p->minlat.pheromone));
+		p->minlat.pheromone_last_decay_ns = 0;
+	}
 
-	if (flags & WF_TTWU)
+	if (flags & WF_TTWU) {
 		minlat_record_wakee(p);
+		/*
+		 * Colony placement (ant pheromone): record this wake
+		 * event in p's pheromone array, then try colony-driven
+		 * placement. If p has no colony footprint yet (cold
+		 * start), fall through to topology-based selection.
+		 */
+		minlat_record_pheromone(p, current);
+		cpu = minlat_find_colony_cpu(p, prev_cpu);
+		if (cpu >= 0)
+			goto out;
+	}
+
+	/* Wake affinity (cold-start fallback): sync wakeups go to waker */
+	cpu = minlat_wake_affine_cpu(p, prev_cpu, flags);
 	if (cpu >= 0)
 		goto out;
 
@@ -3991,13 +3999,64 @@ static bool minlat_migration_cooldown(struct task_struct *p,
 }
 
 /*
+ * Per-task migratability check shared between the regular and express
+ * lane walks in load balance pull. Returns 1 for "ideal candidate
+ * (NUMA-preferred), use immediately", 0 for "fallback (remember and
+ * keep looking)", -1 for "skip".
+ */
+static int
+minlat_pull_check(struct task_struct *p, struct rq *src_rq, int this_cpu,
+		  bool cross_numa, bool cross_llc, bool dst_idle, int dst_nid,
+		  struct task_struct **fallback_inout)
+{
+	struct sched_minlat_entity *me = &p->minlat;
+
+	if (task_current(src_rq, p))
+		return -1;
+	if (p->se.sched_delayed)
+		return -1;
+	if (is_migration_disabled(p))
+		return -1;
+	if (!cpumask_test_cpu(this_cpu, p->cpus_ptr))
+		return -1;
+	if (!dst_idle && minlat_task_cache_hot(p, src_rq))
+		return -1;
+	if (cross_numa && minlat_migration_cooldown(p, src_rq))
+		return -1;
+	if (cross_llc && minlat_llc_stickiness &&
+	    me->llc_runs < minlat_llc_stickiness &&
+	    cpu_rq(this_cpu)->minlat.nr_running > 0) {
+		struct sched_domain_shared *sds;
+
+		sds = rcu_dereference_sched(per_cpu(sd_llc_shared, src_rq->cpu));
+		if (sds) {
+			int llc_sz = per_cpu(sd_llc_size, src_rq->cpu);
+			int busy = atomic_read(&sds->nr_busy_cpus);
+
+			if (busy < llc_sz)
+				return -1;
+		} else {
+			return -1;
+		}
+	}
+#ifdef CONFIG_NUMA_BALANCING
+	if (p->numa_preferred_nid == dst_nid)
+		return 1;
+	if (!*fallback_inout)
+		*fallback_inout = p;
+	return 0;
+#else
+	(void)dst_nid;
+	*fallback_inout = p;
+	return 1;
+#endif
+}
+
+/*
  * Find the best candidate task to pull from @src_rq to @this_cpu.
- * Walk the rb-tree from the right (highest vruntime = most starved)
- * to find a migratable task.
- *
- * NUMA-aware: among migratable candidates, prefer tasks whose
- * numa_preferred_nid matches the destination node. This pulls tasks
- * toward their memory, complementing page-fault-based NUMA migration.
+ * Walks regular lane (rb_last → rb_first, newest first) then express
+ * lane (tail → head). NUMA-aware: prefer tasks whose
+ * numa_preferred_nid matches the destination node.
  *
  * @cross_numa: true if this is a cross-NUMA pull (enables cooldown checks)
  */
@@ -4009,92 +4068,42 @@ minlat_pick_pullable_task(struct rq *src_rq, int this_cpu, bool cross_numa)
 	struct task_struct *p, *fallback = NULL;
 	int scanned = 0;
 	bool cross_llc = !cpus_share_cache(src_rq->cpu, this_cpu);
-#ifdef CONFIG_NUMA_BALANCING
-	int dst_nid = cpu_to_node(this_cpu);
-#endif
-
-	{
 	bool dst_idle = minlat_cpu_eff(this_cpu) == 0;
 	int max_scan = sched_minlat_llc_overloaded(this_cpu) ? 8 : 4;
-
-	for (node = rb_last(&src_rq->minlat.tasks_timeline.rb_root);
-	     node && scanned < max_scan; node = rb_prev(node), scanned++) {
-		me = rb_entry(node, struct sched_minlat_entity, run_node);
-		p = container_of(me, struct task_struct, minlat);
-
-		if (task_current(src_rq, p))
-			continue;
-
-		/* Skip delayed sleepers — not actually runnable */
-		if (p->se.sched_delayed)
-			continue;
-
-		if (is_migration_disabled(p))
-			continue;
-
-		if (!cpumask_test_cpu(this_cpu, p->cpus_ptr))
-			continue;
-
-		/*
-		 * Cache-hot: skip recently-executed tasks to avoid
-		 * disrupting cache locality on the source CPU.
-		 *
-		 * Waived when the destination is idle — getting
-		 * work to an idle CPU is more important than
-		 * preserving warmth on a busy source. The task's
-		 * cache lines will be cold by the time it runs
-		 * again anyway if it stays queued behind the
-		 * source's current task.
-		 */
-		if (!dst_idle && minlat_task_cache_hot(p, src_rq))
-			continue;
-
-		/* Cross-NUMA cooldown only when source node is saturated */
-		if (cross_numa && minlat_migration_cooldown(p, src_rq))
-			continue;
-
-		/*
-		 * LLC stickiness: don't pull tasks across LLCs until
-		 * they've run enough times on their current LLC.
-		 * Waived when:
-		 *  - destination CPU is idle (idle pull outweighs
-		 *    cache warmth)
-		 *  - source LLC has no idle cores (no cache benefit
-		 *    worth protecting under full contention)
-		 */
-		if (cross_llc && minlat_llc_stickiness &&
-		    me->llc_runs < minlat_llc_stickiness &&
-		    cpu_rq(this_cpu)->minlat.nr_running > 0) {
-			struct sched_domain_shared *sds;
-
-			sds = rcu_dereference_sched(per_cpu(sd_llc_shared,
-							    src_rq->cpu));
-			if (sds) {
-				int llc_sz = per_cpu(sd_llc_size,
-						     src_rq->cpu);
-				int busy = atomic_read(&sds->nr_busy_cpus);
-
-				if (busy < llc_sz)
-					continue; /* src LLC has idle — stay sticky */
-			} else {
-				continue;
-			}
-		}
+	int dst_nid;
 
 #ifdef CONFIG_NUMA_BALANCING
-		/*
-		 * Prefer tasks whose preferred NUMA node matches dst.
-		 * Remember first fallback in case no NUMA match is found.
-		 */
-		if (p->numa_preferred_nid == dst_nid)
-			return p;
-		if (!fallback)
-			fallback = p;
+	dst_nid = cpu_to_node(this_cpu);
 #else
-		return p;
+	dst_nid = 0;
 #endif
+
+	for (node = rb_last(&src_rq->minlat.regular_root.rb_root);
+	     node && scanned < max_scan; node = rb_prev(node), scanned++) {
+		int rc;
+
+		me = rb_entry(node, struct sched_minlat_entity,
+			      lane_link.regular_node);
+		p = container_of(me, struct task_struct, minlat);
+		rc = minlat_pull_check(p, src_rq, this_cpu, cross_numa,
+				       cross_llc, dst_idle, dst_nid, &fallback);
+		if (rc == 1)
+			return p;
 	}
-	} /* end dst_idle scope */
+
+	list_for_each_entry_reverse(me, &src_rq->minlat.express_q,
+				    lane_link.express_node) {
+		int rc;
+
+		if (scanned >= max_scan)
+			break;
+		scanned++;
+		p = container_of(me, struct task_struct, minlat);
+		rc = minlat_pull_check(p, src_rq, this_cpu, cross_numa,
+				       cross_llc, dst_idle, dst_nid, &fallback);
+		if (rc == 1)
+			return p;
+	}
 
 	return fallback;
 }
@@ -4464,20 +4473,29 @@ minlat_pick_pushable_task(struct rq *src_rq, int target_cpu)
 	struct task_struct *p;
 	int scanned = 0;
 
-	for (node = rb_last(&src_rq->minlat.tasks_timeline.rb_root);
+	/* Walk regular lane (newest first), then express */
+	for (node = rb_last(&src_rq->minlat.regular_root.rb_root);
 	     node && scanned < 4; node = rb_prev(node), scanned++) {
-		me = rb_entry(node, struct sched_minlat_entity, run_node);
+		me = rb_entry(node, struct sched_minlat_entity,
+			      lane_link.regular_node);
 		p = container_of(me, struct task_struct, minlat);
 
-		if (p->se.sched_delayed)
+		if (p->se.sched_delayed || is_migration_disabled(p))
 			continue;
-
-		if (is_migration_disabled(p))
-			continue;
-
 		if (!cpumask_test_cpu(target_cpu, p->cpus_ptr))
 			continue;
-
+		return p;
+	}
+	list_for_each_entry_reverse(me, &src_rq->minlat.express_q,
+				    lane_link.express_node) {
+		if (scanned >= 4)
+			break;
+		scanned++;
+		p = container_of(me, struct task_struct, minlat);
+		if (p->se.sched_delayed || is_migration_disabled(p))
+			continue;
+		if (!cpumask_test_cpu(target_cpu, p->cpus_ptr))
+			continue;
 		return p;
 	}
 	return NULL;
@@ -4762,13 +4780,31 @@ minlat_pick_balance_task(struct rq *src_rq, int dst_cpu,
 	bool cross_llc = !cpus_share_cache(src_rq->cpu, dst_cpu);
 	int scanned = 0;
 
-	for (node = rb_last(&src_rq->minlat.tasks_timeline.rb_root);
+	/* Walk regular lane (newest waiter first), then express */
+	for (node = rb_last(&src_rq->minlat.regular_root.rb_root);
 	     node && scanned < 8; node = rb_prev(node), scanned++) {
 		int score;
 
-		me = rb_entry(node, struct sched_minlat_entity, run_node);
+		me = rb_entry(node, struct sched_minlat_entity,
+			      lane_link.regular_node);
 		p = container_of(me, struct task_struct, minlat);
 
+		score = minlat_migration_score(p, src_rq, dst_cpu,
+					       imbalance, cross_llc,
+					       cross_numa);
+		if (score < best_score) {
+			best_score = score;
+			best = p;
+		}
+	}
+	list_for_each_entry_reverse(me, &src_rq->minlat.express_q,
+				    lane_link.express_node) {
+		int score;
+
+		if (scanned >= 8)
+			break;
+		scanned++;
+		p = container_of(me, struct task_struct, minlat);
 		score = minlat_migration_score(p, src_rq, dst_cpu,
 					       imbalance, cross_llc,
 					       cross_numa);
@@ -5076,10 +5112,35 @@ static void minlat_check_balance(struct rq *rq)
 
 /* ==== tick / lifecycle ==== */
 
+/*
+ * Tick-driven preemption: enforce a per-task slice equal to the
+ * graduation interval. After running for that long, the task is
+ * forced off the CPU so the picker can pick whoever is next in lane
+ * order. This is the colony picker's only periodic preemption
+ * mechanism — wake-driven preemption is handled separately by
+ * wakeup_preempt_minlat.
+ */
+static void minlat_check_tick_preempt(struct rq *rq, struct task_struct *p)
+{
+	struct sched_minlat_entity *me = &p->minlat;
+	struct minlat_rq *mr = &rq->minlat;
+	u64 ran, slice;
+
+	if (mr->nr_running - mr->nr_delayed <= 1)
+		return;
+	if (list_empty(&mr->express_q) && RB_EMPTY_ROOT(&mr->regular_root.rb_root))
+		return;
+
+	ran = p->se.sum_exec_runtime - p->se.prev_sum_exec_runtime;
+	slice = minlat_graduation_interval(me);
+	if (ran >= slice)
+		resched_curr(rq);
+}
+
 static void task_tick_minlat(struct rq *rq, struct task_struct *p, int queued)
 {
 	update_curr_minlat(rq);
-	check_preempt_tick_minlat(rq, p);
+	minlat_check_tick_preempt(rq, p);
 
 	/* Fallback tgid_ctx allocation for pre-fork tasks */
 	if (unlikely(!p->minlat.tgid_ctx))
@@ -5295,16 +5356,17 @@ static void prio_changed_minlat(struct rq *rq, struct task_struct *p,
 	minlat_rq->load_weight += scale_load_down(me->load.weight) - old_weight;
 
 	/*
-	 * Requeue: dequeue from rb-tree and re-insert with updated weight.
-	 * Skip if this is the currently running task — it's out of tree.
+	 * Requeue: re-insert into the appropriate lane with the updated
+	 * weight. Skip if this is curr (it's out of any lane while
+	 * running).
 	 */
-	if (minlat_rq->curr != me && !RB_EMPTY_NODE(&me->run_node)) {
-		__dequeue_minlat_entity(minlat_rq, me);
-		__enqueue_minlat_entity(minlat_rq, me);
+	if (minlat_rq->curr != me && me->lane == MINLAT_LANE_REGULAR) {
+		minlat_lane_dequeue(minlat_rq, me);
+		minlat_regular_insert(minlat_rq, me);
 	}
 
 	if (rq->curr == p)
-		check_preempt_tick_minlat(rq, p);
+		minlat_check_tick_preempt(rq, p);
 	else
 		wakeup_preempt_minlat(rq, p, 0);
 }
@@ -5333,10 +5395,10 @@ static void reweight_task_minlat(struct rq *rq, struct task_struct *p,
 	/* Update rq aggregate: remove old, add new */
 	minlat_rq->load_weight += scale_load_down(me->load.weight) - old_weight;
 
-	/* Reposition in rb-tree (skip curr — it's out of tree) */
-	if (minlat_rq->curr != me && !RB_EMPTY_NODE(&me->run_node)) {
-		__dequeue_minlat_entity(minlat_rq, me);
-		__enqueue_minlat_entity(minlat_rq, me);
+	/* Reposition in regular lane (skip curr — out of lane while running) */
+	if (minlat_rq->curr != me && me->lane == MINLAT_LANE_REGULAR) {
+		minlat_lane_dequeue(minlat_rq, me);
+		minlat_regular_insert(minlat_rq, me);
 	}
 }
 
@@ -5373,11 +5435,10 @@ static void switched_from_minlat(struct rq *rq, struct task_struct *p)
 {
 	struct minlat_rq *minlat_rq = &rq->minlat;
 
-	if (minlat_rq->next == &p->minlat)
-		minlat_rq->next = NULL;
 	if (minlat_rq->curr == &p->minlat)
 		minlat_rq->curr = NULL;
 	p->minlat.on_rq = 0;
+	p->minlat.lane = MINLAT_LANE_BLOCKED;
 }
 
 /* ==== runtime toggle ==== */
@@ -5409,23 +5470,28 @@ static void minlat_switch_all(bool to_minlat)
 		update_rq_clock(rq);
 
 		if (!to_minlat) {
-			/* minlat→CFS: drain minlat runqueue */
+			/* minlat→CFS: drain minlat runqueue (both lanes) */
 			while (rq->minlat.nr_running > 0) {
 				struct sched_minlat_entity *me;
 				struct sched_change_ctx *ctx;
 
-				if (rq->minlat.curr)
+				if (rq->minlat.curr) {
 					me = rq->minlat.curr;
-				else {
+				} else if (!list_empty(&rq->minlat.express_q)) {
+					me = list_first_entry(
+						&rq->minlat.express_q,
+						struct sched_minlat_entity,
+						lane_link.express_node);
+				} else {
 					struct rb_node *nd;
 
 					nd = rb_first_cached(
-						&rq->minlat.tasks_timeline);
+						&rq->minlat.regular_root);
 					if (!nd)
 						break;
 					me = rb_entry(nd,
 						struct sched_minlat_entity,
-						run_node);
+						lane_link.regular_node);
 				}
 				p = container_of(me, struct task_struct,
 						 minlat);
@@ -5640,10 +5706,8 @@ static unsigned int get_rr_interval_minlat(struct rq *rq,
 {
 	struct sched_minlat_entity *me = &task->minlat;
 
-	if (!rq->minlat.load_weight)
-		return 0;
-
-	return NS_TO_JIFFIES(minlat_sched_slice(&rq->minlat, me));
+	/* Colony picker uses graduation interval as the per-task slice. */
+	return NS_TO_JIFFIES(minlat_graduation_interval(me));
 }
 
 #ifdef CONFIG_SCHED_CORE

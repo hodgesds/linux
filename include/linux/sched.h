@@ -778,14 +778,39 @@ struct minlat_tgid_ctx {
 	struct rcu_head			rcu;
 };
 
+/*
+ * Pheromone array entry — used by the colony placement layer to track
+ * which other tasks have woken this one. Sorted by strength descending.
+ */
+#define MINLAT_PHEROMONE_FANIN 8
+struct minlat_pheromone {
+	pid_t				waker_tgid;
+	u32				strength;
+};
+
+/*
+ * Lane membership for the colony picker. A task is in exactly one of
+ * these states at any time.
+ */
+enum minlat_lane {
+	MINLAT_LANE_BLOCKED = 0,	/* sleeping or throttled — out of all queues */
+	MINLAT_LANE_EXPRESS,		/* recently woken; FIFO list */
+	MINLAT_LANE_REGULAR,		/* graduated or overflowed; rb-tree */
+	MINLAT_LANE_RUNNING,		/* currently on-CPU; out of queue */
+};
+
 struct sched_minlat_entity {
 	/*
 	 * Cacheline 0: context-switch hot fields.
 	 * put_prev/set_next touch these every switch — keep together.
 	 */
-	struct rb_node			run_node;	/* 24 bytes */
-	u64				vruntime;
-	unsigned int			on_rq;
+	enum minlat_lane		lane;
+	unsigned int			on_rq;	/* mirrors (lane != BLOCKED) */
+	u64				lane_enter_ns;
+	union {
+		struct list_head	express_node;
+		struct rb_node		regular_node;
+	} lane_link;
 	struct load_weight		load;		/* 16 bytes */
 
 	/*
@@ -807,9 +832,6 @@ struct sched_minlat_entity {
 	/* migration stickiness: timestamp of last migration */
 	u64				last_migrate_ts;
 
-	/* preempt resist: timestamp of last involuntary preemption */
-	u64				last_preempt_ts;
-
 	/* SMT-aware interactivity tracking */
 	u64				last_sleep_duration;
 	u64				total_sleep_ns;
@@ -817,18 +839,21 @@ struct sched_minlat_entity {
 	unsigned int			interactive : 1; /* short-burst task */
 
 	/*
-	 * Wake-burst spread: tracked on the WAKER side.
-	 *
-	 * When a task dispatches multiple ttwu wakeups in a tight loop
-	 * (e.g. a message thread waking N workers), the per-wake CPU
-	 * selection is stateless and tends to return the same target
-	 * for each call, piling the burst onto one runqueue. These
-	 * fields let select_task_rq_minlat detect that streak and
-	 * rotate later wakes within the same LLC.
+	 * Wake-burst spread: tracked on the WAKER side. Carried forward
+	 * from minlat-v7 wake-burst-spread; used as admission control on
+	 * top of the colony placement decision.
 	 */
 	int				last_wake_target_cpu;
 	u8				wake_target_streak;
 	u64				last_wake_target_ts;
+
+	/*
+	 * Colony placement: pheromone array recording who has been waking
+	 * this task. Sorted by strength descending. Updated under the
+	 * wakee's pi_lock during select_task_rq_minlat.
+	 */
+	struct minlat_pheromone		pheromone[MINLAT_PHEROMONE_FANIN];
+	u64				pheromone_last_decay_ns;
 
 	/* PELT tracking for task placement and load balancing */
 	struct sched_avg		avg;

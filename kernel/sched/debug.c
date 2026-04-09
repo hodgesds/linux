@@ -637,10 +637,6 @@ static __init int sched_init_debug(void)
 		struct dentry *d_minlat;
 
 		d_minlat = debugfs_create_dir("minlat", debugfs_sched);
-		debugfs_create_u32("latency_ns", 0644, d_minlat,
-				   &minlat_latency_ns);
-		debugfs_create_u32("min_granularity_ns", 0644, d_minlat,
-				   &minlat_min_granularity_ns);
 		debugfs_create_u32("cache_hot_ns", 0644, d_minlat,
 				   &minlat_cache_hot_ns);
 		debugfs_create_u32("numa_imbalance_min", 0644, d_minlat,
@@ -649,10 +645,6 @@ static __init int sched_init_debug(void)
 				   &minlat_migration_cooldown_ns);
 		debugfs_create_u32("numa_saturated_pct", 0644, d_minlat,
 				   &minlat_numa_saturated_pct);
-		debugfs_create_u32("wake_affine", 0644, d_minlat,
-				   &minlat_wake_affine);
-		debugfs_create_u32("wakeup_preempt_thresh_ns", 0644, d_minlat,
-				   &minlat_wakeup_preempt_thresh_ns);
 		debugfs_create_u32("fork_imbalance_pct", 0644, d_minlat,
 				   &minlat_fork_imbalance_pct);
 		debugfs_create_u32("fork_numa_imbalance_pct", 0644, d_minlat,
@@ -663,12 +655,34 @@ static __init int sched_init_debug(void)
 				   &minlat_compute_big_prefer);
 		debugfs_create_u32("llc_stickiness", 0644, d_minlat,
 				   &minlat_llc_stickiness);
-		debugfs_create_u32("preempt_resist_ns", 0644, d_minlat,
-				   &minlat_preempt_resist_ns);
 		debugfs_create_u32("wake_burst_window_ns", 0644, d_minlat,
 				   &minlat_wake_burst_window_ns);
 		debugfs_create_u32("wake_burst_threshold", 0644, d_minlat,
 				   &minlat_wake_burst_threshold);
+
+		/* Colony picker tunables */
+		debugfs_create_u32("graduation_base_ns", 0644, d_minlat,
+				   &minlat_graduation_base_ns);
+		debugfs_create_u32("graduation_min_ns", 0644, d_minlat,
+				   &minlat_graduation_min_ns);
+		debugfs_create_u32("graduation_max_ns", 0644, d_minlat,
+				   &minlat_graduation_max_ns);
+		debugfs_create_u32("balance_min_gran_ns", 0644, d_minlat,
+				   &minlat_balance_min_gran_ns);
+		debugfs_create_u32("express_min_capacity", 0644, d_minlat,
+				   &minlat_express_min_capacity);
+		debugfs_create_u32("express_capacity_pct", 0644, d_minlat,
+				   &minlat_express_capacity_pct);
+		debugfs_create_u32("pheromone_increment", 0644, d_minlat,
+				   &minlat_pheromone_increment);
+		debugfs_create_u32("pheromone_half_life_ns", 0644, d_minlat,
+				   &minlat_pheromone_half_life_ns);
+		debugfs_create_u32("pheromone_use_threshold", 0644, d_minlat,
+				   &minlat_pheromone_use_threshold);
+		debugfs_create_u32("pheromone_replace_threshold", 0644, d_minlat,
+				   &minlat_pheromone_replace_threshold);
+		debugfs_create_u32("yield_to_promotion", 0644, d_minlat,
+				   &minlat_yield_to_promotion);
 
 		{
 			extern const struct file_operations minlat_enabled_fops;
@@ -950,35 +964,35 @@ static void print_minlat_rq(struct seq_file *m, int cpu)
 {
 	struct rq *rq = cpu_rq(cpu);
 	struct minlat_rq *minlat_rq = &rq->minlat;
-	struct rb_node *leftmost;
-	s64 left_vruntime = -1;
 	unsigned long flags;
+	unsigned int express_count = 0;
+	unsigned int regular_count = 0;
 
 	SEQ_printf(m, "\n");
 	SEQ_printf(m, "minlat_rq[%d]:\n", cpu);
 
 	raw_spin_rq_lock_irqsave(rq, flags);
-	leftmost = rb_first_cached(&minlat_rq->tasks_timeline);
-	if (leftmost) {
-		struct sched_minlat_entity *me;
+	express_count = minlat_rq->express_count;
+	{
+		struct rb_node *n;
 
-		me = rb_entry(leftmost, struct sched_minlat_entity, run_node);
-		left_vruntime = me->vruntime;
+		for (n = rb_first_cached(&minlat_rq->regular_root);
+		     n; n = rb_next(n))
+			regular_count++;
 	}
 	raw_spin_rq_unlock_irqrestore(rq, flags);
 
 #define P(x) \
 	SEQ_printf(m, "  .%-30s: %d\n", #x, minlat_rq->x)
-#define Pn(x) \
-	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", #x, SPLIT_NS(minlat_rq->x))
 #define Pl(x) \
 	SEQ_printf(m, "  .%-30s: %lu\n", #x, minlat_rq->x)
 
 	P(nr_running);
 	P(nr_delayed);
-	Pn(min_vruntime);
-	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", "left_vruntime",
-		   SPLIT_NS(left_vruntime));
+	SEQ_printf(m, "  .%-30s: %u\n", "express_count", express_count);
+	SEQ_printf(m, "  .%-30s: %u\n", "regular_count", regular_count);
+	SEQ_printf(m, "  .%-30s: %u\n", "express_capacity",
+		   minlat_rq->express_capacity);
 	Pl(load_weight);
 	SEQ_printf(m, "  .%-30s: %lu\n", "util_avg",
 		   minlat_rq->avg.util_avg);

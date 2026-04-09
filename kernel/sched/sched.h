@@ -1045,12 +1045,20 @@ struct dl_rq {
 #ifdef CONFIG_SCHED_CLASS_MINLAT
 
 struct minlat_rq {
-	struct rb_root_cached	tasks_timeline;
+	/*
+	 * Two-lane picker (colony design):
+	 *  - express_q is a FIFO list of recently-woken tasks
+	 *  - regular_root is an rb-tree sorted by weighted lane_enter_ns
+	 *  - express has bounded capacity; overflow demotes oldest to regular
+	 */
+	struct list_head	express_q;
+	struct rb_root_cached	regular_root;
+	unsigned int		express_count;
+	unsigned int		express_capacity;
+
 	struct sched_minlat_entity *curr;
-	struct sched_minlat_entity *next;	/* wakeup buddy (like CFS next) */
 	unsigned int		nr_running;
 	unsigned int		nr_delayed;	/* delayed entities on this rq */
-	u64			min_vruntime;
 	unsigned long		load_weight;
 	bool			overloaded;
 
@@ -2981,23 +2989,30 @@ static inline bool sched_minlat_runnable(struct rq *rq)
 	return rq->minlat.nr_running > 0;
 }
 
-/* debugfs-tunable load balancer parameters (defined in minlat.c) */
-extern unsigned int minlat_latency_ns;
-extern unsigned int minlat_min_granularity_ns;
+/* debugfs-tunable parameters (defined in minlat.c) */
 extern unsigned int minlat_cache_hot_ns;
 extern unsigned int minlat_numa_imbalance_min;
 extern unsigned int minlat_migration_cooldown_ns;
 extern unsigned int minlat_numa_saturated_pct;
-extern unsigned int minlat_wake_affine;
 extern unsigned int minlat_fork_imbalance_pct;
 extern unsigned int minlat_fork_numa_imbalance_pct;
-extern unsigned int minlat_wakeup_preempt_thresh_ns;
 extern unsigned int minlat_interactive_big_prefer;
 extern unsigned int minlat_compute_big_prefer;
 extern unsigned int minlat_llc_stickiness;
-extern unsigned int minlat_preempt_resist_ns;
 extern unsigned int minlat_wake_burst_window_ns;
 extern unsigned int minlat_wake_burst_threshold;
+/* Colony picker tunables (new in minlat-colony) */
+extern unsigned int minlat_graduation_base_ns;
+extern unsigned int minlat_graduation_min_ns;
+extern unsigned int minlat_graduation_max_ns;
+extern unsigned int minlat_balance_min_gran_ns;
+extern unsigned int minlat_express_min_capacity;
+extern unsigned int minlat_express_capacity_pct;
+extern unsigned int minlat_pheromone_increment;
+extern unsigned int minlat_pheromone_half_life_ns;
+extern unsigned int minlat_pheromone_use_threshold;
+extern unsigned int minlat_pheromone_replace_threshold;
+extern unsigned int minlat_yield_to_promotion;
 #else
 static inline bool sched_minlat_runnable(struct rq *rq)
 {

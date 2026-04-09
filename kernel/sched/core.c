@@ -4439,20 +4439,21 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 #endif
 
 #ifdef CONFIG_SCHED_CLASS_MINLAT
-	RB_CLEAR_NODE(&p->minlat.run_node);
-	p->minlat.vruntime = 0;
+	p->minlat.lane = MINLAT_LANE_BLOCKED;
+	p->minlat.lane_enter_ns = 0;
+	INIT_LIST_HEAD(&p->minlat.lane_link.express_node);
 	p->minlat.minlat_prio = 0;
-	p->minlat.on_rq = 0;
 	p->minlat.tgid_ctx = NULL;
 	p->minlat.prev_llc = -1;
 	p->minlat.last_sleep_duration = 0;
 	p->minlat.total_sleep_ns = 0;
 	p->minlat.total_run_ns = 0;
 	p->minlat.interactive = 0;
-	p->minlat.last_preempt_ts = 0;
 	p->minlat.last_wake_target_cpu = -1;
 	p->minlat.wake_target_streak = 0;
 	p->minlat.last_wake_target_ts = 0;
+	memset(p->minlat.pheromone, 0, sizeof(p->minlat.pheromone));
+	p->minlat.pheromone_last_decay_ns = 0;
 	minlat_init_latency_nice(&p->minlat, p->minlat.latency_nice);
 #ifdef CONFIG_CFS_BANDWIDTH
 	p->minlat.bw_throttled = 0;
@@ -5975,36 +5976,34 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 			struct rb_node *left;
 
 			/*
-			 * Buddy fast path: sync wakeups set a buddy via
-			 * wakeup_preempt. Pick it directly — the buddy
-			 * was just woken (ttwu_runnable cleared its
-			 * delayed flag), so it's always non-delayed.
-			 * Avoids tree traversal entirely for pipe/IPC.
+			 * Express lane fast path (colony picker): pick
+			 * the head of the express FIFO if it's
+			 * non-delayed. Mirrors CFS-fast-path semantics
+			 * for sync wakeups under the colony design.
 			 */
-			me = rq->minlat.next;
-			if (me && !RB_EMPTY_NODE(&me->run_node)) {
+			if (!list_empty(&rq->minlat.express_q)) {
+				me = list_first_entry(&rq->minlat.express_q,
+					struct sched_minlat_entity,
+					lane_link.express_node);
 				p = container_of(me, struct task_struct,
 						 minlat);
 				if (likely(!p->se.sched_delayed)) {
-					rq->minlat.next = NULL;
 					minlat_put_prev_set_next(rq, prev, p);
 					return p;
 				}
+				goto restart;
 			}
 
 			/*
-			 * Tree pick: check leftmost only. If delayed,
-			 * fall to restart — pick_task_minlat will
-			 * force-dequeue it (mirrors CFS approach).
-			 * Avoids O(n) scan that degrades at high
-			 * oversubscription.
+			 * Regular lane: pick rb_first_cached. If
+			 * delayed, fall through to slow path.
 			 */
 			left = rb_first_cached(
-					&rq->minlat.tasks_timeline);
+					&rq->minlat.regular_root);
 			if (left) {
 				me = rb_entry(left,
 					struct sched_minlat_entity,
-					run_node);
+					lane_link.regular_node);
 				p = container_of(me,
 					struct task_struct, minlat);
 				if (likely(!p->se.sched_delayed)) {
