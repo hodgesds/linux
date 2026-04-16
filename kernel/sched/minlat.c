@@ -87,10 +87,10 @@ unsigned int minlat_wake_burst_threshold = 4;
  * express_capacity_pct:  capacity as a percentage of effective queue depth
  *                        (eff = nr_running - nr_delayed)
  */
-unsigned int minlat_graduation_base_ns	= 1500 * NSEC_PER_USEC;
+unsigned int minlat_graduation_base_ns	= 750 * NSEC_PER_USEC;
 unsigned int minlat_graduation_min_ns	= 250 * NSEC_PER_USEC;
 unsigned int minlat_graduation_max_ns	= 16 * NSEC_PER_MSEC;
-unsigned int minlat_balance_min_gran_ns	= 500 * NSEC_PER_USEC;
+unsigned int minlat_balance_min_gran_ns	= 250 * NSEC_PER_USEC;
 unsigned int minlat_express_min_capacity = 1;
 unsigned int minlat_express_capacity_pct = 50;
 
@@ -114,7 +114,7 @@ unsigned int minlat_pheromone_replace_threshold = 128;
  * head of express on its rq (strong "you should run next" semantics for
  * KVM's kvm_vcpu_on_spin); 0 = soft hint only.
  */
-unsigned int minlat_yield_to_promotion = 1;
+unsigned int minlat_yield_to_promotion = 0;
 
 /*
  * Latency nice: weight-based scaling helpers.
@@ -2531,10 +2531,11 @@ static void yield_task_minlat(struct rq *rq)
 /*
  * Yield to a specific task (KVM kvm_vcpu_on_spin, sys_sched_yield_to).
  *
- * Promote the target into the head of express on its rq by clearing
- * lane_enter_ns to a sentinel (the colony picker treats this as
- * "leftmost in any sort"). yield_to_promotion=0 makes this a no-op
- * for testing.
+ * Promote the target into the head of express on its rq. The entity
+ * is placed at the list head (list_add, not list_add_tail) so it is
+ * picked first; lane_enter_ns is set to now so the graduation sweep
+ * does not immediately evict it. yield_to_promotion=0 makes this a
+ * no-op for testing.
  */
 static bool yield_to_task_minlat(struct rq *rq, struct task_struct *p)
 {
@@ -2551,7 +2552,7 @@ static bool yield_to_task_minlat(struct rq *rq, struct task_struct *p)
 	if (minlat_yield_to_promotion) {
 		minlat_lane_dequeue(target_rq, me);
 		me->lane = MINLAT_LANE_EXPRESS;
-		me->lane_enter_ns = 0;	/* sentinel: leftmost */
+		me->lane_enter_ns = sched_clock();
 		INIT_LIST_HEAD(&me->lane_link.express_node);
 		list_add(&me->lane_link.express_node, &target_rq->express_q);
 		target_rq->express_count++;
