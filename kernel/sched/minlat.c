@@ -113,8 +113,15 @@ unsigned int minlat_pheromone_replace_threshold = 128;
  * yield_to_promotion: 1 = yield_to_task_minlat moves the target into the
  * head of express on its rq (strong "you should run next" semantics for
  * KVM's kvm_vcpu_on_spin); 0 = soft hint only.
+ *
+ * yield_promote_cooldown_ns: minimum wall-clock gap between two head-inserts
+ * into the same rq's express lane. Caps PLE-storm amplification where many
+ * yielders head-insert different targets into the same victim rq and each
+ * promotion evicts the prior one. Once this cooldown would be violated the
+ * promotion degrades to a plain yield_task (soft hint).
  */
-unsigned int minlat_yield_to_promotion = 0;
+unsigned int minlat_yield_to_promotion		= 0;
+unsigned int minlat_yield_promote_cooldown_ns	= 250 * NSEC_PER_USEC;
 
 /*
  * Latency nice: weight-based scaling helpers.
@@ -2175,6 +2182,7 @@ void init_minlat_rq(struct minlat_rq *minlat_rq)
 	minlat_rq->regular_root = RB_ROOT_CACHED;
 	minlat_rq->express_count = 0;
 	minlat_rq->express_capacity = 1;	/* recomputed on enqueue */
+	minlat_rq->last_yield_promote_ns = 0;
 	minlat_rq->curr = NULL;
 	minlat_rq->nr_running = 0;
 	minlat_rq->nr_delayed = 0;
@@ -2533,14 +2541,28 @@ static void yield_task_minlat(struct rq *rq)
  *
  * Promote the target into the head of express on its rq. The entity
  * is placed at the list head (list_add, not list_add_tail) so it is
- * picked first; lane_enter_ns is set to now so the graduation sweep
- * does not immediately evict it. yield_to_promotion=0 makes this a
- * no-op for testing.
+ * picked first. yield_to_promotion=0 makes this a no-op for testing.
+ *
+ * Two safety valves guard against PLE-storm amplification:
+ *
+ *  1. Per-rq cooldown: at most one head-insert every
+ *     minlat_yield_promote_cooldown_ns. Further yield_to()s degrade to
+ *     a plain yield on the caller. Prevents N yielders from
+ *     ping-ponging different victims through the same target's head.
+ *
+ *  2. Bounded express stay: lane_enter_ns is back-dated so the entry
+ *     graduates to regular within ~minlat_balance_min_gran_ns even if
+ *     it isn't picked (e.g. target rq is still running something
+ *     higher-prio). Stops stale head-inserts from pinning express.
+ *
+ * express_capacity is refreshed so a REGULAR->EXPRESS move does not
+ * leave the rq over capacity until the next natural enqueue.
  */
 static bool yield_to_task_minlat(struct rq *rq, struct task_struct *p)
 {
 	struct sched_minlat_entity *me = &p->minlat;
 	struct minlat_rq *target_rq;
+	u64 now, g_interval, back_date;
 
 	if (!me->on_rq)
 		return false;
@@ -2548,14 +2570,30 @@ static bool yield_to_task_minlat(struct rq *rq, struct task_struct *p)
 		return false;
 
 	target_rq = &task_rq(p)->minlat;
+	now = sched_clock();
 
-	if (minlat_yield_to_promotion) {
+	if (minlat_yield_to_promotion &&
+	    (s64)(now - target_rq->last_yield_promote_ns) >=
+		    (s64)minlat_yield_promote_cooldown_ns) {
 		minlat_lane_dequeue(target_rq, me);
+
+		/*
+		 * Back-date lane_enter_ns so the entry is still "young enough"
+		 * to pass the graduation sweep on the next pick, but graduates
+		 * within one min_gran window if the pick is deferred.
+		 */
+		g_interval = minlat_graduation_interval(me);
+		back_date = g_interval > minlat_balance_min_gran_ns ?
+			    g_interval - minlat_balance_min_gran_ns : 0;
 		me->lane = MINLAT_LANE_EXPRESS;
-		me->lane_enter_ns = sched_clock();
+		me->lane_enter_ns = now - min_t(u64, back_date, now);
+
 		INIT_LIST_HEAD(&me->lane_link.express_node);
 		list_add(&me->lane_link.express_node, &target_rq->express_q);
 		target_rq->express_count++;
+		target_rq->express_capacity =
+			minlat_express_capacity_calc(minlat_eff(target_rq));
+		target_rq->last_yield_promote_ns = now;
 	}
 
 	yield_task_minlat(rq);

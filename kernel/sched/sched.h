@@ -1055,6 +1055,9 @@ struct minlat_rq {
 	unsigned int		express_count;
 	unsigned int		express_capacity;
 
+	/* Per-rq cooldown for yield_to_task head-inserts (PLE-storm guard). */
+	u64			last_yield_promote_ns;
+
 	struct sched_minlat_entity *curr;
 	unsigned int		nr_running;
 	unsigned int		nr_delayed;	/* delayed entities on this rq */
@@ -3012,6 +3015,7 @@ extern unsigned int minlat_pheromone_half_life_ns;
 extern unsigned int minlat_pheromone_use_threshold;
 extern unsigned int minlat_pheromone_replace_threshold;
 extern unsigned int minlat_yield_to_promotion;
+extern unsigned int minlat_yield_promote_cooldown_ns;
 #else
 static inline bool sched_minlat_runnable(struct rq *rq)
 {

@@ -683,6 +683,8 @@ static __init int sched_init_debug(void)
 				   &minlat_pheromone_replace_threshold);
 		debugfs_create_u32("yield_to_promotion", 0644, d_minlat,
 				   &minlat_yield_to_promotion);
+		debugfs_create_u32("yield_promote_cooldown_ns", 0644, d_minlat,
+				   &minlat_yield_promote_cooldown_ns);
 
 		{
 			extern const struct file_operations minlat_enabled_fops;
