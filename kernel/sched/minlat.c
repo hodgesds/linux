@@ -2143,7 +2143,7 @@ static int minlat_find_colony_cpu(struct task_struct *p, int prev_cpu)
 		sd = rcu_dereference(per_cpu(sd_llc, colony_cpus[i]));
 		if (!sd)
 			continue;
-		for_each_cpu(cpu, sched_domain_span(sd)) {
+		for_each_cpu_wrap(cpu, sched_domain_span(sd), colony_cpus[i]) {
 			struct minlat_rq *mr;
 			unsigned int e;
 
@@ -2332,7 +2332,8 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 		if (sd) {
 			int cpu;
 
-			for_each_cpu(cpu, sched_domain_span(sd)) {
+			for_each_cpu_wrap(cpu, sched_domain_span(sd),
+					  this_cpu + 1) {
 				if (cpu == this_cpu)
 					continue;
 				if (idle_cpu(cpu)) {
@@ -3599,7 +3600,8 @@ select_task_rq_minlat_fork(struct task_struct *p, int prev_cpu)
 			int remote_idle_big = -1;
 			unsigned long remote_big_cap = 0;
 
-			for_each_cpu(cpu, sched_domain_span(rand_sd)) {
+			for_each_cpu_wrap(cpu, sched_domain_span(rand_sd),
+					  rand_cpu) {
 				unsigned int nr;
 
 				if (!cpumask_test_cpu(cpu, allowed))
@@ -4220,7 +4222,7 @@ minlat_find_busiest_rq(struct rq *this_rq, const struct cpumask *mask,
 	unsigned int best_nr = min_nr;
 	int cpu;
 
-	for_each_cpu(cpu, mask) {
+	for_each_cpu_wrap(cpu, mask, this_rq->cpu + 1) {
 		struct rq *rq;
 
 		if (cpu == this_rq->cpu)
@@ -4249,7 +4251,7 @@ minlat_find_misfit_rq(struct rq *this_rq, const struct cpumask *mask)
 	unsigned long this_cap = arch_scale_cpu_capacity(this_rq->cpu);
 	int cpu;
 
-	for_each_cpu(cpu, mask) {
+	for_each_cpu_wrap(cpu, mask, this_rq->cpu + 1) {
 		struct rq *rq;
 
 		if (cpu == this_rq->cpu)
@@ -4316,7 +4318,7 @@ minlat_pick_random_llc_rq(struct rq *this_rq, const struct cpumask *numa_span)
 			return cpu_rq(rand_cpu)->minlat.nr_running > 1 ?
 				cpu_rq(rand_cpu) : NULL;
 
-		for_each_cpu(cpu, sched_domain_span(rand_sd)) {
+		for_each_cpu_wrap(cpu, sched_domain_span(rand_sd), rand_cpu) {
 			struct rq *rq = cpu_rq(cpu);
 
 			if (cpu == this_rq->cpu)
@@ -4937,7 +4939,7 @@ minlat_find_busiest_rq_weight(struct rq *this_rq, const struct cpumask *span)
 	unsigned long busiest_load = minlat_cpu_load(this_rq->cpu);
 	int cpu;
 
-	for_each_cpu(cpu, span) {
+	for_each_cpu_wrap(cpu, span, this_rq->cpu + 1) {
 		unsigned long load;
 
 		if (cpu == this_rq->cpu)
@@ -5062,7 +5064,7 @@ static void minlat_active_balance_push(struct rq *rq)
 	for_each_domain(this_cpu, sd) {
 		int cpu;
 
-		for_each_cpu(cpu, sched_domain_span(sd)) {
+		for_each_cpu_wrap(cpu, sched_domain_span(sd), this_cpu + 1) {
 			if (cpu == this_cpu)
 				continue;
 			if (idle_cpu(cpu)) {
