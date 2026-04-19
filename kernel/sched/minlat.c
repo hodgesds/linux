@@ -194,6 +194,66 @@ static inline unsigned long minlat_capacity_of(int cpu)
  * exponential smoothing on decrease (w=1/4), matching CFS behavior.
  */
 
+/*
+ * Counter-underflow tripwires: decrement only when non-zero and WARN once
+ * if the caller asks to go below zero.  Used for per-rq counters that
+ * previously wrapped silently under inconsistent accounting (nr_delayed,
+ * nr_bw_throttled, express_count, load_weight).  panic_on_warn=1 turns
+ * the WARN into a full traceback, which identifies the bad decrement
+ * path without having to instrument every caller by hand.
+ */
+#define minlat_dec_clamped(field)					\
+	do {								\
+		if (WARN_ON_ONCE((field) == 0))				\
+			break;						\
+		(field)--;						\
+	} while (0)
+
+#define minlat_sub_clamped(field, sub)					\
+	do {								\
+		typeof(field) _sub = (sub);				\
+		if (WARN_ON_ONCE((field) < _sub))			\
+			(field) = 0;					\
+		else							\
+			(field) -= _sub;				\
+	} while (0)
+
+/*
+ * Validate minlat_rq->curr against staleness.  Returns the entity if
+ * consistent with an active minlat curr; returns NULL and self-heals
+ * the field otherwise.  A stale curr happens when a dequeue, class
+ * switch, or task_dead path fails to NULL the pointer; if the picker
+ * or bw_throttle code then follows it, it dereferences a task that
+ * is no longer minlat's (or has been freed).  panic_on_warn=1 turns
+ * the tripwire into a traceback identifying the caller that missed
+ * the clear.
+ *
+ * Only call this at sites that dereference curr (read task fields,
+ * pass into throttle helpers, etc.).  Plain equality reads (curr ==
+ * me, curr != me) are safe against a stale pointer and should not
+ * use this wrapper to avoid the overhead on the hot path.
+ */
+static __always_inline struct sched_minlat_entity *
+minlat_curr_checked(struct minlat_rq *mr)
+{
+	struct sched_minlat_entity *me = mr->curr;
+	struct task_struct *p;
+
+	if (!me)
+		return NULL;
+
+	p = container_of(me, struct task_struct, minlat);
+	if (WARN_ON_ONCE(p->sched_class != &minlat_sched_class)) {
+		mr->curr = NULL;
+		return NULL;
+	}
+	if (WARN_ON_ONCE(!me->on_rq)) {
+		mr->curr = NULL;
+		return NULL;
+	}
+	return me;
+}
+
 /* UTIL_EST: uses shared helpers from sched.h (__util_est_{enqueue,dequeue,update}) */
 
 static inline unsigned long minlat_task_util_est(struct task_struct *p)
@@ -1212,6 +1272,25 @@ static void minlat_ensure_tgid_ctx(struct task_struct *p, gfp_t gfp)
 			minlat_tgid_ctx_get(ctx);
 			atomic_inc(&ctx->nr_tasks);
 			me->tgid_ctx = ctx;
+
+			/*
+			 * Re-check PF_EXITING after the cmpxchg.  The leader
+			 * may have entered do_exit() between the earlier
+			 * PF_EXITING test and our publish; in that window
+			 * task_dead_minlat has no reference to this ctx and
+			 * will never drop the leader's ref we just added.
+			 * If it's exiting now, retract the publish atomically
+			 * and drop that ref.  Safe even if another racer is
+			 * now installing its own ctx — the cmpxchg only
+			 * retracts when the current publish is still ours.
+			 */
+			if (READ_ONCE(leader->flags) & PF_EXITING) {
+				if (cmpxchg(&leader->minlat.tgid_ctx,
+					    ctx, NULL) == ctx) {
+					atomic_dec(&ctx->nr_tasks);
+					minlat_tgid_ctx_put(ctx);
+				}
+			}
 		} else if (refcount_inc_not_zero(&existing->refcount)) {
 			/* Lost: adopt the winner's ctx */
 			minlat_tgid_ctx_put(ctx);
@@ -1493,8 +1572,9 @@ static void __minlat_bw_throttle_one(struct rq *rq, struct task_struct *p,
 	minlat_rq->nr_bw_throttled++;
 	minlat_rq->nr_running--;
 	if (p->se.sched_delayed)
-		minlat_rq->nr_delayed--;
-	minlat_rq->load_weight -= scale_load_down(me->load.weight);
+		minlat_dec_clamped(minlat_rq->nr_delayed);
+	minlat_sub_clamped(minlat_rq->load_weight,
+			   scale_load_down(me->load.weight));
 	sub_nr_running(rq, 1);
 }
 
@@ -1561,10 +1641,14 @@ static void minlat_throttle_tg_cpu(struct rq *rq, struct task_group *tg)
 	}
 
 	/* Also throttle curr if it belongs to this tg or descendant */
-	if (minlat_rq->curr) {
-		p = container_of(minlat_rq->curr, struct task_struct, minlat);
-		if (minlat_tg_is_descendant(task_group(p), tg))
-			__minlat_bw_throttle_one(rq, p, minlat_rq->curr, true);
+	{
+		struct sched_minlat_entity *cur = minlat_curr_checked(minlat_rq);
+
+		if (cur) {
+			p = container_of(cur, struct task_struct, minlat);
+			if (minlat_tg_is_descendant(task_group(p), tg))
+				__minlat_bw_throttle_one(rq, p, cur, true);
+		}
 	}
 
 	if (minlat_rq->nr_running - minlat_rq->nr_delayed < 2)
@@ -1611,7 +1695,7 @@ void minlat_unthrottle_bw(struct rq *rq, struct task_group *tg)
 
 		list_del_init(&me->bw_throttled_node);
 		me->bw_throttled = 0;
-		minlat_rq->nr_bw_throttled--;
+		minlat_dec_clamped(minlat_rq->nr_bw_throttled);
 
 		/* Re-enqueue into the regular lane (not a fresh wake) */
 		me->lane_enter_ns = sched_clock();
@@ -1867,7 +1951,7 @@ minlat_demote_express_to_regular(struct minlat_rq *mr,
 				 struct sched_minlat_entity *me)
 {
 	list_del_init(&me->lane_link.express_node);
-	mr->express_count--;
+	minlat_dec_clamped(mr->express_count);
 	me->lane = MINLAT_LANE_REGULAR;
 	minlat_regular_insert(mr, me);
 }
@@ -1956,8 +2040,7 @@ minlat_lane_dequeue(struct minlat_rq *mr, struct sched_minlat_entity *me)
 	case MINLAT_LANE_EXPRESS:
 		if (!list_empty(&me->lane_link.express_node)) {
 			list_del_init(&me->lane_link.express_node);
-			if (mr->express_count)
-				mr->express_count--;
+			minlat_dec_clamped(mr->express_count);
 		}
 		break;
 	case MINLAT_LANE_REGULAR:
@@ -2243,7 +2326,30 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	if (flags & ENQUEUE_DELAYED) {
 		WARN_ON_ONCE(!p->se.sched_delayed);
 		p->se.sched_delayed = 0;
-		minlat_rq->nr_delayed--;
+#ifdef CONFIG_CFS_BANDWIDTH
+		if (me->bw_throttled) {
+			/*
+			 * A delayed curr that was bw-throttled via
+			 * minlat_check_bw_throttle() had its nr_delayed
+			 * accounting already retired in
+			 * __minlat_bw_throttle_one().  The task now lives on
+			 * bw_throttled_tasks; ttwu_runnable() still took the
+			 * ENQUEUE_DELAYED path because p->on_rq and
+			 * p->se.sched_delayed both stayed set across the
+			 * throttle.  Decrementing nr_delayed again here would
+			 * underflow the counter, making minlat_eff() return
+			 * zero and the picker treat the rq as empty while
+			 * queued work piles up on bw_throttled_tasks ---
+			 * exactly the silent-wedge signature we hit under
+			 * cgroup cpu.max limits.  ttwu_do_wakeup() will flip
+			 * p->__state to TASK_RUNNING; the task stays parked
+			 * until minlat_unthrottle_bw() lands it back in a
+			 * lane on the next cfs_b period.
+			 */
+			return;
+		}
+#endif
+		minlat_dec_clamped(minlat_rq->nr_delayed);
 		return;
 	}
 
@@ -2350,13 +2456,16 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 			 * rq lock. That creates an AB-BA deadlock if the
 			 * remote CPU is simultaneously trying to lock our rq.
 			 *
-			 * Defer via irq_work: the callback runs on this CPU
-			 * after rq_unlock (when IRQs are re-enabled) and can
-			 * safely call resched_cpu() which sets TIF_NEED_RESCHED
-			 * on the target and sends the IPI.
+			 * Defer via irq_work.  Pin to this_cpu (the rq owner)
+			 * so that a remote enqueue (e.g. migration path that
+			 * holds this rq's lock from a different CPU) doesn't
+			 * schedule the callback on the wrong CPU and leave
+			 * the kick stranded there across a hotplug flush.
+			 * The callback on this_cpu then calls resched_cpu()
+			 * which takes the target rq lock internally.
 			 */
 			WRITE_ONCE(minlat_rq->kick_cpu, kick_cpu);
-			irq_work_queue(&minlat_rq->kick_work);
+			irq_work_queue_on(&minlat_rq->kick_work, this_cpu);
 		}
 	}
 }
@@ -2374,7 +2483,7 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	if (me->bw_throttled) {
 		list_del_init(&me->bw_throttled_node);
 		me->bw_throttled = 0;
-		minlat_rq->nr_bw_throttled--;
+		minlat_dec_clamped(minlat_rq->nr_bw_throttled);
 		/*
 		 * util_est was added at enqueue time (before the throttle
 		 * check). Remove it here to prevent permanent inflation
@@ -2388,6 +2497,14 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 			me->on_rq = 0;
 			me->lane = MINLAT_LANE_BLOCKED;
 		}
+		/*
+		 * Clear delayed state on dequeue of a bw-throttled task.  At
+		 * throttle time nr_delayed was already decremented for a
+		 * delayed task, so the counter is balanced here; the flag
+		 * must not be carried across migration or the destination's
+		 * first pick would force-dequeue and underflow nr_delayed.
+		 */
+		p->se.sched_delayed = 0;
 		return true;
 	}
 #endif
@@ -2463,10 +2580,26 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 		}
 	}
 
-	/* Clear delayed flag on force-dequeue */
-	if (flags & DEQUEUE_DELAYED) {
+	/*
+	 * Clear delayed state on any real dequeue.  nr_delayed counts
+	 * entities that currently sit in this rq's lanes with
+	 * sched_delayed=1; once the task is removed from the rq (force-
+	 * dequeue, migration via move_queued_task, CPU hotplug, affinity
+	 * change, cgroup move) it must be cleared here so the counter
+	 * stays in sync with reality.
+	 *
+	 * Without this, a delayed task migrated via DEQUEUE_NOCLOCK leaks
+	 * an increment on the source rq and, on first pick at the
+	 * destination, the force-dequeue path decrements an unincremented
+	 * counter — wrapping nr_delayed to UINT_MAX.  Once wrapped,
+	 * minlat_eff() returns 0 and balance gates like
+	 * (nr_running <= nr_delayed) freeze the rq: tasks remain queued
+	 * but the picker + load balancer treat the rq as empty, so CPUs
+	 * go idle and userspace starves silently.
+	 */
+	if (p->se.sched_delayed) {
 		p->se.sched_delayed = 0;
-		minlat_rq->nr_delayed--;
+		minlat_dec_clamped(minlat_rq->nr_delayed);
 	}
 
 	if (was_curr) {
@@ -2485,7 +2618,8 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 
 	if (minlat_rq->nr_running - minlat_rq->nr_delayed < 2)
 		minlat_clear_overloaded(rq);
-	minlat_rq->load_weight -= scale_load_down(me->load.weight);
+	minlat_sub_clamped(minlat_rq->load_weight,
+			   scale_load_down(me->load.weight));
 	sub_nr_running(rq, 1);
 
 	if (flags & DEQUEUE_SLEEP) {
@@ -2717,8 +2851,9 @@ pick_task_minlat(struct rq *rq, struct rq_flags *rf)
 	}
 
 	/* Both lanes empty but curr is still on_rq — return it. */
-	if (minlat_rq->curr && minlat_rq->curr->on_rq) {
-		p = container_of(minlat_rq->curr, struct task_struct, minlat);
+	me = minlat_curr_checked(minlat_rq);
+	if (me) {
+		p = container_of(me, struct task_struct, minlat);
 		if (!p->se.sched_delayed)
 			return p;
 		dequeue_task_minlat(rq, p, DEQUEUE_SLEEP | DEQUEUE_DELAYED);
@@ -5258,6 +5393,16 @@ static void task_dead_minlat(struct task_struct *p)
 	struct minlat_tgid_ctx *ctx = p->minlat.tgid_ctx;
 
 	/*
+	 * Staleness tripwire: if we reach here with rq->minlat.curr still
+	 * pointing at this task, some dequeue path left it behind.  The
+	 * fast path in __pick_next_task reads curr and returns a task
+	 * from it when lanes are empty, which would dereference freed
+	 * memory after do_task_dead() → free_task().
+	 */
+	if (WARN_ON_ONCE(rq->minlat.curr == &p->minlat))
+		rq->minlat.curr = NULL;
+
+	/*
 	 * Subtract the dead task's PELT contribution from the rq
 	 * aggregate. The rq signal tracks entity contributions, so
 	 * removing the dead entity's values keeps the signal accurate.
@@ -5491,7 +5636,24 @@ static void switching_from_minlat(struct rq *rq, struct task_struct *p)
 {
 	if (p->se.sched_delayed) {
 		p->se.sched_delayed = 0;
-		rq->minlat.nr_delayed--;
+		minlat_dec_clamped(rq->minlat.nr_delayed);
+#ifdef CONFIG_PSI
+		/*
+		 * A delayed task came off CPU with both TSK_ONCPU and
+		 * TSK_RUNNING cleared by psi_task_switch(sleep=true).
+		 * Clearing sched_delayed above promotes it to a normal
+		 * runnable task for the next class, but sched_change_begin
+		 * and sched_change_end run with DEQUEUE_SAVE | ENQUEUE_RESTORE,
+		 * which make psi_dequeue() and psi_enqueue() short-circuit.
+		 * Without this, psi_flags stays at 0 across the drain; the
+		 * first pick on the new class sets TSK_ONCPU only, and the
+		 * next sleep trips psi_flags_change()'s "inconsistent task
+		 * state" error because it tries to clear ONCPU|RUNNING from
+		 * a task whose only set bit is ONCPU.
+		 */
+		if (!(p->psi_flags & TSK_RUNNING))
+			psi_task_change(p, 0, TSK_RUNNING);
+#endif
 	}
 }
 
@@ -5547,8 +5709,9 @@ static void minlat_switch_all(bool to_minlat)
 				struct sched_minlat_entity *me;
 				struct sched_change_ctx *ctx;
 
-				if (rq->minlat.curr) {
-					me = rq->minlat.curr;
+				me = minlat_curr_checked(&rq->minlat);
+				if (me) {
+					/* validated curr */
 				} else if (!list_empty(&rq->minlat.express_q)) {
 					me = list_first_entry(
 						&rq->minlat.express_q,
@@ -5621,7 +5784,16 @@ static void minlat_switch_all(bool to_minlat)
 	 * up after Phase 1 processed its CPU and gets enqueued on the
 	 * old class's runqueue — Phase 2 must properly dequeue/enqueue
 	 * such tasks rather than just changing the class pointer.
+	 *
+	 * The outer rcu_read_lock() pins thread-group list nodes so that
+	 * dropping tasklist_lock to call task_rq_lock() is safe: a
+	 * concurrent release_task() cannot free the list linkage of g,
+	 * p, or any sibling thread while we hold RCU.  Without this,
+	 * resuming iteration after the tasklist_lock drop could walk
+	 * into freed memory and OOPS silently (no WARN, no splat) if
+	 * the oopsing CPU also holds the console lock.
 	 */
+	rcu_read_lock();
 	read_lock(&tasklist_lock);
 	for_each_process_thread(g, p) {
 		const struct sched_class *from_class = to_minlat ?
@@ -5684,6 +5856,7 @@ static void minlat_switch_all(bool to_minlat)
 		put_task_struct(p);
 	}
 	read_unlock(&tasklist_lock);
+	rcu_read_unlock();
 }
 
 static ssize_t minlat_enabled_write(struct file *file,
