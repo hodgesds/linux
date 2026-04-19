@@ -4441,11 +4441,14 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 
 #ifdef CONFIG_SCHED_CLASS_MINLAT
 	p->minlat.lane = MINLAT_LANE_BLOCKED;
+	p->minlat.on_rq = 0;
 	p->minlat.lane_enter_ns = 0;
 	INIT_LIST_HEAD(&p->minlat.lane_link.express_node);
+	p->minlat.llc_runs = 0;
 	p->minlat.minlat_prio = 0;
 	p->minlat.tgid_ctx = NULL;
 	p->minlat.prev_llc = -1;
+	p->minlat.last_migrate_ts = 0;
 	p->minlat.last_sleep_duration = 0;
 	p->minlat.total_sleep_ns = 0;
 	p->minlat.total_run_ns = 0;
@@ -4455,6 +4458,17 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 	p->minlat.last_wake_target_ts = 0;
 	memset(p->minlat.pheromone, 0, sizeof(p->minlat.pheromone));
 	p->minlat.pheromone_last_decay_ns = 0;
+	/*
+	 * PELT state must start from zero — dup_task_struct copied the
+	 * parent's sched_avg (last_update_time, util/load/runnable avg
+	 * and their sums, util_est).  update_minlat_se_load_avg treats
+	 * last_update_time == 0 as "sync to current rq clock", so the
+	 * first enqueue initializes cleanly.  Without this, the child
+	 * inherits the parent's PELT history and task_dead_minlat later
+	 * lsub_positive-subtracts a signal that was never added to this
+	 * rq's aggregates.
+	 */
+	memset(&p->minlat.avg, 0, sizeof(p->minlat.avg));
 	minlat_init_latency_nice(&p->minlat, p->minlat.latency_nice);
 #ifdef CONFIG_CFS_BANDWIDTH
 	p->minlat.bw_throttled = 0;
