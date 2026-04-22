@@ -220,6 +220,33 @@ static inline unsigned long minlat_capacity_of(int cpu)
 	} while (0)
 
 /*
+ * Clear p->se.sched_delayed on a queued task while preserving the
+ * nr_delayed accounting invariant set by __minlat_bw_throttle_one().
+ *
+ * At bw-throttle time nr_delayed is retired for any task whose
+ * sched_delayed flag was set, but the flag itself is kept so the
+ * unthrottle path (minlat_unthrottle_bw) can restore lane-side delayed
+ * state if the task never woke during the throttled interval.
+ * Subsequent clears of the flag (ENQUEUE_DELAYED wake, class switch)
+ * must therefore skip the decrement for a still-throttled task or they
+ * double-retire the slot and pull nr_delayed below the true lane-side
+ * delayed count.  Once that happens, (nr_running - nr_delayed) balance
+ * gates flip toward "rq empty" and the picker silently wedges.
+ */
+static inline void
+minlat_clear_sched_delayed(struct task_struct *p, struct minlat_rq *mrq)
+{
+	if (!p->se.sched_delayed)
+		return;
+	p->se.sched_delayed = 0;
+#ifdef CONFIG_CFS_BANDWIDTH
+	if (p->minlat.bw_throttled)
+		return;
+#endif
+	minlat_dec_clamped(mrq->nr_delayed);
+}
+
+/*
  * Validate minlat_rq->curr against staleness.  Returns the entity if
  * consistent with an active minlat curr; returns NULL and self-heals
  * the field otherwise.  A stale curr happens when a dequeue, class
@@ -2317,31 +2344,18 @@ enqueue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	 */
 	if (flags & ENQUEUE_DELAYED) {
 		WARN_ON_ONCE(!p->se.sched_delayed);
-		p->se.sched_delayed = 0;
-#ifdef CONFIG_CFS_BANDWIDTH
-		if (me->bw_throttled) {
-			/*
-			 * A delayed curr that was bw-throttled via
-			 * minlat_check_bw_throttle() had its nr_delayed
-			 * accounting already retired in
-			 * __minlat_bw_throttle_one().  The task now lives on
-			 * bw_throttled_tasks; ttwu_runnable() still took the
-			 * ENQUEUE_DELAYED path because p->on_rq and
-			 * p->se.sched_delayed both stayed set across the
-			 * throttle.  Decrementing nr_delayed again here would
-			 * underflow the counter, making minlat_eff() return
-			 * zero and the picker treat the rq as empty while
-			 * queued work piles up on bw_throttled_tasks ---
-			 * exactly the silent-wedge signature we hit under
-			 * cgroup cpu.max limits.  ttwu_do_wakeup() will flip
-			 * p->__state to TASK_RUNNING; the task stays parked
-			 * until minlat_unthrottle_bw() lands it back in a
-			 * lane on the next cfs_b period.
-			 */
-			return;
-		}
-#endif
-		minlat_dec_clamped(minlat_rq->nr_delayed);
+		/*
+		 * For a bw-throttled task the ENQUEUE_DELAYED path is
+		 * reached from ttwu_runnable() because p->on_rq and
+		 * sched_delayed both stayed set across the throttle; the
+		 * task still lives on bw_throttled_tasks and will re-enter
+		 * a lane on the next cfs_b period via minlat_unthrottle_bw.
+		 * The helper clears the flag but skips the nr_delayed
+		 * decrement because __minlat_bw_throttle_one() already
+		 * retired that slot.  ttwu_do_wakeup() flips p->__state to
+		 * TASK_RUNNING; the task stays parked until unthrottle.
+		 */
+		minlat_clear_sched_delayed(p, minlat_rq);
 		return;
 	}
 
@@ -2580,19 +2594,13 @@ dequeue_task_minlat(struct rq *rq, struct task_struct *p, int flags)
 	 * change, cgroup move) it must be cleared here so the counter
 	 * stays in sync with reality.
 	 *
-	 * Without this, a delayed task migrated via DEQUEUE_NOCLOCK leaks
-	 * an increment on the source rq and, on first pick at the
-	 * destination, the force-dequeue path decrements an unincremented
-	 * counter — wrapping nr_delayed to UINT_MAX.  Once wrapped,
-	 * minlat_eff() returns 0 and balance gates like
-	 * (nr_running <= nr_delayed) freeze the rq: tasks remain queued
-	 * but the picker + load balancer treat the rq as empty, so CPUs
-	 * go idle and userspace starves silently.
+	 * Uses the helper so the bw-throttle invariant is honoured too:
+	 * the bw_throttled early return above is the only way a
+	 * bw-throttled task reaches dequeue here, so the branch in the
+	 * helper is dead on this path, but using the helper keeps the
+	 * rule in one place for future readers.
 	 */
-	if (p->se.sched_delayed) {
-		p->se.sched_delayed = 0;
-		minlat_dec_clamped(minlat_rq->nr_delayed);
-	}
+	minlat_clear_sched_delayed(p, minlat_rq);
 
 	if (was_curr) {
 		/*
@@ -5540,6 +5548,26 @@ static void migrate_task_rq_minlat(struct task_struct *p, int new_cpu)
 
 static void switched_to_minlat(struct rq *rq, struct task_struct *p)
 {
+	/*
+	 * Re-sync the entity's PELT clock on class attach.  Fork already
+	 * zeroes p->minlat.avg in __sched_fork() and cross-CPU migration
+	 * resets in migrate_task_rq_minlat(); same-CPU class change via
+	 * sched_setattr() reaches neither path, so without this the next
+	 * update_minlat_se_load_avg() would apply a delta against a stale
+	 * last_update_time carried over from a previous minlat stint.
+	 *
+	 * Set the clock to rq_clock_pelt(rq) (not zero) so the first
+	 * update computes a proper zero-delta from "attach-time onward"
+	 * and starts accumulating legitimately.  The zero-sentinel path
+	 * in update_minlat_se_load_avg would instead skip accumulating
+	 * the first interval, which matters when the attach races with
+	 * put_prev_task on a task that is about to lose the CPU.
+	 *
+	 * CFS handles the analogous case in attach_entity_cfs_rq() ->
+	 * attach_entity_load_avg().
+	 */
+	p->minlat.avg.last_update_time = rq_clock_pelt(rq);
+
 	if (task_on_rq_queued(p)) {
 		minlat_set_load_weight(p);
 		if (rq->curr != p)
@@ -5626,10 +5654,23 @@ static void reweight_task_minlat(struct rq *rq, struct task_struct *p,
  */
 static void switching_from_minlat(struct rq *rq, struct task_struct *p)
 {
-	if (p->se.sched_delayed) {
-		p->se.sched_delayed = 0;
-		minlat_dec_clamped(rq->minlat.nr_delayed);
+	bool was_delayed = p->se.sched_delayed;
+
+	/*
+	 * Use minlat_clear_sched_delayed() so a bw-throttled task whose
+	 * sched_delayed flag was carried across the throttle does not
+	 * double-retire its nr_delayed slot on the class-switch path
+	 * (__minlat_bw_throttle_one() already retired it at throttle
+	 * time).  Before this guard existed the decrement here and the
+	 * throttle-time decrement combined to pull nr_delayed below the
+	 * true lane-side delayed count, tripping (nr_running - nr_delayed)
+	 * balance gates toward "rq empty" and producing the reported
+	 * silent-wedge signature under cgroup cpu.max limits.
+	 */
+	minlat_clear_sched_delayed(p, &rq->minlat);
+
 #ifdef CONFIG_PSI
+	if (was_delayed) {
 		/*
 		 * A delayed task came off CPU with both TSK_ONCPU and
 		 * TSK_RUNNING cleared by psi_task_switch(sleep=true).
@@ -5645,8 +5686,8 @@ static void switching_from_minlat(struct rq *rq, struct task_struct *p)
 		 */
 		if (!(p->psi_flags & TSK_RUNNING))
 			psi_task_change(p, 0, TSK_RUNNING);
-#endif
 	}
+#endif
 }
 
 /*
@@ -5697,6 +5738,48 @@ static void minlat_switch_all(bool to_minlat)
 
 		if (!to_minlat) {
 			/* minlat→CFS: drain minlat runqueue (both lanes) */
+
+#ifdef CONFIG_CFS_BANDWIDTH
+			/*
+			 * Drain bw_throttled_tasks first while rq_lock is
+			 * already held.  These tasks are not in any lane
+			 * and are not counted in rq->minlat.nr_running, so
+			 * the lane-drain loop below cannot reach them.
+			 * Handling them here consolidates all minlat-state
+			 * cleanup into Phase 1 and makes "no minlat state
+			 * lingers on this rq after Phase 1" a local
+			 * invariant Phase 2 can rely on.
+			 *
+			 * Each sched_change_begin(DEQUEUE_CLASS) drives
+			 * dequeue_task_minlat's bw_throttled early-return,
+			 * which list_del_inits the node, clears
+			 * me->bw_throttled, decrements nr_bw_throttled, and
+			 * clears sched_delayed via switching_from_minlat ->
+			 * minlat_clear_sched_delayed (which honours the
+			 * "bw_throttle already retired the nr_delayed slot"
+			 * invariant).  The subsequent enqueue_task_fair
+			 * lands the task in CFS; if its cfs_rq is still
+			 * throttled, CFS's own throttle path parks it.
+			 */
+			{
+				struct sched_minlat_entity *me, *tmp_me;
+
+				list_for_each_entry_safe(me, tmp_me,
+						&rq->minlat.bw_throttled_tasks,
+						bw_throttled_node) {
+					struct sched_change_ctx *ctx;
+
+					p = container_of(me, struct task_struct,
+							 minlat);
+					ctx = sched_change_begin(p,
+						DEQUEUE_SAVE | DEQUEUE_NOCLOCK |
+						DEQUEUE_CLASS | ENQUEUE_CLASS);
+					p->sched_class = &fair_sched_class;
+					sched_change_end(ctx);
+				}
+			}
+#endif
+
 			while (rq->minlat.nr_running > 0) {
 				struct sched_minlat_entity *me;
 				struct sched_change_ctx *ctx;
@@ -5714,8 +5797,30 @@ static void minlat_switch_all(bool to_minlat)
 
 					nd = rb_first_cached(
 						&rq->minlat.regular_root);
-					if (!nd)
+					if (!nd) {
+						/*
+						 * nr_running says this rq has
+						 * minlat work but neither curr
+						 * nor either lane contains an
+						 * entity.  This is the silent-
+						 * wedge failure signature:
+						 * counter drifted above the
+						 * true lane content, picker /
+						 * balance gates see
+						 * (nr_running - nr_delayed)
+						 * > 0 and chase work that
+						 * isn't reachable.
+						 *
+						 * Trip WARN_ON_ONCE so
+						 * panic_on_warn=1 produces a
+						 * traceback instead of
+						 * breaking silently and
+						 * leaving the rq in the
+						 * divergent state.
+						 */
+						WARN_ON_ONCE(rq->minlat.nr_running);
 						break;
+					}
 					me = rb_entry(nd,
 						struct sched_minlat_entity,
 						lane_link.regular_node);
@@ -5729,6 +5834,27 @@ static void minlat_switch_all(bool to_minlat)
 				p->sched_class = &fair_sched_class;
 				sched_change_end(ctx);
 			}
+
+			/*
+			 * Post-drain invariant: no minlat state may linger
+			 * on this rq.  Any WARN here indicates an accounting
+			 * bug in the per-entity enqueue/dequeue paths (the
+			 * counters and containers disagreed before the drain
+			 * started, or a drain iteration failed to update
+			 * one of them).  Fires once per boot; panic_on_warn=1
+			 * turns it into a traceback naming the offending
+			 * bookkeeping site.
+			 */
+			WARN_ON_ONCE(rq->minlat.nr_running);
+			WARN_ON_ONCE(rq->minlat.curr);
+			WARN_ON_ONCE(!list_empty(&rq->minlat.express_q));
+			WARN_ON_ONCE(!RB_EMPTY_ROOT(
+				&rq->minlat.regular_root.rb_root));
+#ifdef CONFIG_CFS_BANDWIDTH
+			WARN_ON_ONCE(!list_empty(
+				&rq->minlat.bw_throttled_tasks));
+			WARN_ON_ONCE(rq->minlat.nr_bw_throttled);
+#endif
 		} else {
 			/* CFS→minlat: drain CFS tasks on this rq */
 			struct sched_entity *se, *se_tmp;
