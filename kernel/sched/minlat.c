@@ -517,14 +517,28 @@ struct energy_env {
 };
 
 static DEFINE_PER_CPU(cpumask_var_t, minlat_eas_mask);
+static bool minlat_eas_ready __read_mostly;
 
 void __init minlat_eas_init(void)
 {
 	int i;
 
-	for_each_possible_cpu(i)
-		zalloc_cpumask_var_node(&per_cpu(minlat_eas_mask, i),
-					GFP_KERNEL, cpu_to_node(i));
+	for_each_possible_cpu(i) {
+		if (!zalloc_cpumask_var_node(&per_cpu(minlat_eas_mask, i),
+					     GFP_KERNEL, cpu_to_node(i))) {
+			int j;
+
+			pr_warn("minlat: EAS mask alloc failed on cpu %d, disabling minlat EAS path\n",
+				i);
+			for_each_possible_cpu(j) {
+				if (j == i)
+					break;
+				free_cpumask_var(per_cpu(minlat_eas_mask, j));
+			}
+			return;
+		}
+	}
+	minlat_eas_ready = true;
 }
 
 /*
@@ -755,7 +769,7 @@ static void minlat_check_update_overutilized(struct rq *rq)
 static int
 find_energy_efficient_cpu_minlat(struct task_struct *p, int prev_cpu)
 {
-	struct cpumask *cpus = this_cpu_cpumask_var_ptr(minlat_eas_mask);
+	struct cpumask *cpus;
 	unsigned long prev_delta = ULONG_MAX, best_delta = ULONG_MAX;
 	unsigned long p_util_min = uclamp_is_used() ?
 		uclamp_eff_value(p, UCLAMP_MIN) : 0;
@@ -769,6 +783,11 @@ find_energy_efficient_cpu_minlat(struct task_struct *p, int prev_cpu)
 	struct sched_domain *sd;
 	struct perf_domain *pd;
 	struct energy_env eenv;
+
+	if (!READ_ONCE(minlat_eas_ready))
+		return -1;
+
+	cpus = this_cpu_cpumask_var_ptr(minlat_eas_mask);
 
 	rcu_read_lock();
 	pd = rcu_dereference(rd->pd);
