@@ -1358,6 +1358,12 @@ const char * const vmstat_text[] = {
 	[I(NUMA_HINT_FAULTS_LOCAL)]		= "numa_hint_faults_local",
 	[I(NUMA_PAGE_MIGRATE)]			= "numa_pages_migrated",
 #endif
+#ifdef CONFIG_NUMA_PAGE_REPLICATE
+	[I(NUMA_REPLICA_CREATED)]		= "numa_replica_created",
+	[I(NUMA_REPLICA_DROPPED)]		= "numa_replica_dropped",
+	[I(NUMA_REPLICA_HIT)]			= "numa_replica_hit",
+	[I(NUMA_REPLICA_MISS)]			= "numa_replica_miss",
+#endif
 #ifdef CONFIG_MIGRATION
 	[I(PGMIGRATE_SUCCESS)]			= "pgmigrate_success",
 	[I(PGMIGRATE_FAIL)]			= "pgmigrate_fail",
