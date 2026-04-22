@@ -703,6 +703,7 @@ config KSM
 config NUMA_PAGE_REPLICATE
 	bool "NUMA page replication for read-only pages"
 	depends on NUMA && 64BIT && MMU
+	depends on !ALPHA && !MIPS && !PARISC && !XTENSA
 	help
 	  Allow read-only file-backed pages (shared library text and rodata)
 	  to be replicated across NUMA nodes.  Each CPU maps the NUMA-local
