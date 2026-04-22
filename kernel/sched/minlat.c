@@ -17,6 +17,7 @@
 
 #include "sched.h"
 #include "pelt.h"
+#include "minlat.h"
 #include <linux/sched/clock.h>
 #include <linux/sched/cputime.h>
 #include <linux/sched/signal.h>
@@ -1835,15 +1836,6 @@ static void minlat_kick_idle_func(struct irq_work *work)
 }
 
 /* ==== colony picker helpers ==== */
-
-/*
- * Effective queue depth for picker decisions: total runnable tasks
- * minus tasks in delayed-dequeue state (sleeping but kept on rq).
- */
-static __always_inline unsigned int minlat_eff(struct minlat_rq *mr)
-{
-	return mr->nr_running - min(mr->nr_running, mr->nr_delayed);
-}
 
 /*
  * Express lane capacity. Tunable percentage of eff, with a hard floor.

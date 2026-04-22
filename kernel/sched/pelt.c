@@ -24,6 +24,9 @@
  *  Author: Vincent Guittot <vincent.guittot@linaro.org>
  */
 #include "pelt.h"
+#ifdef CONFIG_SCHED_CLASS_MINLAT
+#include "minlat.h"
+#endif
 
 /*
  * Approximate:
@@ -407,9 +410,17 @@ int update_minlat_rq_load_avg(u64 now, struct rq *rq, int running)
 {
 	struct minlat_rq *mrq = &rq->minlat;
 
+	/*
+	 * Runnable term excludes sched_delayed entities (minlat_eff()),
+	 * matching CFS's h_nr_runnable semantics and the rest of minlat.
+	 * Passing raw mrq->nr_running here would inflate runnable_avg by
+	 * the delayed-entity count until natural PELT decay and push
+	 * schedutil toward a higher OPP on an rq that is actually
+	 * idle-with-delayed-tasks.
+	 */
 	if (___update_load_sum(now, &mrq->avg,
 				scale_load_down(mrq->load_weight),
-				mrq->nr_running,
+				minlat_eff(mrq),
 				running)) {
 
 		___update_load_avg(&mrq->avg, 1);
