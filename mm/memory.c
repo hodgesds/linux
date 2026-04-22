@@ -44,6 +44,7 @@
 #include <linux/mm_inline.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/numa_balancing.h>
+#include <linux/numa_replicate.h>
 #include <linux/sched/task.h>
 #include <linux/hugetlb.h>
 #include <linux/mman.h>
@@ -5558,9 +5559,11 @@ vm_fault_t finish_fault(struct vm_fault *vmf)
 	struct vm_area_struct *vma = vmf->vma;
 	struct page *page;
 	struct folio *folio;
+	struct numa_replica_ctx replica_ctx = { };
 	vm_fault_t ret;
 	bool is_cow = (vmf->flags & FAULT_FLAG_WRITE) &&
 		      !(vma->vm_flags & VM_SHARED);
+	bool try_replica;
 	int type, nr_pages;
 	unsigned long addr;
 	bool needs_fallback = false;
@@ -5643,10 +5646,26 @@ fallback:
 		}
 	}
 
+	/*
+	 * Prepare replica before acquiring PTL to avoid page allocation
+	 * and memcpy under the page table spinlock.
+	 *
+	 * Note: prepared_replica and old_replica are initialized above
+	 * the fallback label.  This is safe because the fallback path
+	 * only triggers for nr_pages > 1 (where try_replica is false),
+	 * so no replica is ever prepared before a goto fallback.
+	 */
+	try_replica = !is_cow && nr_pages == 1 &&
+		      (vma->vm_flags & VM_NUMA_REPLICATE);
+	if (try_replica)
+		replica_ctx.prepared = numa_replica_prepare(vma, folio, vmf->pgoff);
+
 	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
 				       addr, &vmf->ptl);
-	if (!vmf->pte)
-		return VM_FAULT_NOPAGE;
+	if (!vmf->pte) {
+		ret = VM_FAULT_NOPAGE;
+		goto out_put_replica;
+	}
 
 	/* Re-check under ptl */
 	if (nr_pages == 1 && unlikely(vmf_pte_changed(vmf))) {
@@ -5660,6 +5679,29 @@ fallback:
 	}
 
 	folio_ref_add(folio, nr_pages - 1);
+
+	/* Install prepared replica under PTL (xa_store only, no alloc) */
+	if (replica_ctx.prepared) {
+		struct folio *replica = numa_replica_install(vma,
+							    replica_ctx.prepared,
+							    vmf->pgoff,
+							    &replica_ctx.old);
+		if (replica) {
+			/*
+			 * Replica has two refs: one from allocation in
+			 * numa_replica_prepare() (for the PTE, consumed
+			 * by set_pte_range via folio_add_file_rmap_ptes),
+			 * one from folio_get in numa_replica_install()
+			 * (for the XArray, dropped on erase).
+			 * Drop the canonical's ref since we map the replica.
+			 */
+			folio_put(folio);
+			folio = replica;
+			page = &replica->page;
+			replica_ctx.prepared = NULL; /* consumed */
+		}
+	}
+
 	set_pte_range(vmf, folio, page, nr_pages, addr);
 	type = is_cow ? MM_ANONPAGES : mm_counter_file(folio);
 	add_mm_counter(vma->vm_mm, type, nr_pages);
@@ -5667,6 +5709,14 @@ fallback:
 
 unlock:
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
+out_put_replica:
+	/* Discard unused prepared replica */
+	numa_replica_discard_prepared(replica_ctx.prepared);
+	/*
+	 * Clean up replaced replica after releasing PTL --
+	 * replica_unmap_and_free() sleeps.
+	 */
+	numa_replica_cleanup_old(replica_ctx.old);
 	return ret;
 }
 
