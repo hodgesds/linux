@@ -303,6 +303,366 @@ struct folio *numa_replica_lookup(struct numa_replica_tree *nrt,
 
 	return folio;
 }
+static bool check_node_replica_limit(int nid)
+{
+	if (!sysctl_numa_replicate_max_per_node)
+		return true;
+	return atomic_long_read(&node_nr_replicas[nid]) <
+	       (long)sysctl_numa_replicate_max_per_node;
+}
+
+/*
+ * Skip replica creation when the target node is below the high watermark.
+ * This prevents a thrash loop where the shrinker reclaims replicas that
+ * are immediately re-created on the next fault.
+ */
+static bool node_has_memory_headroom(int nid)
+{
+	pg_data_t *pgdat = NODE_DATA(nid);
+	struct zone *zone;
+	enum zone_type zidx = gfp_zone(GFP_NOWAIT);
+
+	zone = &pgdat->node_zones[zidx];
+	if (!managed_zone(zone))
+		return true;
+
+	return zone_watermark_ok(zone, 0, high_wmark_pages(zone), zidx, 0);
+}
+
+/*
+ * Phase 1: Allocate and copy a replica folio (before PTL).
+ *
+ * Allocates a folio on the local NUMA node, copies data from the
+ * canonical folio, sets FOLIO_MAPPING_REPLICA, and configures mapping/index for
+ * rmap compatibility.  The folio is NOT inserted into the XArray yet.
+ *
+ * Returns the prepared folio with one reference, or NULL.
+ * On failure, falls back gracefully to the canonical folio.
+ *
+ * Caller must later call either numa_replica_install() under PTL to
+ * insert it, or numa_replica_discard_prepared() to discard it.
+ */
+struct folio *numa_replica_prepare(struct vm_area_struct *vma,
+				   struct folio *canonical, pgoff_t pgoff)
+{
+	struct address_space *mapping;
+	struct numa_replica_tree *nrt;
+	struct folio *replica;
+	void *src, *dst;
+	int local_nid;
+
+	if (!sysctl_numa_replicate_enabled || num_online_nodes() < 2)
+		return NULL;
+
+	/*
+	 * Replicas are only created for order-0 folios.  If khugepaged
+	 * later collapses small folios into a large folio via
+	 * collapse_file(), stale replica XArray entries may persist
+	 * until the shrinker walks the tree and frees them.  The data
+	 * remains correct since the file content is unchanged.  After
+	 * collapse, subsequent faults on the large folio will not
+	 * create new replicas, so replication for that range is
+	 * silently lost.
+	 */
+	if (folio_test_large(canonical) || folio_test_dirty(canonical))
+		return NULL;
+
+	local_nid = numa_node_id();
+
+	if (folio_nid(canonical) == local_nid)
+		return NULL;
+
+	mapping = vma->vm_file->f_mapping;
+
+	if (mapping_exiting(mapping))
+		return NULL;
+
+	nrt = numa_replica_tree_for_mapping(mapping);
+	if (!nrt)
+		return NULL;
+
+	/*
+	 * If a replica already exists, skip preparation.  Do not return
+	 * the existing folio -- it could be concurrently invalidated
+	 * (mapping cleared) between here and
+	 * numa_replica_install(), creating a zombie folio.  The canonical
+	 * folio is mapped for this fault; the existing replica serves
+	 * future faults from this node.
+	 */
+	replica = numa_replica_lookup(nrt, pgoff, local_nid);
+	if (replica) {
+		count_vm_event(NUMA_REPLICA_HIT);
+		trace_numa_replica_hit(pgoff, local_nid);
+		folio_put(replica);
+		return NULL;
+	}
+	count_vm_event(NUMA_REPLICA_MISS);
+
+	if (!check_node_replica_limit(local_nid))
+		return NULL;
+
+	if (!node_has_memory_headroom(local_nid))
+		return NULL;
+
+	replica = __folio_alloc_node(GFP_NOWAIT | __GFP_NOWARN, 0, local_nid);
+	if (!replica)
+		return NULL;
+
+	/* Charge replica to the current task's memcg */
+	if (mem_cgroup_charge(replica, current->mm, GFP_NOWAIT)) {
+		folio_put(replica);
+		return NULL;
+	}
+
+	/*
+	 * Re-check canonical->mapping: if the folio was truncated between
+	 * the caller's lookup and here, mapping may be NULL.  A replica
+	 * with NULL mapping cannot be unmapped via try_to_unmap() later.
+	 */
+	if (!canonical->mapping) {
+		folio_put(replica);
+		return NULL;
+	}
+
+	src = kmap_local_folio(canonical, 0);
+	dst = kmap_local_folio(replica, 0);
+	memcpy(dst, src, PAGE_SIZE);
+	kunmap_local(dst);
+	kunmap_local(src);
+
+	/*
+	 * Set replica's mapping/index so rmap (try_to_unmap) can find VMAs
+	 * via i_mmap when the shrinker or invalidation path unmaps this folio.
+	 *
+	 * FOLIO_MAPPING_REPLICA (bit 2) is OR'd into the mapping pointer so
+	 * folio_mapping() returns NULL for replicas, preserving the invariant
+	 * that folio_mapping() != NULL means "in the page cache."  Code that
+	 * needs the real address_space (e.g. rmap_walk) uses folio_raw_mapping()
+	 * which strips the flag bits.
+	 *
+	 * Replicas are NOT added to the LRU.  Reclaim is handled exclusively
+	 * through the custom shrinker.
+	 */
+	replica->mapping = (struct address_space *)
+		((unsigned long)canonical->mapping | FOLIO_MAPPING_REPLICA);
+	replica->index = pgoff;
+
+	return replica;
+}
+
+/*
+ * Phase 2: Install a prepared replica into the XArray (under PTL).
+ *
+ * This is the only path that calls xa_store() on the replica XArray.
+ * Returns the replica folio on success (caller should map it), or NULL
+ * on failure (caller should discard the prepared folio).
+ *
+ * @old_out: receives any replaced old replica for deferred cleanup.
+ *           Caller MUST call numa_replica_cleanup_old() after releasing
+ *           PTL -- replica_unmap_and_free() sleeps.
+ */
+struct folio *numa_replica_install(struct vm_area_struct *vma,
+				   struct folio *prepared, pgoff_t pgoff,
+				   struct folio **old_out)
+{
+	struct address_space *mapping = vma->vm_file->f_mapping;
+	struct numa_replica_tree *nrt;
+	unsigned long key;
+	int nid;
+	void *old;
+
+	*old_out = NULL;
+
+	nrt = numa_replica_tree_for_mapping(mapping);
+	if (!nrt)
+		return NULL;
+
+	nid = folio_nid(prepared);
+	key = replica_key(pgoff, nid);
+
+	old = xa_store(&nrt->replicas, key, prepared, GFP_NOWAIT | __GFP_ACCOUNT);
+	if (xa_is_err(old))
+		return NULL;
+
+	if (old && !xa_is_value(old)) {
+		atomic_long_dec(&node_nr_replicas[folio_nid(old)]);
+		atomic_long_dec(&nrt->nr_replicas);
+		*old_out = old;
+	}
+
+	folio_get(prepared); /* XArray holds one ref, caller gets the other */
+	atomic_long_inc(&node_nr_replicas[nid]);
+	atomic_long_inc(&nrt->nr_replicas);
+
+	count_vm_event(NUMA_REPLICA_CREATED);
+	trace_numa_replica_create(prepared, nid, pgoff);
+
+	return prepared;
+}
+
+/*
+ * Erase and free a single replica for (@pgoff, @nid).
+ * Called from memory_failure where we know exactly which replica is
+ * affected and do not need to invalidate replicas on other nodes.
+ *
+ * Uses xa_erase() return value to avoid double-free races with the
+ * shrinker: only the path that successfully erases owns the folio.
+ */
+void numa_replica_invalidate_one(struct numa_replica_tree *nrt,
+				 pgoff_t pgoff, int nid)
+{
+	struct folio *folio;
+	unsigned long key;
+
+	if (!nrt)
+		return;
+
+	key = replica_key(pgoff, nid);
+	folio = xa_erase(&nrt->replicas, key);
+	if (!folio)
+		return;
+
+	atomic_long_dec(&node_nr_replicas[nid]);
+	atomic_long_dec(&nrt->nr_replicas);
+	replica_unmap_and_free(folio, nid, pgoff, "hwpoison");
+}
+
+/*
+ * Unmap and drop all replicas for @pgoff.
+ * Called on reclaim/truncate where sleeping is allowed.
+ *
+ * Uses xa_erase() return value to avoid double-free races with the
+ * shrinker: only the path that successfully erases owns the folio.
+ */
+void numa_replica_invalidate(struct numa_replica_tree *nrt, pgoff_t pgoff)
+{
+	unsigned long start, end;
+	struct folio *folio;
+	unsigned long index;
+
+	if (!nrt)
+		return;
+
+	start = replica_key(pgoff, 0);
+	end = replica_key(pgoff, MAX_NUMNODES - 1);
+
+	xa_for_each_range(&nrt->replicas, index, folio, start, end) {
+		folio = xa_erase(&nrt->replicas, index);
+		if (!folio)
+			continue;
+		atomic_long_dec(&node_nr_replicas[replica_key_nid(index)]);
+		atomic_long_dec(&nrt->nr_replicas);
+		replica_unmap_and_free(folio, replica_key_nid(index),
+				      pgoff, "invalidate");
+	}
+}
+
+/*
+ * Unmap and drop all replicas in [start, end].
+ * Called on truncation/hole punch and MADV_NUMA_NOREPLICATE.
+ */
+void numa_replica_invalidate_range(struct numa_replica_tree *nrt,
+				   pgoff_t start, pgoff_t end)
+{
+	unsigned long key_start, key_end;
+	struct folio *folio;
+	unsigned long index;
+
+	if (!nrt)
+		return;
+
+	key_start = replica_key(start, 0);
+	key_end = replica_key(end, MAX_NUMNODES - 1);
+
+	xa_for_each_range(&nrt->replicas, index, folio, key_start, key_end) {
+		folio = xa_erase(&nrt->replicas, index);
+		if (!folio)
+			continue;
+		atomic_long_dec(&node_nr_replicas[replica_key_nid(index)]);
+		atomic_long_dec(&nrt->nr_replicas);
+		replica_unmap_and_free(folio, replica_key_nid(index),
+				      replica_key_pgoff(index), "truncate");
+	}
+}
+
+/*
+ * Invalidate replicas when a page is dirtied.  Called from
+ * folio_mark_dirty() / set_page_dirty() paths which may execute
+ * under PTL (e.g. zap_present_ptes -> folio_mark_dirty).
+ *
+ * This must be non-sleeping.  We remove replicas from the XArray
+ * (atomic) and queue deferred unmap+free via a global list and static
+ * work item.  The deferred worker calls folio_lock + try_to_unmap +
+ * folio_put to ensure stale PTEs are removed and the replica is fully
+ * freed.  Replica folios keep their mapping set on the list so
+ * try_to_unmap() can find PTEs; this guarantees coherence even under
+ * GFP_ATOMIC pressure.
+ *
+ * Uses xa_erase() return value to avoid double-free races.
+ */
+void numa_replica_invalidate_dirty(struct address_space *mapping,
+				   pgoff_t pgoff)
+{
+	struct numa_replica_tree *nrt;
+	unsigned long start, end;
+	struct folio *folio;
+	unsigned long index;
+	bool queued = false;
+
+	if (!mapping)
+		return;
+
+	nrt = numa_replica_tree_for_mapping(mapping);
+	if (!nrt)
+		return;
+
+	start = replica_key(pgoff, 0);
+	end = replica_key(pgoff, MAX_NUMNODES - 1);
+
+	xa_for_each_range(&nrt->replicas, index, folio, start, end) {
+		folio = xa_erase(&nrt->replicas, index);
+		if (!folio)
+			continue;
+		atomic_long_dec(&node_nr_replicas[replica_key_nid(index)]);
+		atomic_long_dec(&nrt->nr_replicas);
+
+		/*
+		 * Queue folio for deferred unmap+free.  The folio keeps
+		 * its mapping set so try_to_unmap() can find PTEs.
+		 * Replica folios are not on the LRU, so folio->lru is
+		 * available as a list node.
+		 */
+		spin_lock(&dirty_cleanup_lock);
+		list_add_tail(&folio->lru, &dirty_cleanup_list);
+		queued = true;
+		spin_unlock(&dirty_cleanup_lock);
+	}
+	if (queued)
+		schedule_work(&dirty_cleanup_static_work);
+}
+
+/*
+ * Discard an unused prepared replica folio.  Clears mapping (and the
+ * FOLIO_MAPPING_REPLICA bit with it), then drops the reference.
+ */
+void numa_replica_discard_prepared(struct folio *prepared)
+{
+	if (!prepared)
+		return;
+	prepared->mapping = NULL;
+	folio_put(prepared);
+}
+
+/*
+ * Clean up a replaced replica folio after the caller has released PTL.
+ * This is the deferred path for old replicas displaced by numa_replica_install().
+ */
+void numa_replica_cleanup_old(struct folio *old)
+{
+	if (!old)
+		return;
+	replica_unmap_and_free(old, folio_nid(old), old->index, "replace");
+}
 
 long numa_replica_node_count(int nid)
 {
