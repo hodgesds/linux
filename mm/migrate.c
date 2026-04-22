@@ -1096,6 +1096,19 @@ static int move_to_new_folio(struct folio *dst, struct folio *src,
 	VM_BUG_ON_FOLIO(!folio_test_locked(src), src);
 	VM_BUG_ON_FOLIO(!folio_test_locked(dst), dst);
 
+	/*
+	 * Replica folios are tracked in a per-mapping XArray, not in
+	 * i_pages.  The standard migration path would not update the
+	 * replica tree and would leave a stale entry after freeing the
+	 * source folio.
+	 *
+	 * Note: this causes memory offlining to fail if a replica resides
+	 * on the block being offlined.  A future improvement could
+	 * invalidate the replica instead of returning -EBUSY.
+	 */
+	if (IS_ENABLED(CONFIG_NUMA_PAGE_REPLICATE) && folio_test_replica(src))
+		return -EBUSY;
+
 	if (!mapping)
 		rc = migrate_folio(mapping, dst, src, mode);
 	else if (mapping_inaccessible(mapping))
