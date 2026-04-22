@@ -885,3 +885,57 @@ static int __init numa_replicate_init(void)
 	return 0;
 }
 late_initcall(numa_replicate_init);
+
+#ifdef CONFIG_DEBUG_FS
+static int numa_replicate_stats_show(struct seq_file *m, void *v)
+{
+	struct numa_replica_tree_entry *entry;
+	int nid;
+	unsigned long total = 0;
+
+	seq_puts(m, "Per-node replica pages:\n");
+	for_each_node_state(nid, N_MEMORY) {
+		long count = atomic_long_read(&node_nr_replicas[nid]);
+
+		seq_printf(m, "  Node %d: %ld pages (%ld KB)\n",
+			   nid, count, count << (PAGE_SHIFT - 10));
+		total += count;
+	}
+	seq_printf(m, "  Total:  %lu pages (%lu KB)\n\n", total, total << (PAGE_SHIFT - 10));
+
+	seq_puts(m, "Per-mapping replica trees:\n");
+	spin_lock(&replica_trees_lock);
+	list_for_each_entry(entry, &replica_trees_list, list) {
+		struct numa_replica_tree *nrt = &entry->tree;
+		struct inode *inode = nrt->mapping ? nrt->mapping->host : NULL;
+		long nr = atomic_long_read(&nrt->nr_replicas);
+
+		if (inode)
+			seq_printf(m, "  ino %lu dev %d:%d: %ld replicas\n",
+				   inode->i_ino,
+				   MAJOR(inode->i_sb->s_dev),
+				   MINOR(inode->i_sb->s_dev),
+				   nr);
+		else
+			seq_printf(m, "  (unknown): %ld replicas\n", nr);
+	}
+	spin_unlock(&replica_trees_lock);
+
+	seq_printf(m, "\nConfig: enabled=%d pinned=%d max_per_node=%lu\n",
+		   sysctl_numa_replicate_enabled,
+		   sysctl_numa_replicate_pinned,
+		   sysctl_numa_replicate_max_per_node);
+
+	return 0;
+}
+
+DEFINE_SHOW_ATTRIBUTE(numa_replicate_stats);
+
+static int __init numa_replicate_debugfs_init(void)
+{
+	debugfs_create_file("numa_replicate", 0444, NULL, NULL,
+			    &numa_replicate_stats_fops);
+	return 0;
+}
+late_initcall(numa_replicate_debugfs_init);
+#endif
