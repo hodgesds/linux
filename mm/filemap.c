@@ -49,6 +49,7 @@
 #include <linux/sched/mm.h>
 #include <linux/sysctl.h>
 #include <linux/pgalloc.h>
+#include <linux/numa_replicate.h>
 
 #include <asm/tlbflush.h>
 #include "internal.h"
@@ -3835,7 +3836,8 @@ skip:
 
 static vm_fault_t filemap_map_order0_folio(struct vm_fault *vmf,
 		struct folio *folio, unsigned long addr,
-		unsigned long *rss, unsigned short *mmap_miss)
+		unsigned long *rss, unsigned short *mmap_miss,
+		struct numa_replica_ctx *replica_ctx)
 {
 	vm_fault_t ret = 0;
 	struct page *page = &folio->page;
@@ -3858,6 +3860,39 @@ static vm_fault_t filemap_map_order0_folio(struct vm_fault *vmf,
 	if (vmf->address == addr)
 		ret = VM_FAULT_NOPAGE;
 
+	/*
+	 * Install a NUMA replica only for the actual faulting page to
+	 * keep PTL hold time short.  Surrounding fault-around pages
+	 * are mapped with the canonical folio; they will get replicas
+	 * on subsequent faults if needed.
+	 */
+	if (addr == vmf->address && replica_ctx->prepared) {
+		struct folio *replica = numa_replica_install(vmf->vma,
+							    replica_ctx->prepared,
+							    folio->index,
+							    &replica_ctx->old);
+		if (replica) {
+			/*
+			 * Canonical folio is still locked, so the page
+			 * cache ref is stable and cannot be removed by
+			 * concurrent truncation.  folio_put() drops only
+			 * the lookup ref from next_uptodate_folio(),
+			 * leaving the page cache ref.  The subsequent
+			 * folio_unlock() in the caller operates on a
+			 * folio with refcount >= 1.
+			 *
+			 * Replica has two refs: one from allocation (for
+			 * the PTE, dropped by zap or try_to_unmap), one
+			 * from folio_get in numa_replica_install() (for
+			 * the XArray, dropped on erase).
+			 */
+			folio_put(folio);
+			folio = replica;
+			page = &replica->page;
+			replica_ctx->prepared = NULL; /* consumed */
+		}
+	}
+
 	set_pte_range(vmf, folio, page, 1, addr);
 	(*rss)++;
 	return ret;
@@ -3878,6 +3913,7 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 	unsigned long addr;
 	XA_STATE(xas, &mapping->i_pages, start_pgoff);
 	struct folio *folio;
+	struct numa_replica_ctx replica_ctx = { };
 	vm_fault_t ret = 0;
 	unsigned long rss = 0;
 	unsigned int nr_pages = 0, folio_type;
@@ -3904,6 +3940,26 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 		goto out;
 	}
 
+	/*
+	 * Prepare replica for the faulting page before acquiring PTL.
+	 * Only the actual faulting page gets a replica; surrounding
+	 * fault-around pages use canonical folios to keep PTL hold
+	 * time short (no page allocation or memcpy under PTL).
+	 *
+	 * Use the folio that next_uptodate_folio() already validated
+	 * (locked, referenced, in the page cache) rather than a second
+	 * xa_load() which would race with truncation.
+	 *
+	 * If the first folio in the fault-around window does not cover
+	 * vmf->pgoff, no replica is prepared for this fault.  This is
+	 * a missed optimisation, not a bug -- the canonical folio is
+	 * mapped and a subsequent fault can create the replica.
+	 */
+	if ((vma->vm_flags & VM_NUMA_REPLICATE) &&
+	    !folio_test_large(folio) && folio->index == vmf->pgoff)
+		replica_ctx.prepared = numa_replica_prepare(vma, folio,
+							    vmf->pgoff);
+
 	addr = vma->vm_start + ((start_pgoff - vma->vm_pgoff) << PAGE_SHIFT);
 	vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd, addr, &vmf->ptl);
 	if (!vmf->pte) {
@@ -3924,7 +3980,8 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 
 		if (!folio_test_large(folio))
 			ret |= filemap_map_order0_folio(vmf,
-					folio, addr, &rss, &mmap_miss);
+					folio, addr, &rss, &mmap_miss,
+					&replica_ctx);
 		else
 			ret |= filemap_map_folio_range(vmf, folio,
 					xas.xa_index - folio->index, addr,
@@ -3934,9 +3991,15 @@ vm_fault_t filemap_map_pages(struct vm_fault *vmf,
 	} while ((folio = next_uptodate_folio(&xas, mapping, end_pgoff)) != NULL);
 	add_mm_counter(vma->vm_mm, folio_type, rss);
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
+
 	trace_mm_filemap_map_pages(mapping, start_pgoff, end_pgoff);
 out:
 	rcu_read_unlock();
+
+	/* Discard unused prepared replica */
+	numa_replica_discard_prepared(replica_ctx.prepared);
+	/* Clean up replaced replica after releasing both PTL and RCU */
+	numa_replica_cleanup_old(replica_ctx.old);
 
 	mmap_miss_saved = READ_ONCE(file->f_ra.mmap_miss);
 	if (mmap_miss >= mmap_miss_saved)
