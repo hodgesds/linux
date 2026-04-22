@@ -86,6 +86,7 @@ TEST_GEN_FILES += mremap_test
 TEST_GEN_FILES += mseal_test
 TEST_GEN_FILES += numa_replicate
 TEST_GEN_FILES += numa_replicate_workload
+TEST_GEN_FILES += numa_replicate_stress
 TEST_GEN_FILES += on-fault-limit
 TEST_GEN_FILES += pagemap_ioctl
 TEST_GEN_FILES += pfnmap
