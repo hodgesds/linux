@@ -211,7 +211,8 @@ enum mapping_flags {
 	AS_KERNEL_FILE = 10,	/* mapping for a fake kernel file that shouldn't
 				   account usage to user cgroups */
 	AS_NO_DATA_INTEGRITY = 11, /* no data integrity guarantees */
-	/* Bits 16-25 are used for FOLIO_ORDER */
+	AS_NUMA_REPLICATED = 12,   /* has NUMA replica pages */
+	/* Bits 13-15 are available; bits 16-25 are used for FOLIO_ORDER */
 	AS_FOLIO_ORDER_BITS = 5,
 	AS_FOLIO_ORDER_MIN = 16,
 	AS_FOLIO_ORDER_MAX = AS_FOLIO_ORDER_MIN + AS_FOLIO_ORDER_BITS,
@@ -278,6 +279,21 @@ static inline void mapping_set_exiting(struct address_space *mapping)
 static inline int mapping_exiting(const struct address_space *mapping)
 {
 	return test_bit(AS_EXITING, &mapping->flags);
+}
+
+static inline void mapping_set_numa_replicated(struct address_space *mapping)
+{
+	set_bit(AS_NUMA_REPLICATED, &mapping->flags);
+}
+
+static inline void mapping_clear_numa_replicated(struct address_space *mapping)
+{
+	clear_bit(AS_NUMA_REPLICATED, &mapping->flags);
+}
+
+static inline bool mapping_numa_replicated(const struct address_space *mapping)
+{
+	return test_bit(AS_NUMA_REPLICATED, &mapping->flags);
 }
 
 static inline void mapping_set_no_writeback_tags(struct address_space *mapping)
