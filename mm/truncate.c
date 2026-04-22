@@ -21,6 +21,7 @@
 #include <linux/task_io_accounting_ops.h>
 #include <linux/shmem_fs.h>
 #include <linux/rmap.h>
+#include <linux/numa_replicate.h>
 #include "internal.h"
 
 static void clear_shadow_entries(struct address_space *mapping,
@@ -153,6 +154,16 @@ EXPORT_SYMBOL_GPL(folio_invalidate);
  */
 static void truncate_cleanup_folio(struct folio *folio)
 {
+	/* Replicas exist only for order-0 folios; see numa_replica_prepare() */
+	if (IS_ENABLED(CONFIG_NUMA_PAGE_REPLICATE) &&
+	    folio->mapping && mapping_numa_replicated(folio->mapping)) {
+		struct address_space *mapping = folio->mapping;
+
+		numa_replica_invalidate(
+				numa_replica_tree_for_mapping(mapping),
+				folio->index);
+	}
+
 	if (folio_mapped(folio))
 		unmap_mapping_folio(folio);
 
@@ -518,6 +529,22 @@ void truncate_inode_pages_final(struct address_space *mapping)
 	}
 
 	truncate_inode_pages(mapping, 0);
+
+	/*
+	 * AS_EXITING (set above) prevents new replicas from being
+	 * created via numa_replica_prepare().  truncate_inode_pages()
+	 * drained existing replicas via truncate_cleanup_folio().
+	 * The tree should be empty at this point.
+	 */
+	if (IS_ENABLED(CONFIG_NUMA_PAGE_REPLICATE) &&
+	    mapping_numa_replicated(mapping)) {
+		struct numa_replica_tree *nrt;
+
+		nrt = numa_replica_tree_unregister(mapping);
+		WARN_ON_ONCE(nrt &&
+			     atomic_long_read(&nrt->nr_replicas) != 0);
+		numa_replica_tree_free(nrt);
+	}
 }
 EXPORT_SYMBOL(truncate_inode_pages_final);
 
