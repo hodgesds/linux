@@ -670,3 +670,219 @@ long numa_replica_node_count(int nid)
 		return 0;
 	return atomic_long_read(&node_nr_replicas[nid]);
 }
+
+
+/* --- Shrinker --- */
+
+static struct shrinker *replica_shrinker;
+
+static unsigned long
+replica_shrink_count(struct shrinker *shrink, struct shrink_control *sc)
+{
+	unsigned long total = 0;
+	int nid;
+
+	if (sysctl_numa_replicate_pinned)
+		return 0;
+
+	if (sc->nid != NUMA_NO_NODE)
+		return atomic_long_read(&node_nr_replicas[sc->nid]);
+
+	for_each_node_state(nid, N_MEMORY)
+		total += atomic_long_read(&node_nr_replicas[nid]);
+	return total;
+}
+
+#define SHRINK_BATCH 16
+
+/*
+ * Collect replicas under the lock, then drop the lock and unmap/free them.
+ * try_to_unmap() can sleep so it cannot be called under replica_trees_lock.
+ *
+ * The scan position (tree + XArray index) is saved between calls so that
+ * each batch picks up where the previous one left off, avoiding O(n)
+ * re-scan of already-visited entries under the global spinlock.
+ *
+ * The shrinker acquires replica folio locks independently, never while
+ * holding a canonical folio lock.  This preserves the lock ordering
+ * (canonical -> replica) documented in the file header.
+ */
+static unsigned long
+replica_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
+{
+	struct folio *batch[SHRINK_BATCH];
+	struct numa_replica_tree_entry *entry;
+	unsigned long freed = 0;
+	unsigned long to_scan = sc->nr_to_scan;
+	int target_nid = sc->nid;
+	int nr_collected;
+	int i;
+	bool wrapped = false;
+
+	if (sysctl_numa_replicate_pinned)
+		return SHRINK_STOP;
+
+	while (freed < to_scan) {
+		nr_collected = 0;
+
+		spin_lock(&replica_trees_lock);
+
+		if (list_empty(&replica_trees_list)) {
+			spin_unlock(&replica_trees_lock);
+			break;
+		}
+
+		/* Resume from saved position or start from the head */
+		if (!shrink_scan_entry ||
+		    list_entry_is_head(shrink_scan_entry,
+				      &replica_trees_list, list))
+			shrink_scan_entry = list_first_entry(
+				&replica_trees_list,
+				struct numa_replica_tree_entry, list);
+
+		entry = shrink_scan_entry;
+		list_for_each_entry_from(entry, &replica_trees_list, list) {
+			struct numa_replica_tree *nrt = &entry->tree;
+			struct folio *folio;
+			unsigned long index = (entry == shrink_scan_entry) ?
+					      shrink_scan_index : 0;
+
+			xa_for_each_start(&nrt->replicas, index, folio,
+					  index) {
+				struct folio *erased;
+
+				if (nr_collected >= SHRINK_BATCH) {
+					/* Save position for next call */
+					shrink_scan_entry = entry;
+					shrink_scan_index = index + 1;
+					goto batch_full;
+				}
+
+				if (target_nid != NUMA_NO_NODE &&
+				    folio_nid(folio) != target_nid)
+					continue;
+
+				/*
+				 * xa_erase() inside xa_for_each_start() is safe:
+				 * the iterator uses RCU for traversal while
+				 * xa_erase() takes the xa_lock internally.
+				 */
+				erased = xa_erase(&nrt->replicas, index);
+				if (!erased)
+					continue;
+				atomic_long_dec(&node_nr_replicas[folio_nid(erased)]);
+				atomic_long_dec(&nrt->nr_replicas);
+				batch[nr_collected++] = erased;
+			}
+
+			/*
+			 * Finished scanning this tree.  If we collected any
+			 * folios, save position at the next tree and break
+			 * to free them outside the lock.  This bounds lock
+			 * hold time to one tree's scan rather than all trees.
+			 */
+			if (nr_collected > 0) {
+				struct list_head *next = entry->list.next;
+
+				if (next != &replica_trees_list) {
+					shrink_scan_entry = list_entry(next,
+						struct numa_replica_tree_entry,
+						list);
+					shrink_scan_index = 0;
+				} else {
+					shrink_scan_entry = NULL;
+					shrink_scan_index = 0;
+				}
+				goto batch_full;
+			}
+		}
+
+		/*
+		 * Reached the end of all trees.  Wrap around for the next
+		 * scan call.  If we already wrapped in this invocation,
+		 * there is nothing left to reclaim.
+		 */
+		shrink_scan_entry = NULL;
+		shrink_scan_index = 0;
+		if (!nr_collected && !wrapped) {
+			wrapped = true;
+			spin_unlock(&replica_trees_lock);
+			continue;
+		}
+batch_full:
+		spin_unlock(&replica_trees_lock);
+
+		if (!nr_collected)
+			break;
+
+		for (i = 0; i < nr_collected; i++) {
+			folio_lock(batch[i]);
+			try_to_unmap(batch[i], 0);
+			batch[i]->mapping = NULL;
+			folio_unlock(batch[i]);
+			count_vm_event(NUMA_REPLICA_DROPPED);
+			folio_put(batch[i]);
+		}
+		freed += nr_collected;
+	}
+
+	return freed ? freed : SHRINK_STOP;
+}
+
+/* --- Sysctl --- */
+
+#ifdef CONFIG_SYSCTL
+static const struct ctl_table numa_replicate_sysctls[] = {
+	{
+		.procname	= "numa_replicate_enabled",
+		.data		= &sysctl_numa_replicate_enabled,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "numa_replicate_pinned",
+		.data		= &sysctl_numa_replicate_pinned,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "numa_replicate_max_per_node",
+		.data		= &sysctl_numa_replicate_max_per_node,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+};
+#endif
+
+static int __init numa_replicate_init(void)
+{
+	int nid;
+
+	for_each_node_state(nid, N_MEMORY)
+		atomic_long_set(&node_nr_replicas[nid], 0);
+
+	replica_shrinker = shrinker_alloc(SHRINKER_NUMA_AWARE,
+					  "mm-numa-replicas");
+	if (!replica_shrinker)
+		return -ENOMEM;
+
+	replica_shrinker->count_objects = replica_shrink_count;
+	replica_shrinker->scan_objects = replica_shrink_scan;
+	replica_shrinker->seeks = DEFAULT_SEEKS;
+	shrinker_register(replica_shrinker);
+
+#ifdef CONFIG_SYSCTL
+	register_sysctl_init("vm", numa_replicate_sysctls);
+#endif
+
+	pr_info("NUMA page replication initialized\n");
+	return 0;
+}
+late_initcall(numa_replicate_init);
