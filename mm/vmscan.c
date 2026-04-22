@@ -30,6 +30,7 @@
 #include <linux/mm_inline.h>
 #include <linux/backing-dev.h>
 #include <linux/rmap.h>
+#include <linux/numa_replicate.h>
 #include <linux/topology.h>
 #include <linux/cpu.h>
 #include <linux/cpuset.h>
@@ -957,6 +958,17 @@ static void folio_check_dirty_writeback(struct folio *folio,
 	struct address_space *mapping;
 
 	/*
+	 * NUMA replica folios are never dirty or under writeback;
+	 * their lifecycle is managed by the custom replica shrinker.
+	 */
+	if (numa_replicate_is_active() &&
+	    folio_test_replica(folio)) {
+		*dirty = false;
+		*writeback = false;
+		return;
+	}
+
+	/*
 	 * Anonymous folios are not handled by flushers and must be written
 	 * from reclaim context. Do not stall reclaim based on them.
 	 * MADV_FREE anonymous folios are put into inactive file list too.
@@ -1354,6 +1366,32 @@ retry:
 		if (folio_mapped(folio)) {
 			enum ttu_flags flags = TTU_BATCH_FLUSH;
 			bool was_swapbacked = folio_test_swapbacked(folio);
+
+			/*
+			 * Drop NUMA replicas before unmapping the canonical
+			 * folio.  This MUST happen before try_to_unmap() on
+			 * the canonical folio below -- replicas are separate
+			 * folios so rmap won't find PTEs pointing to them
+			 * when unmapping the canonical folio.
+			 *
+			 * Lock ordering: canonical folio lock (held here) ->
+			 * replica folio lock (in numa_replica_invalidate).
+			 * The shrinker acquires replica locks independently
+			 * without holding any canonical folio lock, so ABBA
+			 * deadlock is not possible.
+			 *
+			 * numa_replica_invalidate() calls try_to_unmap() on
+			 * each replica, which takes i_mmap_rwsem as a reader.
+			 * The subsequent try_to_unmap() on the canonical folio
+			 * also takes i_mmap_rwsem.  These are sequential, not
+			 * nested, read-lock acquisitions on the same rwsem.
+			 */
+			if (numa_replicate_is_active() &&
+			    folio_is_file_lru(folio) && folio->mapping &&
+			    mapping_numa_replicated(folio->mapping))
+				numa_replica_invalidate(
+					numa_replica_tree_for_mapping(folio->mapping),
+					folio->index);
 
 			if (folio_test_pmd_mappable(folio))
 				flags |= TTU_SPLIT_HUGE_PMD;
