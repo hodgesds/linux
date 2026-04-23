@@ -5587,11 +5587,19 @@ static void switched_to_minlat(struct rq *rq, struct task_struct *p)
 	 */
 	p->minlat.avg.last_update_time = rq_clock_pelt(rq);
 
-	if (task_on_rq_queued(p)) {
-		minlat_set_load_weight(p);
-		if (rq->curr != p)
-			wakeup_preempt_minlat(rq, p, 0);
-	}
+	/*
+	 * Do not call minlat_set_load_weight() here.  For a queued task,
+	 * sched_change_end() already ran enqueue_task_minlat() which sets
+	 * me->load.weight and adds it to minlat_rq->load_weight atomically.
+	 * Re-setting the weight here without a matching delta-update against
+	 * the rq aggregate is a drift source: if the second call produces a
+	 * different result (cgroup share change racing with the switch, prio
+	 * update between enqueue and switched_to), minlat_rq->load_weight
+	 * ends up out of sync with the task's stored weight and a later
+	 * dequeue trips the load_weight underflow tripwire.
+	 */
+	if (task_on_rq_queued(p) && rq->curr != p)
+		wakeup_preempt_minlat(rq, p, 0);
 }
 
 static void prio_changed_minlat(struct rq *rq, struct task_struct *p,
@@ -5605,6 +5613,22 @@ static void prio_changed_minlat(struct rq *rq, struct task_struct *p,
 		minlat_set_load_weight(p);
 		return;
 	}
+
+#ifdef CONFIG_CFS_BANDWIDTH
+	/*
+	 * A bw-throttled task is still task_on_rq_queued() from the core's
+	 * view (p->on_rq == TASK_ON_RQ_QUEUED) but __minlat_bw_throttle_one()
+	 * already subtracted its weight from minlat_rq->load_weight.  Doing a
+	 * delta update here would adjust an aggregate that does not contain
+	 * this task, driving it out of sync — classic underflow on the next
+	 * dequeue.  Update me->load.weight so the unthrottle path re-adds the
+	 * correct value, and skip the rq-aggregate delta and lane requeue.
+	 */
+	if (me->bw_throttled) {
+		minlat_set_load_weight(p);
+		return;
+	}
+#endif
 
 	/* Update rq aggregate load: remove old weight, add new */
 	old_weight = scale_load_down(me->load.weight);
@@ -5647,6 +5671,17 @@ static void reweight_task_minlat(struct rq *rq, struct task_struct *p,
 
 	if (!task_on_rq_queued(p))
 		return;
+
+#ifdef CONFIG_CFS_BANDWIDTH
+	/*
+	 * See prio_changed_minlat(): a bw-throttled task is task_on_rq_queued()
+	 * but its weight has already been removed from minlat_rq->load_weight
+	 * at throttle time.  Skip the delta update here; the unthrottle path
+	 * re-adds the now-updated me->load.weight.
+	 */
+	if (me->bw_throttled)
+		return;
+#endif
 
 	/* Update rq aggregate: remove old, add new */
 	minlat_rq->load_weight += scale_load_down(me->load.weight) - old_weight;
