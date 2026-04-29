@@ -34,6 +34,7 @@ the Linux memory management.
    multigen_lru
    nommu-mmap
    numa_memory_policy
+   numa_replicate
    numaperf
    pagemap
    shrinker_debugfs
