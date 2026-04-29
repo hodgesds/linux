@@ -16816,6 +16816,18 @@ F:	mm/numa.c
 F:	mm/numa_emulation.c
 F:	mm/numa_memblks.c
 
+MEMORY MANAGEMENT - NUMA PAGE REPLICATION
+M:	Daniel Hodges <hodgesd@meta.com>
+L:	linux-mm@kvack.org
+S:	Maintained
+W:	http://www.linux-mm.org
+T:	git git://git.kernel.org/pub/scm/linux/kernel/git/akpm/mm
+F:	Documentation/admin-guide/mm/numa_replicate.rst
+F:	include/linux/numa_replicate.h
+F:	include/trace/events/numa_replicate.h
+F:	mm/numa_replicate.c
+F:	tools/testing/selftests/mm/numa_replicate*
+
 MEMORY MANAGEMENT - OOM KILLER
 M:	Michal Hocko <mhocko@suse.com>
 R:	David Rientjes <rientjes@google.com>
