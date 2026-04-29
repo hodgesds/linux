@@ -58,6 +58,9 @@ Currently, these files are in /proc/sys/vm:
 - nr_hugepages_mempolicy
 - nr_overcommit_hugepages
 - nr_trim_pages         (only if CONFIG_MMU=n)
+- numa_replicate_enabled
+- numa_replicate_max_per_node
+- numa_replicate_pinned
 - numa_zonelist_order
 - oom_dump_tasks
 - oom_kill_allocating_task
@@ -728,6 +731,52 @@ trimming of allocations is initiated.
 The default value is 1.
 
 See Documentation/admin-guide/mm/nommu-mmap.rst for more information.
+
+
+numa_replicate_enabled
+======================
+
+When set to 1, eligible read-only file-backed pages may be replicated
+across NUMA nodes so each CPU accesses a node-local copy.  Replication
+is only attempted for VMAs marked via ``madvise(MADV_NUMA_REPLICATE)``.
+Setting this to 0 disables creation of new replicas; existing replicas
+remain in place until reclaimed or invalidated.
+
+The default value is 0.
+
+Available only when CONFIG_NUMA_PAGE_REPLICATE=y.
+
+See Documentation/admin-guide/mm/numa_replicate.rst for details.
+
+
+numa_replicate_max_per_node
+===========================
+
+Upper bound on the number of replica pages per NUMA node.  Replica
+creation is skipped once this threshold is reached on the target
+node, falling back to the canonical page.  Reclaim and invalidation
+reduce the count below the threshold over time.
+
+The default value is 65536 (256 MiB on 4 KiB pages).
+
+Setting this to 0 disables the limit.
+
+Available only when CONFIG_NUMA_PAGE_REPLICATE=y.
+
+
+numa_replicate_pinned
+=====================
+
+When set to 1, the NUMA replica shrinker is disabled: replicas are
+pinned in memory and only released by truncation, hole-punch, dirty
+transition, mprotect, MADV_NUMA_NOREPLICATE, or hwpoison.  Use this
+when the working set is small enough to fit within
+numa_replicate_max_per_node and predictable replica residency is
+preferred over reclaim flexibility.
+
+The default value is 0.
+
+Available only when CONFIG_NUMA_PAGE_REPLICATE=y.
 
 
 numa_zonelist_order

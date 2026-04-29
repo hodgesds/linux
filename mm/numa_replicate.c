@@ -829,6 +829,38 @@ batch_full:
 	return freed ? freed : SHRINK_STOP;
 }
 
+/* --- Sysctl --- */
+
+#ifdef CONFIG_SYSCTL
+static const struct ctl_table numa_replicate_sysctls[] = {
+	{
+		.procname	= "numa_replicate_enabled",
+		.data		= &sysctl_numa_replicate_enabled,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "numa_replicate_pinned",
+		.data		= &sysctl_numa_replicate_pinned,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE,
+	},
+	{
+		.procname	= "numa_replicate_max_per_node",
+		.data		= &sysctl_numa_replicate_max_per_node,
+		.maxlen		= sizeof(unsigned long),
+		.mode		= 0644,
+		.proc_handler	= proc_doulongvec_minmax,
+	},
+};
+#endif
+
 static int __init numa_replicate_init(void)
 {
 	int nid;
@@ -845,6 +877,10 @@ static int __init numa_replicate_init(void)
 	replica_shrinker->scan_objects = replica_shrink_scan;
 	replica_shrinker->seeks = DEFAULT_SEEKS;
 	shrinker_register(replica_shrinker);
+
+#ifdef CONFIG_SYSCTL
+	register_sysctl_init("vm", numa_replicate_sysctls);
+#endif
 
 	return 0;
 }
