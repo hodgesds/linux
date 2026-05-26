@@ -96,6 +96,7 @@ acpi_ps_get_next_package_length(struct acpi_parse_state *parser_state)
 u8 *acpi_ps_get_next_package_end(struct acpi_parse_state *parser_state)
 {
 	u8 *start = parser_state->aml;
+	u8 *end;
 	u32 package_length;
 
 	ACPI_FUNCTION_TRACE(ps_get_next_package_end);
@@ -104,7 +105,18 @@ u8 *acpi_ps_get_next_package_end(struct acpi_parse_state *parser_state)
 
 	package_length = acpi_ps_get_next_package_length(parser_state);
 
-	return_PTR(start + package_length);	/* end of package */
+	end = start + package_length;
+
+	/* Clamp to AML end to prevent out-of-bounds access from bogus lengths */
+
+	if (end < start || end > parser_state->aml_end) {
+		ACPI_WARNING((AE_INFO,
+			      "Package length 0x%X extends past AML end, clamping",
+			      package_length));
+		end = parser_state->aml_end;
+	}
+
+	return_PTR(end);
 }
 
 /*******************************************************************************
@@ -126,13 +138,19 @@ char *acpi_ps_get_next_namestring(struct acpi_parse_state *parser_state)
 {
 	u8 *start = parser_state->aml;
 	u8 *end = parser_state->aml;
+	u8 *aml_end = parser_state->aml_end;
 
 	ACPI_FUNCTION_TRACE(ps_get_next_namestring);
 
 	/* Point past any namestring prefix characters (backslash or carat) */
 
-	while (ACPI_IS_ROOT_PREFIX(*end) || ACPI_IS_PARENT_PREFIX(*end)) {
+	while (end < aml_end &&
+	       (ACPI_IS_ROOT_PREFIX(*end) || ACPI_IS_PARENT_PREFIX(*end))) {
 		end++;
+	}
+
+	if (end >= aml_end) {
+		goto truncated;
 	}
 
 	/* Decode the path prefix character */
@@ -159,6 +177,9 @@ char *acpi_ps_get_next_namestring(struct acpi_parse_state *parser_state)
 
 		/* Multiple name segments, 4 chars each, count in next byte */
 
+		if (end + 1 >= aml_end) {
+			goto truncated;
+		}
 		end += 2 + (*(end + 1) * ACPI_NAMESEG_SIZE);
 		break;
 
@@ -170,8 +191,18 @@ char *acpi_ps_get_next_namestring(struct acpi_parse_state *parser_state)
 		break;
 	}
 
+	if (end > aml_end) {
+		goto truncated;
+	}
+
 	parser_state->aml = end;
 	return_PTR((char *)start);
+
+truncated:
+	ACPI_ERROR((AE_INFO, "Truncated namestring at AML offset 0x%X",
+		    (u32)(end - parser_state->aml_start)));
+	parser_state->aml = aml_end;
+	return_PTR(NULL);
 }
 
 /*******************************************************************************
@@ -414,11 +445,22 @@ acpi_ps_get_next_simple_arg(struct acpi_parse_state *parser_state,
 		opcode = AML_STRING_OP;
 		arg->common.value.string = ACPI_CAST_PTR(char, aml);
 
-		/* Find the null terminator */
+		/* Find the null terminator, with bounds checking */
 
 		length = 0;
-		while (aml[length]) {
+		while ((aml + length) < parser_state->aml_end &&
+		       aml[length]) {
 			length++;
+		}
+
+		if ((aml + length) >= parser_state->aml_end) {
+
+			/* String not terminated within AML, point to safe empty string */
+
+			ACPI_ERROR((AE_INFO,
+				    "Unterminated string at AML offset 0x%X",
+				    (u32)(aml - parser_state->aml_start)));
+			arg->common.value.string = "";
 		}
 		length++;
 		break;
