@@ -109,6 +109,16 @@ acpi_ds_build_internal_package_obj(struct acpi_walk_state *walk_state,
 	 * null terminated.
 	 */
 	if (!obj_desc->package.elements) {
+
+		/* Sanity check the element count against a reasonable limit */
+
+		if (element_count > (ACPI_UINT16_MAX / sizeof(void *))) {
+			ACPI_ERROR((AE_INFO,
+				    "Package element count too large: 0x%X",
+				    element_count));
+			return_ACPI_STATUS(AE_AML_OPERAND_VALUE);
+		}
+
 		obj_desc->package.elements = ACPI_ALLOCATE_ZEROED(((acpi_size)
 								   element_count
 								   +
