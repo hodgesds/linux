@@ -272,7 +272,7 @@ void drm_minor_release(struct drm_minor *minor)
  * minor) are found.  The caller gets a reference via drm_dev_get();
  * it must call drm_dev_put() when done.
  *
- * Context: may be called from any context; takes drm_minor_lock.
+ * Context: may be called from any context; takes the drm_minors_xa lock.
  * Return: the DRM device with a reference held, or NULL if no match
  * is found.
  */
@@ -280,11 +280,10 @@ struct drm_device *drm_dev_get_by_parent(struct device *parent)
 {
 	struct drm_minor *minor;
 	struct drm_device *dev = NULL;
-	unsigned long flags;
-	int id;
+	unsigned long index;
 
-	spin_lock_irqsave(&drm_minor_lock, flags);
-	idr_for_each_entry(&drm_minors_idr, minor, id) {
+	xa_lock(&drm_minors_xa);
+	xa_for_each(&drm_minors_xa, index, minor) {
 		if (!minor || !minor->dev || minor->dev->dev != parent)
 			continue;
 		if (minor->type != DRM_MINOR_PRIMARY &&
@@ -294,7 +293,7 @@ struct drm_device *drm_dev_get_by_parent(struct device *parent)
 		dev = minor->dev;
 		break;
 	}
-	spin_unlock_irqrestore(&drm_minor_lock, flags);
+	xa_unlock(&drm_minors_xa);
 
 	return dev;
 }
