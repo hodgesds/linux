@@ -22,6 +22,7 @@
 #include <linux/vmalloc.h>
 #include <linux/huge_mm.h>
 #include <linux/shmem_fs.h>
+#include <linux/zswap.h>
 #include "internal.h"
 #include "swap_table.h"
 #include "swap.h"
@@ -695,6 +696,34 @@ static unsigned long swapin_nr_pages(unsigned long offset)
  * are used for every page of the readahead: neighbouring pages on swap
  * are fairly likely to have been swapped out from the same node.
  */
+/*
+ * Flush a collected batch of newly-allocated readahead folios.  Hand the whole
+ * batch to zswap in one ->load() when the backend benefits from batching (e.g.
+ * zvram, where it becomes a single gathered transfer instead of N small device
+ * reads); folios zswap did not handle fall back to per-page swap_read_folio().
+ */
+static void swap_ra_flush(struct folio **folios, bool *is_ra, int nb,
+			  struct swap_iocb **splug)
+{
+	bool handled[ZSWAP_LOAD_BATCH] = { };
+	int k;
+
+	if (!nb)
+		return;
+	if (zswap_load_can_batch())
+		zswap_load_folios(folios, nb, handled);
+
+	for (k = 0; k < nb; k++) {
+		if (!handled[k])
+			swap_read_folio(folios[k], splug);
+		if (is_ra[k]) {
+			folio_set_readahead(folios[k]);
+			count_vm_event(SWAP_RA);
+		}
+		folio_put(folios[k]);
+	}
+}
+
 struct folio *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,
 				    struct mempolicy *mpol, pgoff_t ilx)
 {
@@ -707,6 +736,9 @@ struct folio *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,
 	struct blk_plug plug;
 	struct swap_iocb *splug = NULL;
 	bool page_allocated;
+	struct folio *batch[ZSWAP_LOAD_BATCH];
+	bool is_ra[ZSWAP_LOAD_BATCH];
+	int nb = 0;
 
 	mask = swapin_nr_pages(offset) - 1;
 	if (!mask)
@@ -722,21 +754,24 @@ struct folio *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,
 
 	blk_start_plug(&plug);
 	for (offset = start_offset; offset <= end_offset ; offset++) {
-		/* Ok, do the async read-ahead now */
+		/* Collect a cluster of newly-allocated folios, then batch them. */
 		folio = swap_cache_alloc_folio(
 			swp_entry(swp_type(entry), offset), gfp_mask, mpol, ilx,
 			&page_allocated);
 		if (!folio)
 			continue;
-		if (page_allocated) {
-			swap_read_folio(folio, &splug);
-			if (offset != entry_offset) {
-				folio_set_readahead(folio);
-				count_vm_event(SWAP_RA);
-			}
+		if (!page_allocated) {
+			folio_put(folio);
+			continue;
 		}
-		folio_put(folio);
+		batch[nb] = folio;
+		is_ra[nb] = offset != entry_offset;
+		if (++nb == ZSWAP_LOAD_BATCH) {
+			swap_ra_flush(batch, is_ra, nb, &splug);
+			nb = 0;
+		}
 	}
+	swap_ra_flush(batch, is_ra, nb, &splug);
 	blk_finish_plug(&plug);
 	swap_read_unplug(splug);
 	lru_add_drain();	/* Push any new pages onto the LRU now */
