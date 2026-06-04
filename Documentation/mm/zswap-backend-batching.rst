@@ -238,6 +238,48 @@ Staged plan
 Each stage is independently measurable and shippable.
 
 
+Stage 1 measured (zvram on a Navi 22 dGPU)
+==========================================
+
+Stage 1 (batch-native ``load`` + readahead cluster batching, *without* the
+cross-object ``MOVNTDQA`` transfer) was implemented and measured.  Swap-in load
+throughput (MiB/s), batched (readahead on, ~6 pages/batch) vs the single-page
+baseline:
+
+    =========  ===================  ===================  ======
+    threads    load: per-page       load: batched        ratio
+    =========  ===================  ===================  ======
+    1          184                  434                  2.36x
+    4          849                  1901                 2.24x
+    12         4286                 4174                 ~1.0
+    =========  ===================  ===================  ======
+
+Findings:
+
+* **Batching helps at low concurrency (~2.3x) and is neutral at high
+  concurrency.**  Batching and thread concurrency are two routes to the same
+  thing -- multiple transfers in flight.  At 12 threads the faulting threads
+  already pipeline the PCIe reads, so the batch adds nothing (but does not
+  regress).  Real swap-in is typically *single-threaded per process* (a process
+  faults its pages serially), so the T=1 figure is the representative one.
+
+* **The win is real even before the transfer optimization.**  This is purely
+  cluster batching (fewer per-page zswap overheads + readahead prefetch); the
+  per-object ``drm_memcpy_from_wc`` is unchanged.  Batched T=1 (434 MiB/s) is
+  still well under RAM-backed zswap (~1186), so the ``MOVNTDQA`` cross-object
+  read (stage 1b) is remaining headroom in the same low-concurrency regime.
+
+* **The readahead batch point is policy-gated.**  It only fires when swap
+  readahead actually produces a cluster: ``vm.page-cluster > 0`` for
+  ``swap_cluster_readahead``, and a non-trivial window for
+  ``swap_vma_readahead``.  Many SSD/zram setups ship ``page-cluster=0`` (swap
+  readahead off), and fast/synchronous swap devices skip readahead entirely --
+  in which case there is *no cluster to batch*.  This is the strongest argument
+  that **large folios** (a folio is a batch of N pages regardless of readahead
+  policy) are the batch source that survives production tuning, and should be
+  pursued alongside the readahead path.
+
+
 Generality
 ==========
 
