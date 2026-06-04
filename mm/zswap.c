@@ -200,8 +200,16 @@ static DEFINE_SPINLOCK(zswap_backends_lock);
 
 /* Name of the backend to use; matches a registered backend's .name. */
 static char *zswap_backend_name = "zsmalloc";
-module_param_named(zpool, zswap_backend_name, charp, 0644);
-MODULE_PARM_DESC(zpool, "storage backend for compressed pages (zsmalloc, zvram)");
+static int zswap_backend_param_set(const char *, const struct kernel_param *);
+static const struct kernel_param_ops zswap_backend_param_ops = {
+	.set =		zswap_backend_param_set,
+	.get =		param_get_charp,
+	.free =		param_free_charp,
+};
+module_param_cb(backend, &zswap_backend_param_ops, &zswap_backend_name, 0644);
+MODULE_PARM_DESC(backend, "storage backend for compressed pages (zsmalloc, zvram)");
+
+static int zswap_pool_reload(void);
 
 static struct zswap_backend *zswap_find_backend(const char *name)
 {
@@ -238,6 +246,13 @@ int zswap_register_backend(struct zswap_backend *backend)
 	pr_info("registered storage backend '%s'\n", backend->name);
 out:
 	spin_unlock(&zswap_backends_lock);
+
+	/*
+	 * If this backend is the one the user selected (e.g. zswap.backend=zvram
+	 * set before the module loaded), bring up / switch the pool now.
+	 */
+	if (!ret && zswap_backend_name && !strcmp(backend->name, zswap_backend_name))
+		zswap_pool_reload();
 	return ret;
 }
 EXPORT_SYMBOL_GPL(zswap_register_backend);
@@ -753,6 +768,73 @@ static int zswap_compressor_param_set(const char *val, const struct kernel_param
 		percpu_ref_kill(&put_pool->ref);
 
 	return ret;
+}
+
+/*
+ * Create a fresh pool using the current compressor and backend, make it the
+ * current pool, and decommission the old one.  Used to switch storage backends
+ * (zswap.backend=) and to bring zswap up once a deferred backend registers.
+ */
+static int zswap_pool_reload(void)
+{
+	struct zswap_pool *pool, *put_pool = NULL;
+	bool ready;
+
+	mutex_lock(&zswap_init_lock);
+	ready = zswap_init_state == ZSWAP_INIT_SUCCEED;
+	mutex_unlock(&zswap_init_lock);
+	if (!ready)
+		return 0;	/* zswap_setup() will create with current params */
+
+	pool = zswap_pool_create(zswap_compressor);
+	if (!pool)
+		return -EINVAL;
+
+	spin_lock_bh(&zswap_pools_lock);
+	put_pool = zswap_pool_current();
+	list_add_rcu(&pool->list, &zswap_pools);
+	zswap_has_pool = true;
+	spin_unlock_bh(&zswap_pools_lock);
+
+	if (put_pool)
+		percpu_ref_kill(&put_pool->ref);
+
+	/*
+	 * zswap may have been force-disabled at boot because the selected
+	 * backend was not yet registered (e.g. zswap.backend=zvram with zvram
+	 * as a module).  A working pool now exists, so honor the original
+	 * zswap.enabled= intent.
+	 */
+	if (!zswap_enabled) {
+		zswap_enabled = true;
+		static_branch_enable(&zswap_ever_enabled);
+		pr_info("enabled with backend '%s'\n", pool->backend->name);
+	}
+	return 0;
+}
+
+static int zswap_backend_param_set(const char *val,
+				   const struct kernel_param *kp)
+{
+	char *s = strstrip((char *)val);
+
+	mutex_lock(&zswap_init_lock);
+	if (zswap_init_state != ZSWAP_INIT_SUCCEED) {
+		/* Too early to switch; zswap_setup() uses the stored value. */
+		int ret = param_set_charp(s, kp);
+
+		mutex_unlock(&zswap_init_lock);
+		return ret;
+	}
+	mutex_unlock(&zswap_init_lock);
+
+	if (!zswap_find_backend(s)) {
+		pr_err("storage backend '%s' not available\n", s);
+		return -ENODEV;
+	}
+	if (param_set_charp(s, kp))
+		return -EINVAL;
+	return zswap_pool_reload();
 }
 
 static int zswap_enabled_param_set(const char *val,

@@ -4,7 +4,7 @@
  *
  * zvram registers as a zswap storage backend (struct zswap_backend) that
  * stores compressed swap pages in GPU VRAM instead of system RAM.  When
- * selected with zswap.zpool=zvram, compressed pages are stored in VRAM over
+ * selected with zswap.backend=zvram, compressed pages are stored in VRAM over
  * PCIe, freeing host RAM.
  *
  * Architecture:
@@ -1567,7 +1567,7 @@ static int __init zvram_init(void)
 	}
 
 	if (any_ready)
-		pr_info("ready, %d GPU(s), use zswap.zpool=zvram to enable\n",
+		pr_info("ready, %d GPU(s), use zswap.backend=zvram to enable\n",
 			any_ready);
 	else
 		pr_info("no VRAM pool yet, waiting for GPU\n");
