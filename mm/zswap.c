@@ -1862,6 +1862,133 @@ int zswap_load(struct folio *folio)
 	return 0;
 }
 
+/*
+ * Decompress @entry into @folio from compressed bytes already staged in @buf
+ * (filled by a backend ->load() batch).  Mirrors zswap_decompress() but skips
+ * the per-object read_begin/read_end since the transfer was batched.
+ */
+static bool zswap_decompress_batched(struct zswap_entry *entry,
+				     struct folio *folio, void *buf, size_t len)
+{
+	struct zswap_pool *pool = entry->pool;
+	struct crypto_acomp_ctx *acomp_ctx;
+	struct scatterlist input, output;
+	int ret = 0, dlen;
+
+	sg_init_one(&input, buf, len);
+	acomp_ctx = raw_cpu_ptr(pool->acomp_ctx);
+	mutex_lock(&acomp_ctx->mutex);
+
+	if (len == PAGE_SIZE) {
+		void *dst = kmap_local_folio(folio, 0);
+
+		memcpy(dst, buf, PAGE_SIZE);
+		dlen = PAGE_SIZE;
+		kunmap_local(dst);
+		flush_dcache_folio(folio);
+	} else {
+		sg_init_table(&output, 1);
+		sg_set_folio(&output, folio, PAGE_SIZE, 0);
+		acomp_request_set_params(acomp_ctx->req, &input, &output, len,
+					 PAGE_SIZE);
+		ret = crypto_acomp_decompress(acomp_ctx->req);
+		ret = crypto_wait_req(ret, &acomp_ctx->wait);
+		dlen = acomp_ctx->req->dlen;
+	}
+
+	mutex_unlock(&acomp_ctx->mutex);
+	if (!ret && dlen == PAGE_SIZE)
+		return true;
+
+	zswap_decompress_fail++;
+	return false;
+}
+
+/* Whether the current pool's backend benefits from batched cluster loads. */
+bool zswap_load_can_batch(void)
+{
+	struct zswap_pool *pool = zswap_pool_current_get();
+	bool can;
+
+	if (!pool)
+		return false;
+	can = pool->backend->caps & ZSWAP_BE_BATCH;
+	zswap_pool_put(pool);
+	return can;
+}
+
+/*
+ * Batch-load a readahead cluster.  For each locked swapcache folio in
+ * folios[0..n) that zswap owns (and whose backend batches), gather all of their
+ * compressed objects in one backend ->load(), decompress each, mark it
+ * uptodate and unlock it, and set handled[i].  Folios left unhandled (not in
+ * zswap, large, a different/non-batch pool, or a failed decompress) are
+ * untouched for the caller to read per-page via swap_read_folio().
+ */
+void zswap_load_folios(struct folio **folios, int n, bool *handled)
+{
+	struct zswap_io_req reqs[ZSWAP_LOAD_BATCH];
+	struct zswap_entry *entries[ZSWAP_LOAD_BATCH];
+	int idx[ZSWAP_LOAD_BATCH];
+	struct zswap_pool *pool = NULL;
+	int i, j, nb = 0;
+
+	if (WARN_ON_ONCE(n > ZSWAP_LOAD_BATCH))
+		n = ZSWAP_LOAD_BATCH;
+
+	for (i = 0; i < n; i++) {
+		struct folio *folio = folios[i];
+		struct zswap_entry *e;
+		swp_entry_t swp;
+
+		handled[i] = false;
+		if (!folio || folio_test_large(folio))
+			continue;
+		swp = folio->swap;
+		e = xa_load(swap_zswap_tree(swp), swp_offset(swp));
+		if (!e || !(e->pool->backend->caps & ZSWAP_BE_BATCH))
+			continue;
+		if (!pool)
+			pool = e->pool;
+		else if (e->pool != pool)
+			continue;	/* keep one pool per batch */
+
+		entries[nb] = e;
+		reqs[nb].handle = e->handle;
+		reqs[nb].len = e->length;
+		reqs[nb].buf = NULL;
+		reqs[nb].error = 0;
+		idx[nb] = i;
+		nb++;
+	}
+	if (!nb)
+		return;
+
+	pool->backend->load(pool->backend_pool, reqs, nb);
+
+	for (j = 0; j < nb; j++) {
+		struct folio *folio = folios[idx[j]];
+		struct zswap_entry *e = entries[j];
+		swp_entry_t swp = folio->swap;
+
+		if (reqs[j].error ||
+		    !zswap_decompress_batched(e, folio, reqs[j].buf, reqs[j].len))
+			continue;	/* leave for per-page fallback */
+
+		folio_mark_uptodate(folio);
+		count_vm_event(ZSWPIN);
+		if (e->objcg)
+			count_objcg_events(e->objcg, ZSWPIN, 1);
+		folio_mark_dirty(folio);
+		xa_erase(swap_zswap_tree(swp), swp_offset(swp));
+		zswap_entry_free(e);
+		folio_unlock(folio);
+		handled[idx[j]] = true;
+	}
+
+	pool->backend->load_done(pool->backend_pool, reqs, nb);
+}
+
 void zswap_invalidate(swp_entry_t swp)
 {
 	pgoff_t offset = swp_offset(swp);
