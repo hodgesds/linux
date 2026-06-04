@@ -650,6 +650,46 @@ static void zvram_be_read_end(void *pool, unsigned long handle,
 	mempool_free(sg_virt(sg), zvram_stage_pool);
 }
 
+/*
+ * Batch-native load: gather a readahead cluster's compressed objects into host
+ * staging buffers in one call, so zswap issues one batched transfer instead of
+ * N per-page reads.  zswap decompresses each reqs[i].buf, then calls
+ * load_done() to release them.
+ *
+ * TODO: the per-object reads here still bracket kernel_fpu per object via
+ * drm_memcpy_from_wc().  The larger win is one kernel_fpu region issuing
+ * MOVNTDQA loads across all objects so many CPU line-fill buffers stay in
+ * flight (or a scatter-gather DMA submission); this batched entry point is the
+ * plumbing that makes that optimization possible without further API churn.
+ */
+static void zvram_be_load(void *pool, struct zswap_io_req *reqs, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++) {
+		struct zvram_gpu *gpu = zvram_handle_gpu_ready(reqs[i].handle);
+		void *buf = mempool_alloc(zvram_stage_pool, GFP_NOIO);
+
+		reqs[i].buf = buf;
+		reqs[i].error = 0;
+		if (gpu)
+			zvram_read_from_vram(gpu,
+					     zvram_handle_offset(reqs[i].handle),
+					     buf, reqs[i].len);
+		else
+			reqs[i].error = -EIO;
+	}
+}
+
+static void zvram_be_load_done(void *pool, struct zswap_io_req *reqs, int n)
+{
+	int i;
+
+	for (i = 0; i < n; i++)
+		if (reqs[i].buf)
+			mempool_free(reqs[i].buf, zvram_stage_pool);
+}
+
 static u64 zvram_be_total_pages(void *pool)
 {
 	u64 bytes = 0;
@@ -667,6 +707,7 @@ static u64 zvram_be_total_pages(void *pool)
 static struct zswap_backend zvram_backend = {
 	.name		= "zvram",
 	.owner		= THIS_MODULE,
+	.caps		= ZSWAP_BE_BATCH,
 	.create		= zvram_be_create,
 	.destroy	= zvram_be_destroy,
 	.malloc		= zvram_be_malloc,
@@ -674,6 +715,8 @@ static struct zswap_backend zvram_backend = {
 	.write		= zvram_be_write,
 	.read_begin	= zvram_be_read_begin,
 	.read_end	= zvram_be_read_end,
+	.load		= zvram_be_load,
+	.load_done	= zvram_be_load_done,
 	.total_pages	= zvram_be_total_pages,
 };
 
