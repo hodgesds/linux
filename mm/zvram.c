@@ -60,6 +60,7 @@
 #include <drm/drm_cache.h>
 #endif
 
+
 /*********************************
 * configuration
 **********************************/
@@ -664,21 +665,50 @@ static void zvram_be_read_end(void *pool, unsigned long handle,
  */
 static void zvram_be_load(void *pool, struct zswap_io_req *reqs, int n)
 {
+#ifdef CONFIG_DRM
+	struct iosys_map dmap[ZSWAP_LOAD_BATCH], smap[ZSWAP_LOAD_BATCH];
+	unsigned long lens[ZSWAP_LOAD_BATCH];
+	int nb = 0;
+#endif
 	int i;
+
+	if (WARN_ON_ONCE(n > ZSWAP_LOAD_BATCH))
+		n = ZSWAP_LOAD_BATCH;
 
 	for (i = 0; i < n; i++) {
 		struct zvram_gpu *gpu = zvram_handle_gpu_ready(reqs[i].handle);
-		void *buf = mempool_alloc(zvram_stage_pool, GFP_NOIO);
+		unsigned int buf_idx;
+		unsigned long buf_off;
 
-		reqs[i].buf = buf;
+		reqs[i].buf = mempool_alloc(zvram_stage_pool, GFP_NOIO);
 		reqs[i].error = 0;
-		if (gpu)
-			zvram_read_from_vram(gpu,
-					     zvram_handle_offset(reqs[i].handle),
-					     buf, reqs[i].len);
-		else
+		if (!gpu) {
 			reqs[i].error = -EIO;
+			continue;
+		}
+		zvram_vram_location(gpu, zvram_handle_offset(reqs[i].handle),
+				    &buf_idx, &buf_off);
+#ifdef CONFIG_DRM
+		/*
+		 * Gather the whole cluster, then issue one batched WC read so
+		 * the per-object streaming loads pipeline in a single kernel_fpu
+		 * region (drm_memcpy_from_wc_batch); all arch specifics stay in
+		 * drm_cache.c.
+		 */
+		iosys_map_set_vaddr(&dmap[nb], reqs[i].buf);
+		smap[nb] = gpu->maps[buf_idx];
+		iosys_map_incr(&smap[nb], buf_off);
+		lens[nb] = ALIGN(reqs[i].len, 16);
+		nb++;
+#else
+		iosys_map_memcpy_from(reqs[i].buf, &gpu->maps[buf_idx], buf_off,
+				      reqs[i].len);
+#endif
 	}
+
+#ifdef CONFIG_DRM
+	drm_memcpy_from_wc_batch(dmap, smap, lens, nb);
+#endif
 }
 
 static void zvram_be_load_done(void *pool, struct zswap_io_req *reqs, int n)
