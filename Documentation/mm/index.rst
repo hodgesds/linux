@@ -64,3 +64,4 @@ documentation, or deleted if it has served its purpose.
    vmalloced-kernel-stacks
    vmemmap_dedup
    zsmalloc
+   zswap-backend-batching
