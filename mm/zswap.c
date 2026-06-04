@@ -133,6 +133,131 @@ bool zswap_never_enabled(void)
 }
 
 /*********************************
+* storage backend
+**********************************/
+/*
+ * Each compressed page is stored through a pluggable backend.  The default is
+ * zsmalloc (host RAM); zvram registers an alternative backed by GPU VRAM.  The
+ * backend is selected by name with the zswap.zpool= parameter.  This is a
+ * single, deliberately small indirection -- the operations are exactly those
+ * the store/load paths below need from zsmalloc, not a generic pool framework.
+ */
+static void *zsmalloc_be_create(const char *name)
+{
+	return zs_create_pool(name);
+}
+static void zsmalloc_be_destroy(void *pool)
+{
+	zs_destroy_pool(pool);
+}
+static unsigned long zsmalloc_be_malloc(void *pool, size_t size, gfp_t gfp,
+					int nid)
+{
+	return zs_malloc(pool, size, gfp, nid);
+}
+static void zsmalloc_be_free(void *pool, unsigned long handle)
+{
+	zs_free(pool, handle);
+}
+static void zsmalloc_be_write(void *pool, unsigned long handle, void *buf,
+			      size_t len)
+{
+	zs_obj_write(pool, handle, buf, len);
+}
+static void zsmalloc_be_read_begin(void *pool, unsigned long handle,
+				   struct scatterlist *sg, size_t len)
+{
+	zs_obj_read_sg_begin(pool, handle, sg, len);
+}
+static void zsmalloc_be_read_end(void *pool, unsigned long handle)
+{
+	zs_obj_read_sg_end(pool, handle);
+}
+static u64 zsmalloc_be_total_pages(void *pool)
+{
+	return zs_get_total_pages(pool);
+}
+
+static struct zswap_backend zswap_backend_zsmalloc = {
+	.name		= "zsmalloc",
+	.create		= zsmalloc_be_create,
+	.destroy	= zsmalloc_be_destroy,
+	.malloc		= zsmalloc_be_malloc,
+	.free		= zsmalloc_be_free,
+	.write		= zsmalloc_be_write,
+	.read_begin	= zsmalloc_be_read_begin,
+	.read_end	= zsmalloc_be_read_end,
+	.total_pages	= zsmalloc_be_total_pages,
+};
+
+#define ZSWAP_MAX_BACKENDS 4
+static struct zswap_backend *zswap_backends[ZSWAP_MAX_BACKENDS] = {
+	&zswap_backend_zsmalloc,
+};
+static int zswap_nr_backends = 1;
+static DEFINE_SPINLOCK(zswap_backends_lock);
+
+/* Name of the backend to use; matches a registered backend's .name. */
+static char *zswap_backend_name = "zsmalloc";
+module_param_named(zpool, zswap_backend_name, charp, 0644);
+MODULE_PARM_DESC(zpool, "storage backend for compressed pages (zsmalloc, zvram)");
+
+static struct zswap_backend *zswap_find_backend(const char *name)
+{
+	struct zswap_backend *be = NULL;
+	int i;
+
+	spin_lock(&zswap_backends_lock);
+	for (i = 0; i < zswap_nr_backends; i++) {
+		if (!strcmp(zswap_backends[i]->name, name)) {
+			be = zswap_backends[i];
+			break;
+		}
+	}
+	spin_unlock(&zswap_backends_lock);
+	return be;
+}
+
+int zswap_register_backend(struct zswap_backend *backend)
+{
+	int ret = 0, i;
+
+	spin_lock(&zswap_backends_lock);
+	for (i = 0; i < zswap_nr_backends; i++) {
+		if (!strcmp(zswap_backends[i]->name, backend->name)) {
+			ret = -EBUSY;
+			goto out;
+		}
+	}
+	if (zswap_nr_backends >= ZSWAP_MAX_BACKENDS) {
+		ret = -ENOSPC;
+		goto out;
+	}
+	zswap_backends[zswap_nr_backends++] = backend;
+	pr_info("registered storage backend '%s'\n", backend->name);
+out:
+	spin_unlock(&zswap_backends_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(zswap_register_backend);
+
+void zswap_unregister_backend(struct zswap_backend *backend)
+{
+	int i;
+
+	spin_lock(&zswap_backends_lock);
+	for (i = 0; i < zswap_nr_backends; i++) {
+		if (zswap_backends[i] == backend) {
+			zswap_backends[i] = zswap_backends[--zswap_nr_backends];
+			zswap_backends[zswap_nr_backends] = NULL;
+			break;
+		}
+	}
+	spin_unlock(&zswap_backends_lock);
+}
+EXPORT_SYMBOL_GPL(zswap_unregister_backend);
+
+/*********************************
 * data structures
 **********************************/
 
@@ -151,7 +276,8 @@ struct crypto_acomp_ctx {
  * needs to be verified that it's still valid in the tree.
  */
 struct zswap_pool {
-	struct zs_pool *zs_pool;
+	struct zswap_backend *backend;
+	void *backend_pool;
 	struct crypto_acomp_ctx __percpu *acomp_ctx;
 	struct percpu_ref ref;
 	struct list_head list;
@@ -283,10 +409,20 @@ static struct zswap_pool *zswap_pool_create(char *compressor)
 	if (!pool)
 		return NULL;
 
+	pool->backend = zswap_find_backend(zswap_backend_name);
+	if (!pool->backend) {
+		pr_err("storage backend '%s' not available\n", zswap_backend_name);
+		goto error;
+	}
+	if (pool->backend->owner && !try_module_get(pool->backend->owner)) {
+		pool->backend = NULL;
+		goto error;
+	}
+
 	/* unique name for each pool specifically required by zsmalloc */
 	snprintf(name, 38, "zswap%x", atomic_inc_return(&zswap_pools_count));
-	pool->zs_pool = zs_create_pool(name);
-	if (!pool->zs_pool)
+	pool->backend_pool = pool->backend->create(name);
+	if (!pool->backend_pool)
 		goto error;
 
 	strscpy(pool->tfm_name, compressor, sizeof(pool->tfm_name));
@@ -335,8 +471,10 @@ cpuhp_add_fail:
 error:
 	if (pool->acomp_ctx)
 		free_percpu(pool->acomp_ctx);
-	if (pool->zs_pool)
-		zs_destroy_pool(pool->zs_pool);
+	if (pool->backend_pool)
+		pool->backend->destroy(pool->backend_pool);
+	if (pool->backend && pool->backend->owner)
+		module_put(pool->backend->owner);
 	kfree(pool);
 	return NULL;
 }
@@ -373,7 +511,9 @@ static void zswap_pool_destroy(struct zswap_pool *pool)
 
 	free_percpu(pool->acomp_ctx);
 
-	zs_destroy_pool(pool->zs_pool);
+	pool->backend->destroy(pool->backend_pool);
+	if (pool->backend->owner)
+		module_put(pool->backend->owner);
 	kfree(pool);
 }
 
@@ -500,7 +640,7 @@ unsigned long zswap_total_pages(void)
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(pool, &zswap_pools, list)
-		total += zs_get_total_pages(pool->zs_pool);
+		total += pool->backend->total_pages(pool->backend_pool);
 	rcu_read_unlock();
 
 	return total;
@@ -765,7 +905,7 @@ static void zswap_entry_cache_free(struct zswap_entry *entry)
 static void zswap_entry_free(struct zswap_entry *entry)
 {
 	zswap_lru_del(&zswap_list_lru, entry);
-	zs_free(entry->pool->zs_pool, entry->handle);
+	entry->pool->backend->free(entry->pool->backend_pool, entry->handle);
 	zswap_pool_put(entry->pool);
 	if (entry->objcg) {
 		obj_cgroup_uncharge_zswap(entry->objcg, entry->length);
@@ -897,13 +1037,14 @@ static bool zswap_compress(struct page *page, struct zswap_entry *entry,
 	}
 
 	gfp = GFP_NOWAIT | __GFP_NORETRY | __GFP_HIGHMEM | __GFP_MOVABLE;
-	handle = zs_malloc(pool->zs_pool, dlen, gfp, page_to_nid(page));
+	handle = pool->backend->malloc(pool->backend_pool, dlen, gfp,
+				       page_to_nid(page));
 	if (IS_ERR_VALUE(handle)) {
 		alloc_ret = PTR_ERR((void *)handle);
 		goto unlock;
 	}
 
-	zs_obj_write(pool->zs_pool, handle, dst, dlen);
+	pool->backend->write(pool->backend_pool, handle, dst, dlen);
 	entry->handle = handle;
 	entry->length = dlen;
 
@@ -931,7 +1072,8 @@ static bool zswap_decompress(struct zswap_entry *entry, struct folio *folio)
 
 	acomp_ctx = raw_cpu_ptr(pool->acomp_ctx);
 	mutex_lock(&acomp_ctx->mutex);
-	zs_obj_read_sg_begin(pool->zs_pool, entry->handle, input, entry->length);
+	pool->backend->read_begin(pool->backend_pool, entry->handle, input,
+				  entry->length);
 
 	/* zswap entries of length PAGE_SIZE are not compressed. */
 	if (entry->length == PAGE_SIZE) {
@@ -954,7 +1096,7 @@ static bool zswap_decompress(struct zswap_entry *entry, struct folio *folio)
 		dlen = acomp_ctx->req->dlen;
 	}
 
-	zs_obj_read_sg_end(pool->zs_pool, entry->handle);
+	pool->backend->read_end(pool->backend_pool, entry->handle);
 	mutex_unlock(&acomp_ctx->mutex);
 
 	if (!ret && dlen == PAGE_SIZE)
@@ -1472,7 +1614,7 @@ static bool zswap_store_page(struct page *page,
 	return true;
 
 store_failed:
-	zs_free(pool->zs_pool, entry->handle);
+	pool->backend->free(pool->backend_pool, entry->handle);
 compress_failed:
 	zswap_entry_cache_free(entry);
 	return false;

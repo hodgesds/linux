@@ -6,8 +6,35 @@
 #include <linux/mm_types.h>
 
 struct lruvec;
+struct scatterlist;
+struct module;
 
 extern atomic_long_t zswap_stored_pages;
+
+/*
+ * Pluggable storage backend for compressed pages.  The default backend is
+ * zsmalloc (host RAM).  An alternative (zvram) stores the compressed pages in
+ * GPU VRAM over PCIe.  A backend is selected by name via the zswap.zpool=
+ * parameter; the operations mirror exactly what the zswap store/load paths
+ * need from zsmalloc, nothing more.
+ */
+struct zswap_backend {
+	const char	*name;
+	struct module	*owner;
+	void		*(*create)(const char *name);
+	void		(*destroy)(void *pool);
+	unsigned long	(*malloc)(void *pool, size_t size, gfp_t gfp, int nid);
+	void		(*free)(void *pool, unsigned long handle);
+	void		(*write)(void *pool, unsigned long handle,
+				 void *buf, size_t len);
+	void		(*read_begin)(void *pool, unsigned long handle,
+				      struct scatterlist *sg, size_t len);
+	void		(*read_end)(void *pool, unsigned long handle);
+	u64		(*total_pages)(void *pool);
+};
+
+int zswap_register_backend(struct zswap_backend *backend);
+void zswap_unregister_backend(struct zswap_backend *backend);
 
 #ifdef CONFIG_ZSWAP
 
