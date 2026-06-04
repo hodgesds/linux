@@ -103,42 +103,64 @@ paths each already operate on a batch that the backend interface throws away:
 The proposal is simply to **expose these existing batches to the backend**.
 
 
+Separate the transfer from the decompress
+=========================================
+
+The decisive observation: of the two things a load does, only one is wasteful
+per page.
+
+* **Decompress is irreducibly per-page** -- one compressed object yields one
+  page, and the crypto call is per-page.  Nothing to batch here.
+* **Transfer is wasteful per-page** -- a separate small device read per object.
+  This is what batching must target.
+
+So the interface should make the *transfer* batch-native while leaving the
+*decompress* per-page.  zswap pulls a cluster's compressed bytes into staging in
+one gather, then decompresses each page individually.
+
+
 Proposed interface
 ==================
 
-Add a capability field and two optional batched operations to
-``struct zswap_backend``.  The per-page ops remain and are the fallback::
-
-    /* capability bits */
-    #define ZSWAP_BE_BATCH   (1u << 0)   /* store_batch / load_batch present */
-    #define ZSWAP_BE_ASYNC   (1u << 1)   /* submit/poll model (stage 2)      */
+Make the backend's data-transfer op **batch-native**: it takes a vector of
+requests, and a single page is just ``n == 1``.  Allocation
+(``malloc``/``free``) stays per-object -- it is cheap host-RAM metadata; only
+the data movement vectorises::
 
     struct zswap_io_req {
-        unsigned long   handle;     /* in:  backend handle               */
-        void           *buf;        /* in/out: host RAM object buffer     */
-        size_t          len;        /* in:  object length                 */
-        int             error;      /* out: per-request status            */
+        unsigned long   handle;     /* in:  backend handle                  */
+        void           *buf;        /* load: backend fills; store: provided */
+        size_t          len;        /* in:  object length                   */
+        int             error;      /* out: per-request status              */
     };
+
+    /* capability bit: backend benefits from cluster batching */
+    #define ZSWAP_BE_BATCH   (1u << 0)
 
     struct zswap_backend {
-        /* ... existing per-page ops: create/destroy/malloc/free/write/
-         *     read_begin/read_end/total_pages ... */
+        /* ... per-object ops: create/destroy/malloc/free/total_pages ... */
         unsigned int caps;
 
-        /* optional: store N objects (a folio) in one submission */
-        void (*store_batch)(void *pool, struct zswap_io_req *reqs, int n);
-        /* optional: gather N objects (a readahead cluster) in one submission */
-        void (*load_batch)(void *pool, struct zswap_io_req *reqs, int n);
+        /* Pull N objects' compressed bytes into reqs[i].buf in one gather
+         * (scatter-gather DMA, or batched streaming reads).  zswap then
+         * decompresses each buf -> page individually.  load_done() releases
+         * the buffers after all decompresses complete.  n >= 1.            */
+        void (*load)(void *pool, struct zswap_io_req *reqs, int n);
+        void (*load_done)(void *pool, struct zswap_io_req *reqs, int n);
+        /* Write N objects in one submission (a folio's pages). */
+        void (*store)(void *pool, struct zswap_io_req *reqs, int n);
     };
 
-zswap uses the batched path only when (a) it has a batch and (b) the backend
-advertises ``ZSWAP_BE_BATCH``; otherwise it calls the per-page ops in a loop,
-exactly as today.  ``malloc()``/``free()`` are unchanged -- allocation stays
-per-object (cheap, host-RAM metadata); only the *data movement* batches.
+Because the op is batch-native, zsmalloc implements it as a trivial ``n``-element
+loop with **zero** added cost (it is a RAM ``memcpy`` either way).  The
+``ZSWAP_BE_BATCH`` capability gates only whether zswap bothers to *assemble* a
+cluster batch: capable backends (zvram) get the readahead window collected and
+handed to ``load()`` in one call; for zsmalloc, zswap keeps the existing
+per-page ``swap_read_folio`` path, so it stays byte-for-byte unchanged.
 
-zsmalloc sets ``caps = 0`` and is byte-for-byte unchanged.  This is the crux of
-the upstream argument: **no behaviour change for the default backend, opt-in
-benefit for capable ones.**
+That is the upstream-safety crux: **batch is the default shape of the transfer
+op, single page is the degenerate case, and the default RAM backend is
+untouched.**
 
 
 Why batching wins even with a scattered allocator
@@ -196,14 +218,18 @@ explicitly staged after synchronous batching.
 Staged plan
 ===========
 
-1. **Synchronous ``load_batch`` + readahead.**  Add ``caps`` and the batched
-   ops; teach the readahead load path to collect a cluster's entries and call
-   ``load_batch`` when supported.  Implement it in ``zvram`` as a scatter-gather
-   streaming read.  Highest value (targets the read gap), least invasive.
+1. **Batch-native ``load`` + readahead cluster.**  Add the vector ``load``/
+   ``load_done`` ops and ``caps``; restructure ``swap_cluster_readahead`` to
+   collect the window's zswap-backed folios and hand them to ``load`` in one
+   call (per-page ``swap_read_folio`` remains for non-batch backends).
+   Implement ``load`` in ``zvram`` as a single batched streaming read across the
+   cluster (one ``kernel_fpu`` region, ``MOVNTDQA`` loads issued across all
+   objects so many line-fill buffers stay in flight).  Highest value -- targets
+   the read gap directly.
 
-2. **Synchronous ``store_batch`` (+ optional locality).**  Batch a folio's
-   stores into one submission; optionally cluster objects contiguously to make
-   future reads sequential.
+2. **Batch-native ``store`` (+ optional locality).**  Batch a folio's stores
+   into one submission; optionally cluster objects contiguously to make future
+   reads sequential.
 
 3. **Asynchronous submit/poll + readahead prefetch.**  The ambitious stage;
    only worthwhile once 1--2 show the batched device path is transfer-bound
