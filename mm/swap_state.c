@@ -849,6 +849,9 @@ static struct folio *swap_vma_readahead(swp_entry_t targ_entry, gfp_t gfp_mask,
 	unsigned long start, end, addr;
 	pgoff_t ilx;
 	bool page_allocated;
+	struct folio *batch[ZSWAP_LOAD_BATCH];
+	bool is_ra[ZSWAP_LOAD_BATCH];
+	int nb = 0;
 
 	win = swap_vma_ra_win(vmf, &start, &end);
 	if (win == 1)
@@ -888,17 +891,21 @@ static struct folio *swap_vma_readahead(swp_entry_t targ_entry, gfp_t gfp_mask,
 			put_swap_device(si);
 		if (!folio)
 			continue;
-		if (page_allocated) {
-			swap_read_folio(folio, &splug);
-			if (addr != vmf->address) {
-				folio_set_readahead(folio);
-				count_vm_event(SWAP_RA);
-			}
+		if (!page_allocated) {
+			folio_put(folio);
+			continue;
 		}
-		folio_put(folio);
+		/* Collect the window, then batch the loads (see swap_ra_flush). */
+		batch[nb] = folio;
+		is_ra[nb] = addr != vmf->address;
+		if (++nb == ZSWAP_LOAD_BATCH) {
+			swap_ra_flush(batch, is_ra, nb, &splug);
+			nb = 0;
+		}
 	}
 	if (pte)
 		pte_unmap(pte);
+	swap_ra_flush(batch, is_ra, nb, &splug);
 	blk_finish_plug(&plug);
 	swap_read_unplug(splug);
 	lru_add_drain();
