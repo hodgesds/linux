@@ -141,6 +141,20 @@ config ZSMALLOC_STAT
 	  information to userspace via debugfs.
 	  If unsure, say N.
 
+config ZVRAM
+	tristate "GPU VRAM-backed storage backend for zswap"
+	depends on ZSWAP
+	depends on PCI
+	depends on 64BIT
+	help
+	  Store zswap's compressed swap pages in GPU VRAM over PCIe instead of
+	  system RAM, freeing host memory.  zvram reserves a slice of VRAM via a
+	  pinned DRM dumb buffer, manages it with a host-RAM buddy allocator, and
+	  registers as a zswap storage backend.  Enable at runtime with
+	  zswap.zpool=zvram.
+
+	  If unsure, say N.
+
 config ZSMALLOC_CHAIN_SIZE
 	int "Maximum number of physical pages per-zspage"
 	default 8

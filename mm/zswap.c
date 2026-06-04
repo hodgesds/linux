@@ -169,7 +169,8 @@ static void zsmalloc_be_read_begin(void *pool, unsigned long handle,
 {
 	zs_obj_read_sg_begin(pool, handle, sg, len);
 }
-static void zsmalloc_be_read_end(void *pool, unsigned long handle)
+static void zsmalloc_be_read_end(void *pool, unsigned long handle,
+				 struct scatterlist *sg)
 {
 	zs_obj_read_sg_end(pool, handle);
 }
@@ -1096,7 +1097,7 @@ static bool zswap_decompress(struct zswap_entry *entry, struct folio *folio)
 		dlen = acomp_ctx->req->dlen;
 	}
 
-	pool->backend->read_end(pool->backend_pool, entry->handle);
+	pool->backend->read_end(pool->backend_pool, entry->handle, input);
 	mutex_unlock(&acomp_ctx->mutex);
 
 	if (!ret && dlen == PAGE_SIZE)

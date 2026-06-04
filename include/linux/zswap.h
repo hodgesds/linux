@@ -29,7 +29,8 @@ struct zswap_backend {
 				 void *buf, size_t len);
 	void		(*read_begin)(void *pool, unsigned long handle,
 				      struct scatterlist *sg, size_t len);
-	void		(*read_end)(void *pool, unsigned long handle);
+	void		(*read_end)(void *pool, unsigned long handle,
+				    struct scatterlist *sg);
 	u64		(*total_pages)(void *pool);
 };
 
