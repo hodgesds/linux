@@ -269,15 +269,19 @@ Findings:
   still well under RAM-backed zswap (~1186), so the ``MOVNTDQA`` cross-object
   read (stage 1b) is remaining headroom in the same low-concurrency regime.
 
-* **The readahead batch point is policy-gated.**  It only fires when swap
-  readahead actually produces a cluster: ``vm.page-cluster > 0`` for
-  ``swap_cluster_readahead``, and a non-trivial window for
-  ``swap_vma_readahead``.  Many SSD/zram setups ship ``page-cluster=0`` (swap
-  readahead off), and fast/synchronous swap devices skip readahead entirely --
-  in which case there is *no cluster to batch*.  This is the strongest argument
-  that **large folios** (a folio is a batch of N pages regardless of readahead
-  policy) are the batch source that survives production tuning, and should be
-  pursued alongside the readahead path.
+* **The readahead batch point is policy-gated, on both paths.**  Both
+  ``swap_cluster_readahead`` and ``swap_vma_readahead`` cap their window at
+  ``1 << vm.page-cluster``, so ``page-cluster=0`` collapses the window to a
+  single page and *no* batch is assembled on either path (measured: zero
+  ``zswap_load_folios`` calls, load unchanged).  Many SSD/zram setups ship
+  ``page-cluster=0`` (swap readahead off), and fast/synchronous swap devices
+  skip readahead entirely.  In all those cases there is no cluster to batch.
+
+  This is the decisive argument that **large folios** -- a folio is a batch of N
+  pages regardless of readahead policy -- are the batch source that survives
+  production tuning.  The readahead path is a real but tuning-dependent win
+  (~2.3x with ``page-cluster>0``); the large-folio path is the one that fires by
+  default and should be the primary target.
 
 
 Generality
