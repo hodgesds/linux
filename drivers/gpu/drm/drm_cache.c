@@ -246,10 +246,9 @@ static void memcpy_fallback(struct iosys_map *dst,
 
 static DEFINE_STATIC_KEY_FALSE(has_movntdqa);
 
-static void __memcpy_ntdqa(void *dst, const void *src, unsigned long len)
+/* Streaming copy of @len 16-byte units; caller must hold kernel_fpu_begin(). */
+static void __memcpy_ntdqa_nofpu(void *dst, const void *src, unsigned long len)
 {
-	kernel_fpu_begin();
-
 	while (len >= 4) {
 		asm("movntdqa	(%0), %%xmm0\n"
 		    "movntdqa 16(%0), %%xmm1\n"
@@ -271,7 +270,12 @@ static void __memcpy_ntdqa(void *dst, const void *src, unsigned long len)
 		src += 16;
 		dst += 16;
 	}
+}
 
+static void __memcpy_ntdqa(void *dst, const void *src, unsigned long len)
+{
+	kernel_fpu_begin();
+	__memcpy_ntdqa_nofpu(dst, src, len);
 	kernel_fpu_end();
 }
 
@@ -287,6 +291,21 @@ static void __drm_memcpy_from_wc(void *dst, const void *src, unsigned long len)
 		memcpy(dst, src, len);
 	else if (likely(len))
 		__memcpy_ntdqa(dst, src, len >> 4);
+}
+
+/* One iosys_map copy; caller already holds kernel_fpu (batch path). */
+static void __drm_memcpy_from_wc_one(const struct iosys_map *dst,
+				     const struct iosys_map *src,
+				     unsigned long len)
+{
+	void *d = dst->is_iomem ? (void __force *)dst->vaddr_iomem : dst->vaddr;
+	const void *s = src->is_iomem ?
+			(const void __force *)src->vaddr_iomem : src->vaddr;
+
+	if (unlikely(((unsigned long)d | (unsigned long)s | len) & 15))
+		memcpy(d, s, len);
+	else if (likely(len))
+		__memcpy_ntdqa_nofpu(d, s, len >> 4);
 }
 
 /**
@@ -323,6 +342,36 @@ void drm_memcpy_from_wc(struct iosys_map *dst,
 }
 EXPORT_SYMBOL(drm_memcpy_from_wc);
 
+/**
+ * drm_memcpy_from_wc_batch - WC memcpy a vector of buffers in one FPU region
+ * @dst: array of @n destination maps
+ * @src: array of @n (possibly WC) source maps
+ * @len: array of @n transfer sizes in bytes
+ * @n: number of buffers
+ *
+ * Like drm_memcpy_from_wc() but issues the streaming loads for all @n buffers
+ * under a single kernel_fpu_begin()/_end(), so the per-buffer read latency
+ * pipelines across the batch instead of serializing one FPU region per buffer.
+ */
+void drm_memcpy_from_wc_batch(struct iosys_map *dst,
+			      const struct iosys_map *src,
+			      const unsigned long *len, unsigned int n)
+{
+	unsigned int i;
+
+	if (WARN_ON(in_interrupt()) || !static_branch_likely(&has_movntdqa)) {
+		for (i = 0; i < n; i++)
+			memcpy_fallback(&dst[i], &src[i], len[i]);
+		return;
+	}
+
+	kernel_fpu_begin();
+	for (i = 0; i < n; i++)
+		__drm_memcpy_from_wc_one(&dst[i], &src[i], len[i]);
+	kernel_fpu_end();
+}
+EXPORT_SYMBOL(drm_memcpy_from_wc_batch);
+
 /*
  * drm_memcpy_init_early - One time initialization of the WC memcpy code
  */
@@ -346,6 +395,18 @@ void drm_memcpy_from_wc(struct iosys_map *dst,
 	memcpy_fallback(dst, src, len);
 }
 EXPORT_SYMBOL(drm_memcpy_from_wc);
+
+void drm_memcpy_from_wc_batch(struct iosys_map *dst,
+			      const struct iosys_map *src,
+			      const unsigned long *len, unsigned int n)
+{
+	unsigned int i;
+
+	WARN_ON(in_interrupt());
+	for (i = 0; i < n; i++)
+		memcpy_fallback(&dst[i], &src[i], len[i]);
+}
+EXPORT_SYMBOL(drm_memcpy_from_wc_batch);
 
 void drm_memcpy_init_early(void)
 {

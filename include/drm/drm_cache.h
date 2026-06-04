@@ -85,4 +85,7 @@ void drm_memcpy_init_early(void);
 void drm_memcpy_from_wc(struct iosys_map *dst,
 			const struct iosys_map *src,
 			unsigned long len);
+void drm_memcpy_from_wc_batch(struct iosys_map *dst,
+			      const struct iosys_map *src,
+			      const unsigned long *len, unsigned int n);
 #endif
