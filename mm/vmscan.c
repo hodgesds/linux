@@ -247,6 +247,27 @@ static bool writeback_throttling_sane(struct scan_control *sc)
 #endif
 	return false;
 }
+
+/*
+ * Cgroup counterpart of the file exhaustion test in prepare_scan_control():
+ * is the target cgroup's page cache, plus its headroom below the limit that
+ * triggered reclaim, a tiny fraction of that limit?
+ */
+static bool memcg_file_exhausted(struct scan_control *sc)
+{
+	struct mem_cgroup *memcg = sc->target_mem_cgroup;
+	unsigned long limit, usage, file;
+
+	limit = min(READ_ONCE(memcg->memory.max), READ_ONCE(memcg->memory.high));
+	if (limit == PAGE_COUNTER_MAX)
+		return false;
+
+	usage = page_counter_read(&memcg->memory);
+	file = memcg_page_state(memcg, NR_ACTIVE_FILE) +
+	       memcg_page_state(memcg, NR_INACTIVE_FILE);
+
+	return file + (limit > usage ? limit - usage : 0) <= limit >> 6;
+}
 #else
 static bool cgroup_reclaim(struct scan_control *sc)
 {
@@ -261,6 +282,11 @@ static bool root_reclaim(struct scan_control *sc)
 static bool writeback_throttling_sane(struct scan_control *sc)
 {
 	return true;
+}
+
+static bool memcg_file_exhausted(struct scan_control *sc)
+{
+	return false;
 }
 #endif
 
@@ -2438,6 +2464,17 @@ static void prepare_scan_control(pg_data_t *pgdat, struct scan_control *sc)
 			file + free <= total_high_wmark &&
 			!(sc->may_deactivate & DEACTIVATE_ANON) &&
 			anon >> sc->priority;
+	} else {
+		/*
+		 * A cgroup at its limit falls into the same trap: a mostly
+		 * anonymous cgroup with swap keeps evicting and refaulting
+		 * the handful of file pages it runs from.
+		 */
+		sc->file_is_tiny =
+			memcg_file_exhausted(sc) &&
+			!(sc->may_deactivate & DEACTIVATE_ANON) &&
+			lruvec_page_state(target_lruvec, NR_INACTIVE_ANON) >>
+				sc->priority;
 	}
 }
 
